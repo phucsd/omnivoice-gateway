@@ -2,6 +2,7 @@ import os
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from app.config import settings
 from app.database import get_db
 from app.models import TTSJob, User
 from app.schemas import TTSJobCreate, TTSJobResponse
@@ -74,6 +75,13 @@ def get_tts_job(job_id: str, db: Session = Depends(get_db), current_user: User =
         )
     api_base = getattr(settings, "API_BASE_URL", "") or ""
     audio_url = f"{api_base}/v1/tts/jobs/{job.id}/audio" if job.status == "completed" else None
+    import json
+    alignment_data = None
+    if job.alignment:
+        try:
+            alignment_data = json.loads(job.alignment)
+        except Exception:
+            pass
     return {
         "job_id": job.id,
         "job_type": job.job_type,
@@ -83,6 +91,7 @@ def get_tts_job(job_id: str, db: Session = Depends(get_db), current_user: User =
         "audio_url": audio_url,
         "cdn_audio_url": getattr(job, "cdn_audio_url", None) if job.status == "completed" else None,
         "error_message": job.error_message,
+        "alignment": alignment_data,
         "created_at": job.created_at,
         "updated_at": job.updated_at
     }

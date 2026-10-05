@@ -8,6 +8,14 @@ from app.config import settings
 from app.models import UserSetting
 
 class DubbingNotebookBuilder:
+    @staticmethod
+    def get_normalizer_code() -> str:
+        """Loads the pure-Python Vietnamese text normalizer code to embed into worker scripts."""
+        normalizer_file = os.path.join(os.path.dirname(__file__), "..", "utils", "vietnamese_normalizer.py")
+        if os.path.exists(normalizer_file):
+            with open(normalizer_file, "r", encoding="utf-8") as f:
+                return f.read()
+        return ""
     """
     Dedicated builder for Dubbing Kaggle Workers.
     Generates specialized worker scripts and metadata for handling:
@@ -113,6 +121,8 @@ import subprocess
 import requests
 import soundfile as sf
 import torch
+
+{DubbingNotebookBuilder.get_normalizer_code()}
 
 GATEWAY_URL = "{public_api_url.rstrip('/')}"
 WORKER_TOKEN = "{worker_token}"
@@ -307,6 +317,8 @@ def main():
                     target_dur = max(0.5, end_t - start_t)
 
                     log(f"Dubbing segment {{seg_id}}: '{{seg_text}}' (target dur: {{target_dur}}s)")
+                    if seg_text:
+                        seg_text = normalize_vietnamese_text(seg_text)
 
                     if model:
                         gen_kwargs = {{"text": seg_text}}

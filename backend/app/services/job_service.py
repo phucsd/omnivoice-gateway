@@ -108,13 +108,17 @@ class JobService:
         language: str = None,
         pad_duration: float = None,
         fade_duration: float = None,
-        normalize_text: bool = False
+        normalize_text: bool = True
     ) -> tuple[VoiceDesignPreview, TTSJob]:
         """Creates a VoiceDesignPreview entry and triggers a background preview TTS job."""
         preview_id = generate_id("vd")
         job_id = generate_id("job")
         
         instruct = JobService.map_vietnamese_request_to_instruct(voice_request)
+
+        if normalize_text:
+            from app.utils.vietnamese_normalizer import normalize_vietnamese_text
+            preview_text = normalize_vietnamese_text(preview_text)
 
         # Create VoiceDesignPreview
         db_preview = VoiceDesignPreview(
@@ -189,7 +193,7 @@ class JobService:
         language: str = None,
         pad_duration: float = None,
         fade_duration: float = None,
-        normalize_text: bool = False
+        normalize_text: bool = True
     ) -> TTSJob:
         """Creates a TTS job based on the chosen mode (clone_voice, auto_voice, voice_design)."""
         job_id = generate_id("job")
@@ -197,6 +201,10 @@ class JobService:
         ref_audio_path = None
         ref_text_val = None
         job_type = mode
+
+        if normalize_text:
+            from app.utils.vietnamese_normalizer import normalize_vietnamese_text
+            text = normalize_vietnamese_text(text)
 
         if mode == "clone_voice":
             if not voice_sample_id:
@@ -208,6 +216,8 @@ class JobService:
             
             ref_audio_path = sample.file_path
             ref_text_val = ref_text if ref_text is not None else sample.ref_text
+            if ref_text_val and normalize_text:
+                ref_text_val = normalize_vietnamese_text(ref_text_val)
         elif mode == "auto_voice":
             job_type = "auto_voice"
         elif mode == "voice_design":

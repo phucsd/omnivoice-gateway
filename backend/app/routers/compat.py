@@ -131,13 +131,20 @@ async def single_inference(
     else:
         job_type = "auto_voice"
         
-    # 3. Create TTS Job
+    # 3. Normalize & Create TTS Job
     job_id = generate_id("job")
+    synth_text = payload.text
+    try:
+        from app.utils.vietnamese_normalizer import normalize_vietnamese_text
+        synth_text = normalize_vietnamese_text(payload.text)
+    except Exception:
+        pass
+
     db_job = TTSJob(
         id=job_id,
         user_id=current_user.id,
         job_type=job_type,
-        text=payload.text,
+        text=synth_text,
         voice_sample_id=voice_sample_id,
         instruct=payload.instruct,
         ref_audio_path=ref_audio_path,

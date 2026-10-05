@@ -49,4 +49,6 @@ backend/dubbing_jobs/
 tmp_*
 /test_*.py
 !backend/tests/test_*.py
+test_number_results/
+
 

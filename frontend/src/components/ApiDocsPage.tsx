@@ -46,7 +46,7 @@ curl -X POST "${baseUrl}/v1/tts/jobs" \\
     "speed": 1.0,
     "num_step": 32,
     "with_alignment": true,
-    "normalize_text": false
+    "normalize_text": true
   }'
 
 # Phản hồi sẽ trả về {"job_id": "job_xxxx", "status": "queued"}
@@ -96,7 +96,7 @@ payload = {
     "speed": 1.0,
     "num_step": 32,
     "with_alignment": True,
-    "normalize_text": False
+    "normalize_text": True
 }
 
 print("Đang gửi yêu cầu TTS...")
@@ -179,7 +179,7 @@ async function generateSpeech() {
         speed: 1.0,
         num_step: 32,
         with_alignment: true,
-        normalize_text: false
+        normalize_text: true
       })
     });
     
@@ -509,7 +509,7 @@ generateSpeech();`
                 <span className="font-mono text-primary/90 font-bold">normalize_text</span>
                 <span className="text-muted-foreground text-[10px] ml-2 font-semibold">(Tùy chọn)</span>
                 <p className="text-[11px] text-muted-foreground mt-0.5">
-                  Tự động chuẩn hóa số, ngày tháng, tiền tệ, đơn vị đo lường thành chữ đọc tự nhiên (tối ưu cho Tiếng Anh/Trung). Mặc định là <code className="text-foreground bg-muted border border-border px-1.5 py-0.5 rounded font-mono font-semibold">false</code>. Đặt bằng <code className="text-foreground bg-muted border border-border px-1.5 py-0.5 rounded font-mono font-semibold">true</code> khi cần chuẩn hóa văn bản Tiếng Anh/Trung.
+                  Tự động chuẩn hóa số (ví dụ: <code className="text-foreground bg-muted border border-border px-1 py-0.2 rounded font-mono">1.6</code> &rarr; <em>một chấm sáu</em>, <code className="text-foreground bg-muted border border-border px-1 py-0.2 rounded font-mono">1.600</code> &rarr; <em>một nghìn sáu trăm</em>, <code className="text-foreground bg-muted border border-border px-1 py-0.2 rounded font-mono">1,3456</code> &rarr; <em>một phẩy ba bốn năm sáu</em>), phần trăm, ngày tháng, tiền tệ thành chữ đọc tự nhiên. Mặc định là <code className="text-foreground bg-muted border border-border px-1.5 py-0.5 rounded font-mono font-semibold">true</code>.
                 </p>
               </div>
             </div>
@@ -829,13 +829,14 @@ generateSpeech();`
                   Chuẩn hóa văn bản (Normalize Text)
                 </span>
                 <p className="text-[11px] text-muted-foreground leading-relaxed">
-                  Khi bật <code className="text-primary font-mono">normalize_text: true</code> (mặc định: <code className="text-primary font-mono">false</code>, tối ưu cho Tiếng Anh &amp; Tiếng Trung), hệ thống tự động nhận diện và chuyển thành chữ đọc chuẩn xác:
+                  Khi bật <code className="text-primary font-mono">normalize_text: true</code> (mặc định: <code className="text-primary font-mono">true</code>), hệ thống tự động nhận diện và chuyển đổi chuẩn xác các định dạng số:
                 </p>
                 <ul className="text-[11px] text-muted-foreground list-disc list-inside space-y-1 pl-1">
-                  <li><strong className="text-foreground">Số tự nhiên / thứ tự:</strong> <code className="text-[10px] font-mono">123</code> &rarr; <em>một trăm hai mươi ba</em></li>
+                  <li><strong className="text-foreground">Số thập phân &amp; Phiên bản:</strong> <code className="text-[10px] font-mono">1.6</code> &rarr; <em>một chấm sáu</em>, <code className="text-[10px] font-mono">1,3456</code> &rarr; <em>một phẩy ba bốn năm sáu</em></li>
+                  <li><strong className="text-foreground">Phân cách hàng nghìn:</strong> <code className="text-[10px] font-mono">1.600</code> &rarr; <em>một nghìn sáu trăm</em></li>
                   <li><strong className="text-foreground">Ngày tháng năm:</strong> <code className="text-[10px] font-mono">20/11/2024</code> &rarr; <em>ngày hai mươi tháng mười một...</em></li>
                   <li><strong className="text-foreground">Tiền tệ:</strong> <code className="text-[10px] font-mono">50.000đ</code> &rarr; <em>năm mươi nghìn đồng</em>, <code className="text-[10px] font-mono">$100</code> &rarr; <em>một trăm đô la</em></li>
-                  <li><strong className="text-foreground">Đơn vị &amp; %:</strong> <code className="text-[10px] font-mono">99%</code> &rarr; <em>chín mươi chín phần trăm</em></li>
+                  <li><strong className="text-foreground">Đơn vị &amp; %:</strong> <code className="text-[10px] font-mono">1,3456%</code> &rarr; <em>một phẩy ba bốn năm sáu phần trăm</em></li>
                 </ul>
               </div>
 

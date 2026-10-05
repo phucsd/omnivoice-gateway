@@ -4,6 +4,14 @@ from app.config import settings
 
 class KaggleNotebookBuilder:
     @staticmethod
+    def get_normalizer_code() -> str:
+        """Loads the pure-Python Vietnamese text normalizer code to embed into worker scripts."""
+        normalizer_file = os.path.join(os.path.dirname(__file__), "..", "utils", "vietnamese_normalizer.py")
+        if os.path.exists(normalizer_file):
+            with open(normalizer_file, "r", encoding="utf-8") as f:
+                return f.read()
+        return ""
+    @staticmethod
     def ensure_worker_dir(worker_dir: str) -> str:
         """Ensures that the kaggle worker directory exists and returns its absolute path."""
         worker_dir_abs = os.path.abspath(worker_dir)
@@ -239,6 +247,8 @@ import torch
 import soundfile as sf
 from omnivoice import OmniVoice
 
+{KaggleNotebookBuilder.get_normalizer_code()}
+
 PUBLIC_API_BASE_URL = {repr(public_api_url)}.rstrip("/")
 WORKER_TOKEN = {repr(worker_token)}
 WORKER_ID = {repr(worker_id)}
@@ -264,10 +274,20 @@ def make_request(method: str, path: str, **kwargs) -> requests.Response:
 
 WHISPER_MODEL = None
 
+ONES_MAP = {{
+    "0": "không", "1": "một", "2": "hai", "3": "ba", "4": "bốn",
+    "5": "năm", "6": "sáu", "7": "bảy", "8": "tám", "9": "chín",
+    "%": "phần trăm", "đ": "đồng", "$": "đô la"
+}}
+
 def levenshtein_ratio(s1, s2):
-    if len(s1) == 0 or len(s2) == 0:
-        return 0.0
     if s1 == s2:
+        return 1.0
+    if not s1 or not s2:
+        return 0.0
+    s1_norm = ONES_MAP.get(s1, s1)
+    s2_norm = ONES_MAP.get(s2, s2)
+    if s1_norm == s2_norm:
         return 1.0
     matrix = [[0] * (len(s2) + 1) for _ in range(len(s1) + 1)]
     for i in range(len(s1) + 1):
@@ -280,6 +300,15 @@ def levenshtein_ratio(s1, s2):
             matrix[i][j] = min(matrix[i-1][j] + 1, matrix[i][j-1] + 1, matrix[i-1][j-1] + cost)
     max_len = max(len(s1), len(s2))
     return 1.0 - (matrix[len(s1)][len(s2)] / max_len)
+
+def resample_to_16k(audio_arr, orig_sr=24000):
+    if orig_sr == 16000:
+        return audio_arr.astype(np.float32)
+    orig_len = len(audio_arr)
+    target_len = int(orig_len * 16000 / orig_sr)
+    orig_idx = np.linspace(0, orig_len, orig_len, endpoint=False)
+    target_idx = np.linspace(0, orig_len, target_len, endpoint=False)
+    return np.interp(target_idx, orig_idx, audio_arr).astype(np.float32)
 
 def get_whisper_model():
     global WHISPER_MODEL
@@ -315,7 +344,19 @@ def align_words(original_words, transcribed_words, audio_duration):
     if n == 0:
         return []
     if m == 0:
-        return None
+        word_dur = audio_duration / n
+        return [
+            dict(word=w, start=round(i * word_dur, 3), end=round((i + 1) * word_dur, 3))
+            for i, w in enumerate(original_words)
+        ]
+
+    # Normalize Whisper timestamps if they drift beyond audio_duration
+    whisper_max = max(w["end"] for w in transcribed_words) if transcribed_words else audio_duration
+    if whisper_max > audio_duration and whisper_max > 0:
+        scale = audio_duration / whisper_max
+        for w in transcribed_words:
+            w["start"] = w["start"] * scale
+            w["end"] = w["end"] * scale
     
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
     parent = [[None] * (m + 1) for _ in range(n + 1)]
@@ -365,7 +406,6 @@ def align_words(original_words, transcribed_words, audio_duration):
             matches[pi] = pj
         i, j = pi, pj
         
-    aligned = []
     matched_times = []
     for idx in range(n):
         if idx in matches:
@@ -375,15 +415,31 @@ def align_words(original_words, transcribed_words, audio_duration):
             matched_times.append((idx, start, end))
             
     if not matched_times:
-        return None
+        word_dur = audio_duration / n
+        return [
+            dict(word=w, start=round(k * word_dur, 3), end=round((k + 1) * word_dur, 3))
+            for k, w in enumerate(original_words)
+        ]
         
     first_matched_idx, first_start, first_end = matched_times[0]
     last_matched_idx, last_start, last_end = matched_times[-1]
     
-    matched_lookup = dict()
-    for idx, start, end in matched_times:
-        matched_lookup[idx] = (start, end)
-        
+    unmatched_tail_count = n - 1 - last_matched_idx
+    if unmatched_tail_count > 0:
+        min_tail_dur = min(audio_duration * 0.4, unmatched_tail_count * 0.25)
+        if (audio_duration - last_end) < min_tail_dur:
+            last_end = max(first_start + 0.2, audio_duration - min_tail_dur)
+            matched_times[-1] = (last_matched_idx, min(matched_times[-1][1], last_end - 0.1), last_end)
+
+    if first_matched_idx > 0:
+        min_head_dur = min(audio_duration * 0.3, first_matched_idx * 0.25)
+        if first_start < min_head_dur:
+            first_start = min_head_dur
+            matched_times[0] = (first_matched_idx, first_start, max(first_start + 0.1, matched_times[0][2]))
+
+    matched_lookup = {{idx: (s, e) for idx, s, e in matched_times}}
+    
+    aligned = []
     for idx in range(n):
         if idx in matched_lookup:
             start, end = matched_lookup[idx]
@@ -406,7 +462,7 @@ def align_words(original_words, transcribed_words, audio_duration):
         elif idx > last_matched_idx:
             rem_chars = sum(len(original_words[k]) for k in range(last_matched_idx + 1, n)) or 1
             chars_before = sum(len(original_words[k]) for k in range(last_matched_idx + 1, idx))
-            rem_duration = audio_duration - last_end
+            rem_duration = max(0.2, audio_duration - last_end)
             start = last_end + rem_duration * (chars_before / rem_chars)
             word_dur = rem_duration * (len(original_words[idx]) / rem_chars)
             end = start + word_dur
@@ -417,29 +473,25 @@ def align_words(original_words, transcribed_words, audio_duration):
             ))
         else:
             pre_idx = -1
-            pre_start = 0.0
             pre_end = 0.0
-            for o_idx, start, end in matched_times:
+            for o_idx, s, e in matched_times:
                 if o_idx < idx:
                     pre_idx = o_idx
-                    pre_start = start
-                    pre_end = end
+                    pre_end = e
                 else:
                     break
                     
             succ_idx = -1
-            succ_start = 0.0
-            succ_end = 0.0
-            for o_idx, start, end in matched_times:
+            succ_start = audio_duration
+            for o_idx, s, e in matched_times:
                 if o_idx > idx:
                     succ_idx = o_idx
-                    succ_start = start
-                    succ_end = end
+                    succ_start = s
                     break
                     
             gap_chars = sum(len(original_words[k]) for k in range(pre_idx + 1, succ_idx)) or 1
             chars_before = sum(len(original_words[k]) for k in range(pre_idx + 1, idx))
-            gap_duration = succ_start - pre_end
+            gap_duration = max(0.15 * (succ_idx - pre_idx - 1), succ_start - pre_end)
             
             start = pre_end + gap_duration * (chars_before / gap_chars)
             word_dur = gap_duration * (len(original_words[idx]) / gap_chars)
@@ -450,7 +502,14 @@ def align_words(original_words, transcribed_words, audio_duration):
                 start=round(start, 3),
                 end=round(end, 3)
             ))
-            
+
+    # Final pass to ensure strictly monotonic and min duration >= 0.08s
+    for k in range(len(aligned)):
+        if k > 0 and aligned[k]["start"] < aligned[k-1]["end"]:
+            aligned[k]["start"] = aligned[k-1]["end"]
+        if aligned[k]["end"] <= aligned[k]["start"] + 0.05:
+            aligned[k]["end"] = round(aligned[k]["start"] + 0.1, 3)
+                
     return aligned
 
 def main():
@@ -816,6 +875,8 @@ def main():
                         target_dur = max(0.5, end_t - start_t)
                         
                         log(f"Dubbing segment {{seg_id}}: '{{seg_text}}' (target duration: {{target_dur}}s)")
+                        if job.get("normalize_text", True) and seg_text:
+                            seg_text = normalize_vietnamese_text(seg_text)
                         
                         gen_kwargs = {{"text": seg_text}}
                         if voice_clone_prompt is not None:
@@ -945,7 +1006,7 @@ def main():
                     "position_temperature", "class_temperature", "layer_penalty_factor",
                     "duration", "speed", "preprocess_prompt", "postprocess_output",
                     "audio_chunk_duration", "audio_chunk_threshold",
-                    "language", "pad_duration", "fade_duration", "normalize_text"
+                    "language", "pad_duration", "fade_duration"
                 ]
                 for key in optional_keys:
                     if key in job and job[key] is not None:
@@ -999,8 +1060,10 @@ def main():
                         
                         duration_sec = len(audio_result[0]) / 24000.0
                         
+                        # Resample to 16kHz float32 numpy array to bypass PyAV av.open bug
+                        resampled_16k = resample_to_16k(audio_result[0], 24000)
                         segments, info = w_model.transcribe(
-                            local_out_path, 
+                            resampled_16k, 
                             word_timestamps=True,
                             language=lang
                         )
@@ -1120,7 +1183,7 @@ if __name__ == '__main__':
                 "language": None,
                 "pad_duration": None,
                 "fade_duration": None,
-                "normalize_text": False
+                "normalize_text": True
             }
 
             if job:
@@ -1156,7 +1219,10 @@ if __name__ == '__main__':
             language = job_params["language"]
             pad_duration = job_params["pad_duration"]
             fade_duration = job_params["fade_duration"]
-            normalize_text = job_params.get("normalize_text", False)
+            normalize_text = job_params.get("normalize_text", True)
+            if normalize_text and text:
+                from app.utils.vietnamese_normalizer import normalize_vietnamese_text
+                text = normalize_vietnamese_text(text)
 
             ref_audio_url = None
             if voice_sample_id:
@@ -1502,8 +1568,7 @@ def main():
             "audio_chunk_threshold": AUDIO_CHUNK_THRESHOLD,
             "language": LANGUAGE,
             "pad_duration": PAD_DURATION,
-            "fade_duration": FADE_DURATION,
-            "normalize_text": NORMALIZE_TEXT
+            "fade_duration": FADE_DURATION
         }}
         for key, val in params_map.items():
             if val is not None:

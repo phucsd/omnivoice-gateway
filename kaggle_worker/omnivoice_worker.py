@@ -85,17 +85,7 @@ def ensure_dependencies():
             print(f"Failed to install dependencies: {e}")
             sys.exit(1)
 
-    # Optional: Try installing WeTextProcessing for text normalization if available
-    try:
-        from tn.english.normalizer import Normalizer
-    except ImportError:
-        try:
-            subprocess.run([
-                sys.executable, "-m", "pip", "install", "-q",
-                "WeTextProcessing", "--prefer-binary"
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
-        except Exception:
-            pass
+
 
 # Ensure dependencies are available before anything else runs
 ensure_dependencies()
@@ -103,6 +93,132 @@ ensure_dependencies()
 import torch
 import soundfile as sf
 from omnivoice import OmniVoice
+
+# ==================== VIETNAMESE TEXT NORMALIZER ====================
+ONES = ["không", "một", "hai", "ba", "bốn", "năm", "sáu", "bảy", "tám", "chín"]
+
+def read_two_digits(val: int, has_hundred: bool = False) -> str:
+    chuc = val // 10
+    donvi = val % 10
+    res = []
+    if chuc == 0:
+        if has_hundred and donvi > 0:
+            res.append("lẻ " + ONES[donvi])
+        elif not has_hundred:
+            res.append(ONES[donvi])
+    elif chuc == 1:
+        res.append("mười")
+        if donvi == 1:
+            res.append("một")
+        elif donvi == 5:
+            res.append("lăm")
+        elif donvi > 0:
+            res.append(ONES[donvi])
+    else:
+        res.append(ONES[chuc] + " mươi")
+        if donvi == 1:
+            res.append("mốt")
+        elif donvi == 4:
+            res.append("tư")
+        elif donvi == 5:
+            res.append("lăm")
+        elif donvi > 0:
+            res.append(ONES[donvi])
+    return " ".join(res)
+
+def read_three_digits(val: int, is_highest: bool = False) -> str:
+    tram = val // 100
+    du = val % 100
+    res = []
+    if tram > 0 or not is_highest:
+        res.append(ONES[tram] + " trăm")
+    if du > 0:
+        res.append(read_two_digits(du, has_hundred=(tram > 0 or not is_highest)))
+    return " ".join(res)
+
+def read_int(n) -> str:
+    try:
+        n = int(n)
+    except (ValueError, TypeError):
+        return str(n)
+    if n == 0:
+        return "không"
+    if n < 0:
+        return "âm " + read_int(-n)
+    units = ["", "nghìn", "triệu", "tỷ"]
+    groups = []
+    temp = n
+    while temp > 0:
+        groups.append(temp % 1000)
+        temp //= 1000
+    words = []
+    for i in range(len(groups) - 1, -1, -1):
+        g = groups[i]
+        if g == 0:
+            continue
+        is_highest = (i == len(groups) - 1)
+        g_words = read_three_digits(g, is_highest=is_highest)
+        unit = units[i % 4]
+        ty_repeat = (i // 4)
+        suffix = (" " + unit if unit else "") + (" tỷ" * ty_repeat if (i % 4 == 0 and ty_repeat > 0) else "")
+        words.append(g_words + suffix)
+    return " ".join(words).strip()
+
+def read_digits_verbatim(digits_str: str) -> str:
+    return " ".join(ONES[int(d)] for d in digits_str if d.isdigit())
+
+def normalize_vietnamese_text(text: str) -> str:
+    import re
+    if not text or not isinstance(text, str):
+        return text
+    s = text.replace("\u00a0", " ")
+    s = re.sub(r'\b(?:v|ver|phiên bản\s*v)\s*(\d+)\.(\d+)\b', r'phiên bản \1.\2', s, flags=re.IGNORECASE)
+    s = re.sub(r'(\d+(?:[.,]\d+)?)\s*%', r'\1 phần trăm', s)
+    s = re.sub(r'(\d+(?:[.,]\d+)?)\s*(?:đ|vnđ|vnd)\b', r'\1 đồng', s, flags=re.IGNORECASE)
+    s = re.sub(r'\$\s*(\d+(?:[.,]\d+)?)', r'\1 đô la', s)
+    s = re.sub(r'€\s*(\d+(?:[.,]\d+)?)', r'\1 ơ-rô', s)
+    def repl_date(m):
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return f"ngày {read_int(d)} tháng {read_int(mo)} năm {read_int(y)}"
+    s = re.sub(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', repl_date, s)
+    def repl_time(m):
+        h = int(m.group(1))
+        m_val = m.group(2)
+        if m_val:
+            return f"{read_int(h)} giờ {read_int(int(m_val))} phút"
+        return f"{read_int(h)} giờ"
+    s = re.sub(r'\b(\d{1,2})h(\d{1,2})?\b', repl_time, s, flags=re.IGNORECASE)
+    s = re.sub(r'\b(\d{1,2}):(\d{2})\b', lambda m: f"{read_int(int(m.group(1)))} giờ {read_int(int(m.group(2)))} phút", s)
+    def repl_thousands(m):
+        full_num_str = m.group(0).replace(".", "")
+        try:
+            return read_int(int(full_num_str))
+        except ValueError:
+            return m.group(0)
+    s = re.sub(r'\b\d{1,3}(?:\.\d{3})+\b', repl_thousands, s)
+    def repl_decimal_comma(m):
+        int_part = m.group(1)
+        dec_part = m.group(2)
+        return f"{read_int(int(int_part))} phẩy {read_digits_verbatim(dec_part)}"
+    s = re.sub(r'\b(\d+),(\d+)\b', repl_decimal_comma, s)
+    def repl_decimal_dot(m):
+        int_part = m.group(1)
+        dec_part = m.group(2)
+        return f"{read_int(int(int_part))} chấm {read_digits_verbatim(dec_part)}"
+    s = re.sub(r'\b(\d+)\.(\d+)\b', repl_decimal_dot, s)
+    s = re.sub(r'\b(\d+)\s*[-–—]\s*(\d+)\b', lambda m: f"{read_int(int(m.group(1)))} đến {read_int(int(m.group(2)))}", s)
+    s = re.sub(r'\b(\d+)\s*[xX]\s*(\d+)\b', lambda m: f"{read_int(int(m.group(1)))} nhân {read_int(int(m.group(2)))}", s)
+    def repl_lone_int(m):
+        val_str = m.group(0)
+        try:
+            return read_int(int(val_str))
+        except ValueError:
+            return val_str
+    s = re.sub(r'\b\d+\b', repl_lone_int, s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+# =====================================================================
+
 
 PUBLIC_API_BASE_URL = 'https://voice.oloka.net'.rstrip("/")
 WORKER_TOKEN = 'ovg_live_017cb79711c97630fe4115677a004eb5a915dd5ba3f6283b'
@@ -129,10 +245,20 @@ def make_request(method: str, path: str, **kwargs) -> requests.Response:
 
 WHISPER_MODEL = None
 
+ONES_MAP = {
+    "0": "không", "1": "một", "2": "hai", "3": "ba", "4": "bốn",
+    "5": "năm", "6": "sáu", "7": "bảy", "8": "tám", "9": "chín",
+    "%": "phần trăm", "đ": "đồng", "$": "đô la"
+}
+
 def levenshtein_ratio(s1, s2):
-    if len(s1) == 0 or len(s2) == 0:
-        return 0.0
     if s1 == s2:
+        return 1.0
+    if not s1 or not s2:
+        return 0.0
+    s1_norm = ONES_MAP.get(s1, s1)
+    s2_norm = ONES_MAP.get(s2, s2)
+    if s1_norm == s2_norm:
         return 1.0
     matrix = [[0] * (len(s2) + 1) for _ in range(len(s1) + 1)]
     for i in range(len(s1) + 1):
@@ -145,6 +271,15 @@ def levenshtein_ratio(s1, s2):
             matrix[i][j] = min(matrix[i-1][j] + 1, matrix[i][j-1] + 1, matrix[i-1][j-1] + cost)
     max_len = max(len(s1), len(s2))
     return 1.0 - (matrix[len(s1)][len(s2)] / max_len)
+
+def resample_to_16k(audio_arr, orig_sr=24000):
+    if orig_sr == 16000:
+        return audio_arr.astype(np.float32)
+    orig_len = len(audio_arr)
+    target_len = int(orig_len * 16000 / orig_sr)
+    orig_idx = np.linspace(0, orig_len, orig_len, endpoint=False)
+    target_idx = np.linspace(0, orig_len, target_len, endpoint=False)
+    return np.interp(target_idx, orig_idx, audio_arr).astype(np.float32)
 
 def get_whisper_model():
     global WHISPER_MODEL
@@ -180,7 +315,19 @@ def align_words(original_words, transcribed_words, audio_duration):
     if n == 0:
         return []
     if m == 0:
-        return None
+        word_dur = audio_duration / n
+        return [
+            dict(word=w, start=round(i * word_dur, 3), end=round((i + 1) * word_dur, 3))
+            for i, w in enumerate(original_words)
+        ]
+
+    # Normalize Whisper timestamps if they drift beyond audio_duration
+    whisper_max = max(w["end"] for w in transcribed_words) if transcribed_words else audio_duration
+    if whisper_max > audio_duration and whisper_max > 0:
+        scale = audio_duration / whisper_max
+        for w in transcribed_words:
+            w["start"] = w["start"] * scale
+            w["end"] = w["end"] * scale
     
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
     parent = [[None] * (m + 1) for _ in range(n + 1)]
@@ -230,7 +377,6 @@ def align_words(original_words, transcribed_words, audio_duration):
             matches[pi] = pj
         i, j = pi, pj
         
-    aligned = []
     matched_times = []
     for idx in range(n):
         if idx in matches:
@@ -240,15 +386,31 @@ def align_words(original_words, transcribed_words, audio_duration):
             matched_times.append((idx, start, end))
             
     if not matched_times:
-        return None
+        word_dur = audio_duration / n
+        return [
+            dict(word=w, start=round(k * word_dur, 3), end=round((k + 1) * word_dur, 3))
+            for k, w in enumerate(original_words)
+        ]
         
     first_matched_idx, first_start, first_end = matched_times[0]
     last_matched_idx, last_start, last_end = matched_times[-1]
     
-    matched_lookup = dict()
-    for idx, start, end in matched_times:
-        matched_lookup[idx] = (start, end)
-        
+    unmatched_tail_count = n - 1 - last_matched_idx
+    if unmatched_tail_count > 0:
+        min_tail_dur = min(audio_duration * 0.4, unmatched_tail_count * 0.25)
+        if (audio_duration - last_end) < min_tail_dur:
+            last_end = max(first_start + 0.2, audio_duration - min_tail_dur)
+            matched_times[-1] = (last_matched_idx, min(matched_times[-1][1], last_end - 0.1), last_end)
+
+    if first_matched_idx > 0:
+        min_head_dur = min(audio_duration * 0.3, first_matched_idx * 0.25)
+        if first_start < min_head_dur:
+            first_start = min_head_dur
+            matched_times[0] = (first_matched_idx, first_start, max(first_start + 0.1, matched_times[0][2]))
+
+    matched_lookup = {idx: (s, e) for idx, s, e in matched_times}
+    
+    aligned = []
     for idx in range(n):
         if idx in matched_lookup:
             start, end = matched_lookup[idx]
@@ -271,7 +433,7 @@ def align_words(original_words, transcribed_words, audio_duration):
         elif idx > last_matched_idx:
             rem_chars = sum(len(original_words[k]) for k in range(last_matched_idx + 1, n)) or 1
             chars_before = sum(len(original_words[k]) for k in range(last_matched_idx + 1, idx))
-            rem_duration = audio_duration - last_end
+            rem_duration = max(0.2, audio_duration - last_end)
             start = last_end + rem_duration * (chars_before / rem_chars)
             word_dur = rem_duration * (len(original_words[idx]) / rem_chars)
             end = start + word_dur
@@ -282,29 +444,25 @@ def align_words(original_words, transcribed_words, audio_duration):
             ))
         else:
             pre_idx = -1
-            pre_start = 0.0
             pre_end = 0.0
-            for o_idx, start, end in matched_times:
+            for o_idx, s, e in matched_times:
                 if o_idx < idx:
                     pre_idx = o_idx
-                    pre_start = start
-                    pre_end = end
+                    pre_end = e
                 else:
                     break
                     
             succ_idx = -1
-            succ_start = 0.0
-            succ_end = 0.0
-            for o_idx, start, end in matched_times:
+            succ_start = audio_duration
+            for o_idx, s, e in matched_times:
                 if o_idx > idx:
                     succ_idx = o_idx
-                    succ_start = start
-                    succ_end = end
+                    succ_start = s
                     break
                     
             gap_chars = sum(len(original_words[k]) for k in range(pre_idx + 1, succ_idx)) or 1
             chars_before = sum(len(original_words[k]) for k in range(pre_idx + 1, idx))
-            gap_duration = succ_start - pre_end
+            gap_duration = max(0.15 * (succ_idx - pre_idx - 1), succ_start - pre_end)
             
             start = pre_end + gap_duration * (chars_before / gap_chars)
             word_dur = gap_duration * (len(original_words[idx]) / gap_chars)
@@ -315,7 +473,14 @@ def align_words(original_words, transcribed_words, audio_duration):
                 start=round(start, 3),
                 end=round(end, 3)
             ))
-            
+
+    # Final pass to ensure strictly monotonic and min duration >= 0.08s
+    for k in range(len(aligned)):
+        if k > 0 and aligned[k]["start"] < aligned[k-1]["end"]:
+            aligned[k]["start"] = aligned[k-1]["end"]
+        if aligned[k]["end"] <= aligned[k]["start"] + 0.05:
+            aligned[k]["end"] = round(aligned[k]["start"] + 0.1, 3)
+                
     return aligned
 
 def main():
@@ -681,6 +846,8 @@ def main():
                         target_dur = max(0.5, end_t - start_t)
                         
                         log(f"Dubbing segment {seg_id}: '{seg_text}' (target duration: {target_dur}s)")
+                        if job.get("normalize_text", True) and seg_text:
+                            seg_text = normalize_vietnamese_text(seg_text)
                         
                         gen_kwargs = {"text": seg_text}
                         if voice_clone_prompt is not None:
@@ -792,8 +959,12 @@ def main():
                 )
 
                 # Build generate arguments
+                job_text = job.get("text", "")
+                if job.get("normalize_text", True) and job_text:
+                    job_text = normalize_vietnamese_text(job_text)
+                    job["text"] = job_text
                 generate_args = {
-                    "text": job["text"]
+                    "text": job_text
                 }
                 
                 if job_type == "clone_voice":
@@ -810,7 +981,7 @@ def main():
                     "position_temperature", "class_temperature", "layer_penalty_factor",
                     "duration", "speed", "preprocess_prompt", "postprocess_output",
                     "audio_chunk_duration", "audio_chunk_threshold",
-                    "language", "pad_duration", "fade_duration", "normalize_text"
+                    "language", "pad_duration", "fade_duration"
                 ]
                 for key in optional_keys:
                     if key in job and job[key] is not None:
@@ -864,8 +1035,10 @@ def main():
                         
                         duration_sec = len(audio_result[0]) / 24000.0
                         
+                        # Resample to 16kHz float32 numpy array to bypass PyAV av.open bug
+                        resampled_16k = resample_to_16k(audio_result[0], 24000)
                         segments, info = w_model.transcribe(
-                            local_out_path, 
+                            resampled_16k, 
                             word_timestamps=True,
                             language=lang
                         )
