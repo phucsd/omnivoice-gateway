@@ -1011,6 +1011,101 @@ def test_wsola_atempo_stretch_without_librosa_and_stereo_bgm_preservation(tmp_pa
     assert side_rms > 0.02, f"Expected preserved stereo L-R difference in BGM outro, got side_rms={side_rms}"
 
 
+def test_cohesive_asr_clause_segmentation_orphan_reattachment_and_nonblocking_worker_upload():
+    """
+    Verifies Phase-2 live-audit fixes:
+    1. Mid-phrase 20-word sentences ('...in the proper position on the organizer tray.') are never chopped after 'proper' or 'the'.
+    2. Whisper chunk 'seg_end' without an acoustic pause does not chop infinitive/conjunction tails ('...packaging and place it into the implant.').
+    3. Orphan 1-word clause starter ('After') pulled back by Whisper DTW across a 3.7s silence is re-attached to the post-pause speech onset.
+    4. Subword spacing ('4 .2 mm', 'MIS -C1XD', 'single -use') and double punctuation ('implant,.') are cleaned in both EN and translated VI.
+    5. internal_worker.upload_job_output runs in FastAPI's threadpool (regular def, not async def) so FFmpeg preview/mux never blocks the event loop.
+    """
+    import inspect
+    from app.routers.internal_worker import upload_job_output
+    from app.services.video_dubbing_service import VideoDubbingService
 
+    assert not inspect.iscoroutinefunction(upload_job_output), (
+        "upload_job_output must be a sync threadpool handler (def), not async def, so FFmpeg I/O never freezes Uvicorn's event loop"
+    )
 
+    words_sentence_1 = [
+        "This", "video", "will", "demonstrate", "the", "placement", "of", "an", "MIS", "-C1XD", "implant,",
+        "using", "an", "implant", "with", "a", "diameter", "of", "4", ".2", "mm", "and", "a", "length", "of", "13", "mm.",
+    ]
+    words_sentence_2 = [
+        "Begin", "by", "opening", "the", "implant's", "package", "and", "placing", "the", "implant's",
+        "inner", "tube", "in", "the", "proper", "position", "on", "the", "organizer", "tray.",
+    ]
+    words_sentence_3 = [
+        "The", "recommended", "torque", "is", "35", "to", "60", "Nm.",
+    ]
+    # Simulate Whisper DTW pulling 'After' back to 171.21-172.09 before 3.73s silence, followed by continuous speech with mid-utterance seg_end
+    words_after_pause = [
+        ("After", 171.21, 172.09, False),
+        ("placing", 175.82, 176.25, False),
+        ("the", 176.25, 176.40, False),
+        ("implant,", 176.40, 176.95, False),
+        ("use", 177.05, 177.30, False),
+        ("the", 177.30, 177.45, False),
+        ("single", 177.45, 177.80, False),
+        ("-use", 177.80, 178.05, False),
+        ("tool", 178.05, 178.35, False),
+        ("to", 178.35, 178.50, False),
+        ("remove", 178.50, 178.90, False),
+        ("the", 178.90, 179.05, False),
+        ("cover", 179.05, 179.45, False),
+        ("screw", 179.45, 179.85, False),
+        ("from", 179.85, 180.05, False),
+        ("the", 180.05, 180.15, False),
+        ("packaging", 180.15, 180.40, True),  # Whisper internal chunk boundary with 0.00s gap!
+        ("and", 180.40, 180.55, False),
+        ("place", 180.55, 180.85, False),
+        ("it", 180.85, 181.00, False),
+        ("into", 181.00, 181.25, False),
+        ("the", 181.25, 181.40, False),
+        ("implant.", 181.40, 181.94, True),
+    ]
+
+    alignment = []
+    t_cursor = 3.03
+    for w in words_sentence_1:
+        dur = 0.35
+        alignment.append({"word": w, "start": round(t_cursor, 2), "end": round(t_cursor + dur, 2), "prob": 0.96, "seg_end": w.endswith(".")})
+        t_cursor += dur
+    t_cursor = 14.59
+    for w in words_sentence_2:
+        dur = 0.34
+        alignment.append({"word": w, "start": round(t_cursor, 2), "end": round(t_cursor + dur, 2), "prob": 0.95, "seg_end": w.endswith(".")})
+        t_cursor += dur
+    t_cursor = 166.49
+    for w in words_sentence_3:
+        dur = 0.59
+        alignment.append({"word": w, "start": round(t_cursor, 2), "end": round(t_cursor + dur, 2), "prob": 0.97, "seg_end": w.endswith(".")})
+        t_cursor += dur
+    for w, st, et, se in words_after_pause:
+        alignment.append({"word": w, "start": st, "end": et, "prob": 0.94, "seg_end": se})
+
+    segs = VideoDubbingService.build_clean_asr_segments(alignment, raw_text="", total_duration=213.0)
+    texts = [s["text"] for s in segs]
+
+    # 1. No ',.' double punctuation and subword spacing cleaned
+    assert all(",." not in t and "4 .2" not in t and " -use" not in t and " -C1XD" not in t for t in texts), texts
+    # 2. First sentence splits cleanly at comma into 2 balanced clauses, with clean 'MIS-C1XD' and '4.2 mm'
+    assert texts[0] == "This video will demonstrate the placement of an MIS-C1XD implant."
+    assert texts[1] == "Using an implant with a diameter of 4.2 mm and a length of 13 mm."
+    # 3. 20-word sentence stays intact (not chopped after 'proper')
+    assert texts[2] == "Begin by opening the implant's package and placing the implant's inner tube in the proper position on the organizer tray."
+    # 4. Segment 1 start is preserved at 3.03s (no legacy 8.5s jump)
+    assert segs[0]["start"] == 3.03
+    # 5. Orphan 'After' is re-attached to 'placing the implant...' with onset anchored at 175.47s (not a standalone 'After.' segment)
+    assert not any(t.lower() in ("after.", "after") for t in texts), texts
+    assert texts[4] == "After placing the implant, use the single-use tool to remove the cover screw from the packaging and place it into the implant."
+    assert abs(segs[4]["start"] - 175.47) < 0.05
+
+    # 6. normalize_translated_subtitles also strips trailing ',.' in Vietnamese LLM output
+    vi_norm = VideoDubbingService.normalize_translated_subtitles(
+        [{"text": "Mỗi mũi khoan được đóng gói vô trùng, mã màu để dễ nhận biết,"}],
+        [{"id": 1, "start": 29.0, "end": 33.84, "text": "Each drill is provided in a sterile pouch."}],
+    )
+    assert vi_norm[0]["text"] == "Mỗi mũi khoan được đóng gói vô trùng, mã màu để dễ nhận biết."
 

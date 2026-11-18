@@ -1127,9 +1127,19 @@ export default function DubbingStudio({
       const hasStray = /[\u0370-\u03ff\u0400-\u04ff]/.test(s);
       return hasLatin && hasStray;
     };
+    const cleanSpacingAndPunct = (s: string) =>
+      s
+        .replace(/(\d)\s+\.(\d)/g, "$1.$2")
+        .replace(/([A-Za-z0-9])\s+-([A-Za-z])/g, "$1-$2")
+        .replace(/([A-Z]{2,})\s+-(\d)/g, "$1-$2")
+        .replace(/\s+([,.;?!:])/g, "$1")
+        .replace(/[,;]+\s*\./g, ".")
+        .replace(/\s{2,}/g, " ")
+        .trim();
     const stripBadSentences = (s: string) => {
-      const parts = s.trim().split(/(?<=[.!?])\s+/);
-      if (parts.length <= 1) return hasScriptCorruption(s) ? "" : s.trim();
+      const normalized = cleanSpacingAndPunct(s);
+      const parts = normalized.split(/(?<=[.!?])\s+/);
+      if (parts.length <= 1) return hasScriptCorruption(normalized) ? "" : normalized;
       return parts.filter(p => p.trim() && !hasScriptCorruption(p)).join(" ").trim();
     };
 
@@ -1151,8 +1161,9 @@ export default function DubbingStudio({
       const newId = nextOrig.length + 1;
       const st = nextOrig.length > 0 ? Math.max(nextOrig[nextOrig.length - 1].end, orig.start) : orig.start;
       const et = Math.max(st + 0.4, orig.end);
+      const cleanedTransTxt = cleanSpacingAndPunct(trans.text || "");
       nextOrig.push({ ...orig, id: newId, start: st, end: et, text: cleanedOrigTxt });
-      nextTrans.push({ ...trans, id: newId, start: st, end: et });
+      nextTrans.push({ ...trans, id: newId, start: st, end: et, text: cleanedTransTxt });
     });
 
     setOriginalSubs(nextOrig);

@@ -174,7 +174,7 @@ def update_job_status(
         )
 
 @router.post("/jobs/{job_id}/output")
-async def upload_job_output(
+def upload_job_output(
     job_id: str,
     file: UploadFile = File(...),
     alignment: Optional[str] = Form(None),

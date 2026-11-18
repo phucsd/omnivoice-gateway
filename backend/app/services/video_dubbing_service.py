@@ -2182,6 +2182,73 @@ class VideoDubbingService:
         ]
         return " ".join(valid_parts).strip()
 
+    _DANGLING_END_WORDS = {
+        "a", "an", "the", "this", "that", "these", "those",
+        "my", "your", "his", "her", "its", "our", "their",
+        "to", "of", "in", "on", "at", "by", "for", "with", "from", "into", "onto",
+        "upon", "over", "under", "between", "through", "during", "before", "after",
+        "without", "within", "along", "across", "around", "near",
+        "and", "or", "but", "nor", "so", "yet", "as", "than", "if", "when", "while",
+        "where", "which", "who", "whom", "whose", "whether", "because", "although",
+        "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did",
+        "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+        "not", "very", "more", "most", "less", "least", "too", "quite", "each", "every", "all",
+        "proper", "relevant", "prepared", "sterile", "existing", "correct", "used",
+        "recommended", "last", "first", "same", "other", "another", "new",
+    }
+
+    _ORPHAN_STARTER_WORDS = {
+        "after", "before", "when", "while", "once", "until", "since", "if", "unless",
+        "although", "though", "because", "as", "where", "whenever",
+        "to", "in", "on", "at", "by", "for", "with", "from", "into", "onto", "upon",
+        "using", "during", "through", "without", "within",
+        "the", "a", "an", "this", "that", "these", "those", "each", "every",
+        "and", "or", "but",
+    }
+
+    _CLAUSE_BREAK_STARTERS = {
+        "and", "or", "but", "which", "that", "where", "when", "while",
+        "because", "although", "allowing", "providing", "according",
+    }
+
+    @staticmethod
+    def _clean_whisper_spacing_and_punctuation(text: str) -> str:
+        """
+        Normalizes Whisper BPE subword spacing artifacts (e.g. '4 .2 mm' -> '4.2 mm',
+        'single -use' -> 'single-use', 'MIS -C1XD' -> 'MIS-C1XD') and removes double
+        clause/terminal punctuation ('implant,.' -> 'implant.').
+        """
+        if not text:
+            return ""
+        txt = str(text).strip()
+        # Fix spaces before decimal points in numbers: "4 .2" -> "4.2", "3 .65" -> "3.65"
+        txt = re.sub(r"(\d)\s+\.(\d)", r"\1.\2", txt)
+        # Fix spaces before hyphenated subwords/codes: "single -use" -> "single-use", "MIS -C1XD" -> "MIS-C1XD"
+        # Preserves spaced dash separators like "MIS - Make it simple" (which have space after '-')
+        txt = re.sub(r"([A-Za-z0-9])\s+-([A-Za-z])", r"\1-\2", txt)
+        txt = re.sub(r"([A-Z]{2,})\s+-(\d)", r"\1-\2", txt)
+        # Remove stray whitespace before punctuation
+        txt = re.sub(r"\s+([,.;?!:])", r"\1", txt)
+        # Collapse any comma/semicolon immediately followed by a period: ",." or ";." -> "."
+        txt = re.sub(r"[,;]+\s*\.", ".", txt)
+        txt = re.sub(r"\.{2}(?!\.)", ".", txt)
+        txt = re.sub(r"\s{2,}", " ", txt)
+        return txt.strip()
+
+    @staticmethod
+    def _lowercase_continuation_start(text: str) -> str:
+        """Lowercases the first character when joining a mid-sentence continuation unless it is an acronym/proper code."""
+        if not text:
+            return ""
+        first_token = text.split()[0].strip(".,!?;:\"'()-") if text.split() else ""
+        # Keep acronyms/codes like "MIS", "XD", "C1", "I" capitalized
+        if len(first_token) >= 2 and any(c.isupper() for c in first_token[1:]):
+            return text
+        if first_token == "I" or first_token.startswith("I'"):
+            return text
+        return text[0].lower() + text[1:]
+
     @staticmethod
     def build_clean_asr_segments(
         alignment_data: List[Dict[str, Any]],
@@ -2189,10 +2256,11 @@ class VideoDubbingService:
         total_duration: float = 120.0,
     ) -> List[Dict[str, Any]]:
         """
-        Constructs accurate, non-overlapping sentence segments from Whisper word alignments:
+        Constructs accurate, non-overlapping, syntactically cohesive sentence segments from Whisper word alignments:
         - Filters low-probability hallucinated words and retrograde timestamp jumps
-        - Respects natural Whisper segment boundaries, punctuation, and speech pauses (>= 0.65s)
-        - Cleans tail hallucinations and normalizes segment boundaries
+        - Splits on terminal punctuation, real acoustic pauses (>= 0.65s), and balanced clause boundaries
+        - Avoids mid-phrase cuts on determiners/prepositions/modifiers ('the', 'proper', 'to', etc.)
+        - Cleans tail hallucinations, DTW orphan starter pullbacks, and Whisper subword spacing
         """
         def _extract_timing(w_item: dict) -> Tuple[float, float]:
             s_v = w_item.get("start")
@@ -2249,7 +2317,21 @@ class VideoDubbingService:
                 "prob": float(prob) if prob is not None else 1.0,
             })
 
-        # 2. Group words into natural clauses/sentences using pause & punctuation detection
+        def _remaining_words_until_sentence_or_pause(from_idx: int) -> int:
+            """Counts words after from_idx until the next terminal punctuation or acoustic pause >= 0.65s."""
+            cnt = 0
+            prev_e = filtered_words[from_idx]["end"]
+            for j in range(from_idx + 1, min(len(filtered_words), from_idx + 30)):
+                wj = filtered_words[j]
+                if wj["start"] - prev_e >= 0.65:
+                    break
+                cnt += 1
+                prev_e = wj["end"]
+                if wj["word"].endswith((".", "?", "!", ";")):
+                    break
+            return cnt
+
+        # 2. Group words into natural sentences/clauses without mid-phrase cuts
         segments: List[Dict[str, Any]] = []
         curr_seg: List[Dict[str, Any]] = []
         seg_idx = 1
@@ -2257,13 +2339,13 @@ class VideoDubbingService:
         def _flush_curr_seg(words_buf: List[Dict[str, Any]], idx_val: int) -> Optional[Dict[str, Any]]:
             if not words_buf:
                 return None
-            # Check average word probability of segment if available
             avg_p = sum(w.get("prob", 1.0) for w in words_buf) / len(words_buf)
             if avg_p < 0.38:
                 return None
             st = words_buf[0]["start"]
             et = max(st + 0.5, words_buf[-1]["end"])
             txt = " ".join(w["word"] for w in words_buf).strip()
+            txt = VideoDubbingService._clean_whisper_spacing_and_punctuation(txt)
             txt = VideoDubbingService._strip_hallucinated_subsentences(txt)
             if not txt:
                 return None
@@ -2278,8 +2360,18 @@ class VideoDubbingService:
             if curr_seg:
                 prev_end = curr_seg[-1]["end"]
                 pause_gap = w_obj["start"] - prev_end
-                # Split BEFORE adding current word if there is a clear speech pause (>= 0.65s)
-                if pause_gap >= 0.65:
+                # Split BEFORE adding current word if there is a clear speech pause (>= 0.65s),
+                # OR if a long unpunctuated run-on (>= 20 words / >= 9.5s) reaches a clean clause starter
+                w_next_clean = w_obj["word"].strip(".,!?;:\"'()-").lower()
+                prev_w_clean = curr_seg[-1]["word"].strip(".,!?;:\"'()-").lower()
+                curr_dur_before = prev_end - curr_seg[0]["start"]
+                rem_after_prev = _remaining_words_until_sentence_or_pause(i - 1)
+                if pause_gap >= 0.65 or (
+                    (len(curr_seg) >= 20 or curr_dur_before >= 9.5)
+                    and w_next_clean in VideoDubbingService._CLAUSE_BREAK_STARTERS
+                    and prev_w_clean not in VideoDubbingService._DANGLING_END_WORDS
+                    and rem_after_prev >= 5
+                ):
                     flushed = _flush_curr_seg(curr_seg, seg_idx)
                     if flushed:
                         segments.append(flushed)
@@ -2288,17 +2380,35 @@ class VideoDubbingService:
 
             curr_seg.append(w_obj)
             w_txt = w_obj["word"]
+            w_clean = w_txt.strip(".,!?;:\"'()-").lower()
             seg_dur = curr_seg[-1]["end"] - curr_seg[0]["start"]
             ends_punct = w_txt.endswith((".", "?", "!", ";"))
-            ends_clause = w_txt.endswith((",", ":", "-"))
+            ends_clause = w_txt.endswith((",", ":"))
 
-            if (
-                ends_punct
-                or w_obj.get("seg_end")
-                or (ends_clause and (len(curr_seg) >= 10 or seg_dur >= 6.5))
-                or len(curr_seg) >= 15
-                or seg_dur >= 9.0
-            ):
+            next_pause = (
+                filtered_words[i + 1]["start"] - w_obj["end"]
+                if (i + 1) < len(filtered_words)
+                else 999.0
+            )
+            rem_words = _remaining_words_until_sentence_or_pause(i)
+            is_dangling = w_clean in VideoDubbingService._DANGLING_END_WORDS
+
+            should_flush = False
+            if ends_punct:
+                should_flush = True
+            elif ends_clause and (len(curr_seg) >= 10 or seg_dur >= 5.5) and rem_words >= 7:
+                # Balanced comma/colon split on multi-clause sentences without chopping tiny <=6-word tails
+                should_flush = True
+            elif w_obj.get("seg_end") and next_pause >= 0.35 and not is_dangling:
+                # Only trust Whisper chunk/segment boundary when backed by an actual >=350ms pause
+                should_flush = True
+            elif not is_dangling and (len(curr_seg) >= 24 or seg_dur >= 11.5) and rem_words >= 4:
+                should_flush = True
+            elif len(curr_seg) >= 28 or seg_dur >= 13.5:
+                # Absolute safety cap for completely unpunctuated continuous speech
+                should_flush = True
+
+            if should_flush:
                 flushed = _flush_curr_seg(curr_seg, seg_idx)
                 if flushed:
                     segments.append(flushed)
@@ -2312,11 +2422,12 @@ class VideoDubbingService:
 
         # Fallback if alignment_data was empty
         if not segments and raw_text and raw_text.strip():
-            clean_raw = VideoDubbingService._strip_hallucinated_subsentences(raw_text.strip())
+            clean_raw = VideoDubbingService._clean_whisper_spacing_and_punctuation(raw_text.strip())
+            clean_raw = VideoDubbingService._strip_hallucinated_subsentences(clean_raw)
             words = clean_raw.split()
             if words:
                 dur = max(1.0, float(total_duration or 60.0))
-                chunk_size = 10
+                chunk_size = 12
                 total_chunks = max(1, (len(words) + chunk_size - 1) // chunk_size)
                 step_dur = dur / total_chunks
                 for c_idx in range(total_chunks):
@@ -2335,8 +2446,8 @@ class VideoDubbingService:
     @staticmethod
     def merge_and_normalize_subtitles(subs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Filters out empty/hallucinated/overlapping segments, merges only incomplete or ultra-short fragments
-        without ever merging across completed sentences or long pauses, and normalizes punctuation/timing.
+        Filters out empty/hallucinated/overlapping segments, re-attaches DTW-pulled orphan clause starters
+        and mid-phrase dangling splits, preserves balanced comma splits, and normalizes spacing/punctuation.
         """
         if not subs:
             return []
@@ -2347,6 +2458,7 @@ class VideoDubbingService:
             txt = str(s.get("text", "")).strip()
             for tag in ["[Korean]", "[Vietnamese]", "[Japanese]", "[English]", "[Chinese]"]:
                 txt = txt.replace(tag, "").strip()
+            txt = VideoDubbingService._clean_whisper_spacing_and_punctuation(txt)
             txt = VideoDubbingService._strip_hallucinated_subsentences(txt)
             alpha_chars = [c for c in txt if c.isalnum()]
             if not alpha_chars:
@@ -2377,55 +2489,136 @@ class VideoDubbingService:
         if not cleaned:
             return []
 
-        # 2. Merge fragmented clauses carefully without merging completed sentences with trailing segments
-        merged: List[Dict[str, Any]] = []
-        curr = dict(cleaned[0])
+        # 1b. Re-attach orphan 1-word subordinating/prepositional starters pulled back across silence by Whisper DTW
+        # Example: #25 "After" (171.21->172.09) + 3.73s pause + #26 "Placing the implant..." (175.82->180.40)
+        reattached: List[Dict[str, Any]] = []
+        idx_c = 0
+        while idx_c < len(cleaned):
+            curr_item = dict(cleaned[idx_c])
+            if idx_c + 1 < len(cleaned):
+                nxt_item = dict(cleaned[idx_c + 1])
+                c_txt = curr_item["text"].strip()
+                c_tokens = c_txt.split()
+                c_bare = c_txt.strip(".,!?;:\"'()-").lower()
+                gap_to_nxt = nxt_item["start"] - curr_item["end"]
 
-        for nxt in cleaned[1:]:
+                # Unpunctuated 1-word starter, OR 1-word strict function word that cannot stand alone even if '.' was previously added
+                strict_non_standalone = {
+                    "after", "before", "when", "while", "once", "until", "since", "if", "unless",
+                    "although", "though", "because", "to", "with", "by", "from", "into", "onto",
+                    "the", "a", "an", "and", "or", "but",
+                }
+                is_unpunct_orphan = (
+                    len(c_tokens) == 1
+                    and not any(c_txt.endswith(p) for p in [".", "!", "?"])
+                    and c_bare in VideoDubbingService._ORPHAN_STARTER_WORDS
+                )
+                is_strict_orphan = len(c_tokens) == 1 and c_bare in strict_non_standalone
+
+                if (is_unpunct_orphan or is_strict_orphan) and gap_to_nxt < 6.0:
+                    prefix_word = c_txt.rstrip(".,;: ").strip()
+                    cont_text = VideoDubbingService._lowercase_continuation_start(nxt_item["text"].strip())
+                    nxt_item["text"] = f"{prefix_word} {cont_text}".strip()
+                    if gap_to_nxt >= 1.0:
+                        # Anchor start to actual post-pause speech onset (~0.35s before 2nd word)
+                        nxt_item["start"] = round(max(curr_item["end"], nxt_item["start"] - 0.35), 2)
+                    else:
+                        nxt_item["start"] = curr_item["start"]
+                    cleaned[idx_c + 1] = nxt_item
+                    idx_c += 1
+                    continue
+
+            reattached.append(curr_item)
+            idx_c += 1
+
+        if not reattached:
+            return []
+
+        # 2. Merge fragmented clauses carefully without merging completed sentences or undoing balanced comma splits
+        merged: List[Dict[str, Any]] = []
+        curr = dict(reattached[0])
+
+        for nxt in reattached[1:]:
             curr_txt = curr["text"].strip()
             nxt_txt = nxt["text"].strip()
-            curr_words = len(curr_txt.split())
-            nxt_words = len(nxt_txt.split())
+            curr_tokens = curr_txt.split()
+            nxt_tokens = nxt_txt.split()
+            curr_words = len(curr_tokens)
+            nxt_words = len(nxt_tokens)
             time_gap = nxt["start"] - curr["end"]
             merged_duration = nxt["end"] - curr["start"]
 
+            last_word_bare = curr_tokens[-1].strip(".,!?;:\"'()-").lower() if curr_tokens else ""
+            nxt_first_bare = nxt_tokens[0].strip(".,!?;:\"'()-").lower() if nxt_tokens else ""
             ends_sentence = any(curr_txt.endswith(p) for p in [".", "!", "?"])
+            ends_comma = curr_txt.endswith((",", ";", ":"))
+
+            continuation_tail_starters = {
+                "and", "or", "but", "to", "for", "with", "by", "in", "on",
+                "from", "into", "onto", "according", "allowing", "providing", "which", "that",
+            }
 
             should_merge = False
             if ends_sentence:
-                # Only merge a completed sentence if it is a 1-2 word acronym/title (e.g. "MIS.")
-                # immediately followed (< 0.45s) by a short slogan (<= 5 words, e.g. "Make it simple.")
+                # Case A: 1-2 word acronym/title (e.g. "MIS.") immediately followed (< 0.45s) by short slogan ("Make it simple.")
                 if curr_words <= 2 and nxt_words <= 5 and time_gap < 0.45 and merged_duration <= 5.0:
                     should_merge = True
+                # Case B: Heal previously normalized mid-phrase dangling cuts (e.g. "...in the proper." + "Position on the tray.")
+                elif (
+                    curr_txt.endswith(".")
+                    and last_word_bare in VideoDubbingService._DANGLING_END_WORDS
+                    and time_gap < 0.45
+                    and merged_duration <= 11.5
+                    and (curr_words + nxt_words) <= 24
+                ):
+                    curr_txt = curr_txt.rstrip(". ").strip()
+                    nxt_txt = VideoDubbingService._lowercase_continuation_start(nxt_txt)
+                    should_merge = True
+                # Case C: Heal continuous-speech (<= 0.25s gap) short subordinate/coordinate tails where Whisper emitted '.' mid-utterance
+                # e.g. "...remove the cover screw from the packaging." (0.00s gap) + "And place it into the implant." (6 words)
+                elif (
+                    curr_txt.endswith(".")
+                    and time_gap <= 0.25
+                    and nxt_words <= 7
+                    and nxt_first_bare in continuation_tail_starters
+                    and (nxt_first_bare != "to" or "," not in nxt_txt)
+                    and merged_duration <= 9.5
+                    and (curr_words + nxt_words) <= 23
+                ):
+                    curr_txt = curr_txt.rstrip(". ").strip()
+                    nxt_txt = VideoDubbingService._lowercase_continuation_start(nxt_txt)
+                    should_merge = True
             else:
-                # Incomplete clause: merge if pause is short (< 0.85s) and combined segment stays concise
-                if time_gap < 0.85 and merged_duration <= 10.0 and (curr_words + nxt_words) <= 18:
+                # Preserve intentional balanced comma splits (both sides substantial: >= 10 words and >= 7 words)
+                if ends_comma and curr_words >= 10 and nxt_words >= 7:
+                    should_merge = False
+                elif time_gap < 0.85 and merged_duration <= 11.5 and (curr_words + nxt_words) <= 24:
+                    nxt_txt = VideoDubbingService._lowercase_continuation_start(nxt_txt)
                     should_merge = True
 
             if should_merge:
                 curr["end"] = max(curr["end"], nxt["end"])
-                curr["text"] = f"{curr_txt} {nxt_txt}"
+                curr["text"] = VideoDubbingService._clean_whisper_spacing_and_punctuation(f"{curr_txt} {nxt_txt}")
             else:
                 merged.append(curr)
                 curr = dict(nxt)
 
         merged.append(curr)
 
-        # 3. Final normalization (Capitalization, punctuation ending, monotonic timestamps, re-numbering)
+        # 3. Final normalization (Capitalization, clean terminal punctuation without ',.', monotonic timestamps)
         final_subs: List[Dict[str, Any]] = []
         prev_end_val = 0.0
-        for i, s in enumerate(merged):
-            txt = VideoDubbingService._strip_hallucinated_subsentences(s["text"].strip())
+        for s in merged:
+            txt = VideoDubbingService._clean_whisper_spacing_and_punctuation(s["text"].strip())
+            txt = VideoDubbingService._strip_hallucinated_subsentences(txt)
+            txt = txt.rstrip(",; ").strip()
             if not txt:
                 continue
             txt = txt[0].upper() + txt[1:]
-            if not any(txt.endswith(p) for p in [".", "!", "?", "...", ":", ";"]):
+            if not any(txt.endswith(p) for p in [".", "!", "?", "...", ":"]):
                 txt += "."
 
             st_val = round(max(prev_end_val, float(s["start"])), 2)
-            # If segment 1 includes intro music (0.0s - 8.5s), shift start to actual speech onset (~8.5s)
-            if i == 0 and st_val < 3.0 and s["end"] >= 8.0:
-                st_val = 8.5
             et_val = round(max(st_val + 0.4, float(s["end"])), 2)
             prev_end_val = et_val
 
@@ -2455,9 +2648,11 @@ class VideoDubbingService:
             txt = str(cand.get("text", orig.get("text", ""))).strip()
             for tag in ["[Korean]", "[Vietnamese]", "[Japanese]", "[English]", "[Chinese]"]:
                 txt = txt.replace(tag, "").strip()
+            txt = VideoDubbingService._clean_whisper_spacing_and_punctuation(txt)
+            txt = txt.rstrip(",; ").strip()
             if txt:
                 txt = txt[0].upper() + txt[1:]
-                if not any(txt.endswith(p) for p in [".", "!", "?", "...", ":", ";"]):
+                if not any(txt.endswith(p) for p in [".", "!", "?", "...", ":"]):
                     txt += "."
             else:
                 txt = str(orig.get("text", "")).strip()
