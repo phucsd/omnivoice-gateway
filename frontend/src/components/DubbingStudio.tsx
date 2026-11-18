@@ -170,6 +170,9 @@ export default function DubbingStudio({
   const [selectedSegId, setSelectedSegId] = useState<number | null>(null);
   const [savingSubs, setSavingSubs] = useState(false);
   const [retranslating, setRetranslating] = useState(false);
+  const [currentVideoTime, setCurrentVideoTime] = useState<number>(0);
+  const [subOverlayMode, setSubOverlayMode] = useState<"bilingual" | "en" | "vi" | "off">("bilingual");
+  const [editingOrigSegId, setEditingOrigSegId] = useState<number | null>(null);
 
   // Media Player Refs & Audio Mixer
   const videoPlayerRef = useRef<HTMLVideoElement>(null);
@@ -694,14 +697,19 @@ export default function DubbingStudio({
     const interval = setInterval(async () => {
       try {
         const data = await api.getDubbingJob(jobId);
-        setJob(data);
-
-        if (data.original_subtitles && data.original_subtitles.length > 0) {
-          setOriginalSubs(data.original_subtitles);
-        }
-        if (data.translated_subtitles && data.translated_subtitles.length > 0) {
-          setTranslatedSubs(data.translated_subtitles);
-        }
+        setJob(prev => {
+          const wasReview = prev?.status === "awaiting_review";
+          const isNowReview = data.status === "awaiting_review";
+          if (!wasReview || !isNowReview) {
+            if (data.original_subtitles && data.original_subtitles.length > 0) {
+              setOriginalSubs(data.original_subtitles);
+            }
+            if (data.translated_subtitles && data.translated_subtitles.length > 0) {
+              setTranslatedSubs(data.translated_subtitles);
+            }
+          }
+          return data;
+        });
 
         // Fetch logs
         try {
@@ -1079,6 +1087,7 @@ export default function DubbingStudio({
 
   const jumpToSegment = (start: number, id: number) => {
     setSelectedSegId(id);
+    setCurrentVideoTime(start);
     if (videoPlayerRef.current) {
       videoPlayerRef.current.currentTime = start;
       videoPlayerRef.current.play();
@@ -1089,6 +1098,65 @@ export default function DubbingStudio({
     setTranslatedSubs(prev =>
       prev.map(item => (item.id === id ? { ...item, text } : item))
     );
+  };
+
+  const updateOrigSubText = (id: number, text: string) => {
+    setOriginalSubs(prev =>
+      prev.map(item => (item.id === id ? { ...item, text } : item))
+    );
+  };
+
+  const handleDeleteSegment = (segId: number) => {
+    setOriginalSubs(prev =>
+      prev
+        .filter(item => item.id !== segId)
+        .map((item, idx) => ({ ...item, id: idx + 1 }))
+    );
+    setTranslatedSubs(prev =>
+      prev
+        .filter(item => item.id !== segId)
+        .map((item, idx) => ({ ...item, id: idx + 1 }))
+    );
+    if (selectedSegId === segId) setSelectedSegId(null);
+    if (editingOrigSegId === segId) setEditingOrigSegId(null);
+  };
+
+  const handleCleanAsrHallucinations = () => {
+    const hasScriptCorruption = (s: string) => {
+      const hasLatin = /[A-Za-z]/.test(s);
+      const hasStray = /[\u0370-\u03ff\u0400-\u04ff]/.test(s);
+      return hasLatin && hasStray;
+    };
+    const stripBadSentences = (s: string) => {
+      const parts = s.trim().split(/(?<=[.!?])\s+/);
+      if (parts.length <= 1) return hasScriptCorruption(s) ? "" : s.trim();
+      return parts.filter(p => p.trim() && !hasScriptCorruption(p)).join(" ").trim();
+    };
+
+    const nextOrig: SubtitleSegment[] = [];
+    const nextTrans: SubtitleSegment[] = [];
+
+    originalSubs.forEach((orig, idx) => {
+      const trans = translatedSubs[idx] || orig;
+      const cleanedOrigTxt = stripBadSentences(orig.text || "");
+      if (!cleanedOrigTxt) return;
+
+      if (nextOrig.length > 0) {
+        const prev = nextOrig[nextOrig.length - 1];
+        if (orig.start < prev.end - 0.1 && orig.end <= prev.end + 0.8) {
+          return;
+        }
+      }
+
+      const newId = nextOrig.length + 1;
+      const st = nextOrig.length > 0 ? Math.max(nextOrig[nextOrig.length - 1].end, orig.start) : orig.start;
+      const et = Math.max(st + 0.4, orig.end);
+      nextOrig.push({ ...orig, id: newId, start: st, end: et, text: cleanedOrigTxt });
+      nextTrans.push({ ...trans, id: newId, start: st, end: et });
+    });
+
+    setOriginalSubs(nextOrig);
+    setTranslatedSubs(nextTrans);
   };
 
   const resetState = () => {
@@ -1182,6 +1250,7 @@ export default function DubbingStudio({
       }
     }
     const t = videoPlayerRef.current?.currentTime || 0;
+    setCurrentVideoTime(t);
     if (vocalsPlayerRef.current) {
       vocalsPlayerRef.current.currentTime = t;
       vocalsPlayerRef.current.play().catch(() => {});
@@ -1200,6 +1269,7 @@ export default function DubbingStudio({
   const handleVideoSeek = () => {
     if (videoPlayerRef.current) {
       const t = videoPlayerRef.current.currentTime;
+      setCurrentVideoTime(t);
       if (vocalsPlayerRef.current) vocalsPlayerRef.current.currentTime = t;
       if (bgmPlayerRef.current) bgmPlayerRef.current.currentTime = t;
     }
@@ -1216,6 +1286,7 @@ export default function DubbingStudio({
   const handleVideoTimeUpdate = () => {
     if (!videoPlayerRef.current) return;
     const t = videoPlayerRef.current.currentTime;
+    setCurrentVideoTime(t);
     if (vocalsPlayerRef.current && Math.abs(vocalsPlayerRef.current.currentTime - t) > 0.2) {
       vocalsPlayerRef.current.currentTime = t;
     }
@@ -2670,7 +2741,19 @@ export default function DubbingStudio({
       )}
 
       {/* --- STEP 3: SUBTITLE REVIEW & EDIT STUDIO --- */}
-      {viewMode === "workspace" && jobId && job && job.id === jobId && job.status === "awaiting_review" && (
+      {viewMode === "workspace" && jobId && job && job.id === jobId && job.status === "awaiting_review" && (() => {
+        const activeSegIdx = originalSubs.findIndex((s, i) => {
+          const st = typeof s?.start === "number" ? s.start : (translatedSubs[i]?.start ?? -1);
+          const et = typeof s?.end === "number" ? s.end : (translatedSubs[i]?.end ?? -1);
+          return currentVideoTime >= st && currentVideoTime <= et;
+        });
+        const fallbackIdx = activeSegIdx === -1
+          ? translatedSubs.findIndex(s => typeof s.start === "number" && typeof s.end === "number" && currentVideoTime >= s.start && currentVideoTime <= s.end)
+          : activeSegIdx;
+        const activeOrigSeg = fallbackIdx !== -1 ? (originalSubs[fallbackIdx] || translatedSubs[fallbackIdx]) : null;
+        const activeTransSeg = fallbackIdx !== -1 ? (translatedSubs[fallbackIdx] || originalSubs[fallbackIdx]) : null;
+
+        return (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           
           {/* Left: Video Player & Audio Controls */}
@@ -2694,6 +2777,27 @@ export default function DubbingStudio({
                   onVolumeChange={handleVideoVolumeChange}
                   className="w-full h-full object-contain"
                 />
+
+                {/* Live Subtitle Overlay on Video Player (English ASR + Translation) */}
+                {subOverlayMode !== "off" && activeOrigSeg && (
+                  <div className="absolute bottom-11 left-3 right-3 pointer-events-none z-10 flex flex-col items-center gap-1 transition-all">
+                    <span className="px-2 py-0.5 rounded-full bg-black/80 text-[9px] font-mono font-bold text-amber-300 border border-amber-400/30 shadow">
+                      Phân đoạn #{activeOrigSeg.id} • {activeOrigSeg.start.toFixed(2)}s → {activeOrigSeg.end.toFixed(2)}s
+                    </span>
+                    {(subOverlayMode === "bilingual" || subOverlayMode === "en") && (
+                      <div className="max-w-[95%] bg-black/85 backdrop-blur-md text-white px-3.5 py-1.5 rounded-lg border border-amber-400/50 shadow-lg text-center">
+                        <span className="text-[9px] font-extrabold uppercase tracking-wider text-amber-400 mr-1.5">[SUB GỐC ASR]</span>
+                        <span className="text-xs sm:text-sm font-semibold leading-snug">{activeOrigSeg.text}</span>
+                      </div>
+                    )}
+                    {(subOverlayMode === "bilingual" || subOverlayMode === "vi") && activeTransSeg && (
+                      <div className="max-w-[92%] bg-black/80 backdrop-blur-md text-emerald-300 px-3 py-1 rounded-lg border border-emerald-500/40 shadow-md text-center">
+                        <span className="text-[9px] font-bold uppercase tracking-wider text-emerald-400 mr-1.5">[DỊCH]</span>
+                        <span className="text-[11px] sm:text-xs font-medium leading-snug">{activeTransSeg.text}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
                 
                 {job.vocals_audio_path && (
                   <audio ref={vocalsPlayerRef} src={api.getDubbingFileUrl(jobId, "vocals", false, true)} preload="metadata" />
@@ -2701,6 +2805,81 @@ export default function DubbingStudio({
                 {job.bgm_audio_path && (
                   <audio ref={bgmPlayerRef} src={api.getDubbingFileUrl(jobId, "bgm", false, true)} preload="metadata" />
                 )}
+              </div>
+
+              {/* Dedicated Live English ASR Monitor Bar & Mode Switcher */}
+              <div className="p-3 bg-secondary/40 rounded-xl border border-border flex flex-col gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded bg-background border border-border text-[10px] font-mono font-bold text-primary">
+                      ⏱ {currentVideoTime.toFixed(2)}s
+                    </span>
+                    {activeOrigSeg ? (
+                      <span className="text-[11px] font-bold text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                        <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping" />
+                        Đang phát #{activeOrigSeg.id} ({activeOrigSeg.start.toFixed(1)}s - {activeOrigSeg.end.toFixed(1)}s)
+                      </span>
+                    ) : (
+                      <span className="text-[11px] text-muted-foreground italic">
+                        Khoảng lặng / Nhạc nền (Không có sub ASR tại mốc này)
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1">
+                    {(
+                      [
+                        { id: "bilingual", label: "EN (ASR) + VI" },
+                        { id: "en", label: "Chỉ Sub EN (ASR)" },
+                        { id: "vi", label: "Chỉ Sub VI" },
+                        { id: "off", label: "Tắt Sub" },
+                      ] as const
+                    ).map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => setSubOverlayMode(m.id)}
+                        className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors cursor-pointer border ${
+                          subOverlayMode === m.id
+                            ? "bg-primary text-primary-foreground border-primary"
+                            : "bg-background hover:bg-secondary text-muted-foreground border-border"
+                        }`}
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Persistent English ASR Sub Box below video so native controls never obscure it */}
+                <div className="p-2.5 rounded-lg bg-background/90 border border-amber-500/30 flex flex-col gap-1 min-h-[52px] justify-center">
+                  {activeOrigSeg ? (
+                    <>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[9px] font-extrabold uppercase tracking-wider text-amber-600 dark:text-amber-400">
+                          Sub Gốc Tiếng Anh (Whisper ASR • Phân đoạn #{activeOrigSeg.id}):
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedSegId(activeOrigSeg.id);
+                            setEditingOrigSegId(activeOrigSeg.id);
+                          }}
+                          className="text-[10px] text-primary hover:underline font-bold cursor-pointer"
+                        >
+                          Sửa sub gốc này
+                        </button>
+                      </div>
+                      <p className="text-xs font-semibold text-foreground leading-snug">
+                        {activeOrigSeg.text}
+                      </p>
+                    </>
+                  ) : (
+                    <p className="text-[11px] text-muted-foreground italic text-center">
+                      Bấm Play video hoặc chọn một phân đoạn bên phải để đối chiếu trực tiếp phụ đề Tiếng Anh (ASR) với giọng nói gốc.
+                    </p>
+                  )}
+                </div>
               </div>
 
               {/* Audio Track Mix Panel */}
@@ -2912,13 +3091,15 @@ export default function DubbingStudio({
                     onClick={async () => {
                       try {
                         setRetranslating(true);
+                        await api.updateDubbingSubtitles(job.id, originalSubs, translatedSubs);
                         const updated = await api.retryDubbingTranslation(job.id, {
                           llm_profile_id: selectedLlmProfileId || undefined,
                           target_language: targetLanguage || job.target_language
                         });
                         setJob(updated);
+                        if (updated.original_subtitles) setOriginalSubs(updated.original_subtitles);
                         if (updated.translated_subtitles) setTranslatedSubs(updated.translated_subtitles);
-                        alert("Đã dịch lại toàn bộ phụ đề qua AI thành công!");
+                        alert("Đã làm sạch phụ đề gốc & dịch lại toàn bộ qua AI thành công!");
                       } catch (e: unknown) {
                         alert(`Lỗi khi dịch lại: ${getErrorMessage(e, "Mô hình LLM không phản hồi")}`);
                       } finally {
@@ -2927,10 +3108,20 @@ export default function DubbingStudio({
                     }}
                     disabled={retranslating}
                     className="px-2.5 py-1 bg-secondary hover:bg-secondary/80 text-foreground text-xs font-semibold rounded-lg border border-border transition-colors cursor-pointer flex items-center gap-1"
-                    title="Dịch lại tất cả phân đoạn bằng mô hình AI"
+                    title="Làm sạch ảo giác ASR và dịch lại tất cả phân đoạn bằng mô hình AI"
                   >
                     <RefreshCw className={`w-3 h-3 ${retranslating ? "animate-spin text-primary" : ""}`} />
                     <span>{retranslating ? "Đang dịch..." : "Dịch Lại Bằng AI"}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleCleanAsrHallucinations}
+                    className="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-semibold rounded-lg border border-amber-500/30 transition-colors cursor-pointer flex items-center gap-1"
+                    title="Tự động cắt bỏ các câu/phân đoạn bị Whisper ASR bịa thêm ở cuối video hoặc chứa ký tự lỗi"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    <span>Lọc Rác ASR</span>
                   </button>
                 </div>
 
@@ -2948,6 +3139,8 @@ export default function DubbingStudio({
                 {translatedSubs.map((seg, idx) => {
                   const origSeg = originalSubs[idx] || seg;
                   const isSelected = selectedSegId === seg.id;
+                  const isPlayingNow = activeOrigSeg?.id === seg.id;
+                  const isEditingOrig = editingOrigSegId === seg.id;
                   const duration = typeof seg.start === "number" && typeof seg.end === "number" ? Math.max(0.1, seg.end - seg.start) : 2.0;
                   const words = (seg.text || "").trim().split(/\s+/).filter(Boolean).length;
                   const estSeconds = Math.round((words / 3.0) * 10) / 10;
@@ -2959,7 +3152,9 @@ export default function DubbingStudio({
                       key={seg.id}
                       onClick={() => jumpToSegment(seg.start, seg.id)}
                       className={`p-3.5 rounded-xl border transition-all cursor-pointer ${
-                        isSelected
+                        isPlayingNow
+                          ? "bg-amber-500/10 border-amber-500 shadow-sm ring-1 ring-amber-500/30"
+                          : isSelected
                           ? "bg-primary/10 border-primary shadow-sm"
                           : isOverDuration
                           ? "bg-amber-500/5 border-amber-500/40 hover:border-amber-500/60"
@@ -2969,6 +3164,11 @@ export default function DubbingStudio({
                       <div className="flex flex-wrap justify-between items-center gap-2 mb-2">
                         <div className="flex items-center gap-2">
                           <span className="text-[10px] font-bold text-primary tracking-wider">PHÂN ĐOẠN #{seg.id}</span>
+                          {isPlayingNow && (
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500 text-white flex items-center gap-1 animate-pulse">
+                              <span>● Đang phát</span>
+                            </span>
+                          )}
                           {isOverDuration && (
                             <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30 flex items-center gap-1">
                               <AlertTriangle className="w-2.5 h-2.5" />
@@ -2977,7 +3177,7 @@ export default function DubbingStudio({
                           )}
                         </div>
 
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1.5">
                           <button
                             type="button"
                             onClick={(e) => {
@@ -3008,13 +3208,59 @@ export default function DubbingStudio({
                           <span className="text-[10px] font-mono font-bold text-muted-foreground bg-background px-2 py-0.5 rounded border border-border">
                             {typeof seg.start === "number" ? seg.start.toFixed(2) : "0.00"}s → {typeof seg.end === "number" ? seg.end.toFixed(2) : "0.00"}s ({duration.toFixed(1)}s)
                           </span>
+
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDeleteSegment(seg.id);
+                            }}
+                            className="p-1 rounded hover:bg-destructive/15 text-muted-foreground hover:text-destructive transition-colors cursor-pointer"
+                            title="Xóa phân đoạn này (nếu ASR nhận diện dư / bịa lời ở cuối video)"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
                         </div>
                       </div>
                       
                       <div className="flex flex-col gap-2">
                         <div>
-                          <span className="text-[9px] uppercase font-bold text-muted-foreground tracking-wider">Gốc:</span>
-                          <p className="text-xs text-muted-foreground italic mt-0.5">{origSeg.text}</p>
+                          <div className="flex items-center justify-between">
+                            <span className="text-[9px] uppercase font-bold text-amber-600 dark:text-amber-400 tracking-wider">
+                              Gốc (Tiếng Anh • ASR):
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setEditingOrigSegId(isEditingOrig ? null : seg.id);
+                              }}
+                              className="text-[9px] font-semibold text-muted-foreground hover:text-primary flex items-center gap-1 cursor-pointer"
+                            >
+                              <Edit3 className="w-2.5 h-2.5" />
+                              <span>{isEditingOrig ? "Xong" : "Sửa câu gốc ASR"}</span>
+                            </button>
+                          </div>
+                          {isEditingOrig ? (
+                            <textarea
+                              value={origSeg.text}
+                              onChange={(e) => updateOrigSubText(origSeg.id, e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                              rows={2}
+                              className="w-full bg-background border border-amber-500/50 rounded-lg p-2 text-xs text-foreground mt-1 focus:outline-none focus:border-amber-500"
+                            />
+                          ) : (
+                            <p
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setEditingOrigSegId(seg.id);
+                              }}
+                              title="Bấm để sửa văn bản Gốc (ASR) nếu nhận diện sai hoặc thừa chữ"
+                              className="text-xs text-foreground/85 italic mt-0.5 hover:bg-background/60 rounded px-1.5 py-0.5 -mx-1.5 transition-colors"
+                            >
+                              {origSeg.text}
+                            </p>
+                          )}
                         </div>
                         
                         <div>
@@ -3043,7 +3289,8 @@ export default function DubbingStudio({
           </SectionCard>
 
         </div>
-      )}
+        );
+      })()}
 
       {/* --- STEP 5: FINAL OUTPUT PREVIEW & DOWNLOAD --- */}
       {viewMode === "workspace" && jobId && job && job.id === jobId && job.status === "completed" && (

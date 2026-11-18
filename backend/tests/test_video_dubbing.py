@@ -831,4 +831,65 @@ def test_dubbing_output_download_preview_stems_disk_reconcile_and_history_playba
     assert len(legacy_tts_audio.content) > 500
 
 
+def test_asr_hallucination_filtering_and_sentence_boundary_preservation():
+    from app.services.video_dubbing_service import VideoDubbingService
+
+    # Exact reproduction of Screenshot 2:
+    # Segment #20 has "MIS. Make it simple." merged with a mixed-script Whisper hallucination ("δiem")
+    # Segment #21 has a retrograde overlapping timestamp (204.38s -> 205.28s after 202.70s -> 204.82s)
+    contaminated_subs = [
+        {
+            "id": 19,
+            "start": 195.0,
+            "end": 201.5,
+            "text": "Tighten the prosthetic screw to the recommended torque.",
+        },
+        {
+            "id": 20,
+            "start": 202.70,
+            "end": 204.82,
+            "text": "MIS. Make it simple. If you want to do the assembly, use the orthopedic tool to δiem the implant, use the left to give the implant.",
+        },
+        {
+            "id": 21,
+            "start": 204.38,
+            "end": 205.28,
+            "text": "If you want to double -dial it, it's just a little bit too small.",
+        },
+    ]
+
+    cleaned = VideoDubbingService.merge_and_normalize_subtitles(contaminated_subs)
+    assert len(cleaned) == 2
+    assert cleaned[0]["text"] == "Tighten the prosthetic screw to the recommended torque."
+    assert cleaned[1]["text"] == "MIS. Make it simple."
+    assert cleaned[1]["start"] == 202.70
+    assert cleaned[1]["end"] == 204.82
+
+    # Also test build_clean_asr_segments from word alignments with low-prob / retrograde tail words
+    words = [
+        {"word": "MIS.", "start": 202.70, "end": 203.20, "prob": 0.96, "seg_end": True},
+        {"word": "Make", "start": 203.35, "end": 203.70, "prob": 0.98},
+        {"word": "it", "start": 203.70, "end": 203.95, "prob": 0.99},
+        {"word": "simple.", "start": 203.95, "end": 204.50, "prob": 0.97, "seg_end": True},
+        # Hallucinated outro music words with low probability and script corruption
+        {"word": "If", "start": 204.60, "end": 204.65, "prob": 0.25},
+        {"word": "δiem", "start": 204.65, "end": 204.82, "prob": 0.12},
+        # Retrograde timestamp jump
+        {"word": "double", "start": 204.38, "end": 205.28, "prob": 0.30, "seg_end": True},
+    ]
+    built = VideoDubbingService.build_clean_asr_segments(words, "MIS. Make it simple.", total_duration=213.0)
+    assert len(built) == 1
+    assert built[0]["text"] == "MIS. Make it simple."
+
+    # Verify 1-to-1 translated subtitle normalization never merges completed short Vietnamese sentences
+    trans_in = [
+        {"id": 1, "start": 195.0, "end": 201.5, "text": "Siết vít phục hình theo lực khuyến nghị."},
+        {"id": 2, "start": 202.70, "end": 204.82, "text": "MIS. Giữ mọi việc đơn giản."},
+    ]
+    norm_trans = VideoDubbingService.normalize_translated_subtitles(trans_in, cleaned)
+    assert len(norm_trans) == len(cleaned) == 2
+    assert norm_trans[1]["text"] == "MIS. Giữ mọi việc đơn giản."
+
+
+
 

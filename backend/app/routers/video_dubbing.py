@@ -699,94 +699,39 @@ def trigger_translation_stage(dub_job_id: str, text: str, alignment_str: str, db
     
     VideoDubbingService.log_to_job(dub_job_id, "Nhận kết quả ASR. Bắt đầu phân đoạn và căn lề thời gian (alignment)...")
 
-    # Parse segments from Whisper alignment
+    # Parse segments from Whisper alignment with pause-aware grouping & anti-hallucination filtering
     try:
         alignment_data = json.loads(alignment_str) if alignment_str else []
     except Exception:
         alignment_data = []
 
-    def extract_word_timing(word_item: dict) -> tuple:
-        start_v = word_item.get("start")
-        end_v = word_item.get("end")
-        if start_v is None or end_v is None:
-            ts = word_item.get("timestamp")
-            if isinstance(ts, (list, tuple)) and len(ts) >= 2:
-                if start_v is None:
-                    start_v = ts[0]
-                if end_v is None:
-                    end_v = ts[1]
+    est_duration = float(getattr(job, "video_duration", 0.0) or 0.0)
+    if est_duration <= 0 and job.original_audio_path and os.path.exists(job.original_audio_path):
         try:
-            start_f = float(start_v) if start_v is not None else 0.0
-        except (ValueError, TypeError):
-            start_f = 0.0
-        try:
-            end_f = float(end_v) if end_v is not None else start_f
-        except (ValueError, TypeError):
-            end_f = start_f
-        return start_f, end_f
+            import soundfile as sf
+            est_duration = float(sf.info(job.original_audio_path).duration)
+        except Exception:
+            est_duration = max(10.0, float(os.path.getsize(job.original_audio_path)) / (44100 * 4))
+    if est_duration <= 0:
+        est_duration = 120.0
 
-    # Standardize alignment to segments of ~6 seconds
-    segments = []
-    curr_seg = []
-    seg_idx = 1
-    
-    for word in alignment_data:
-        curr_seg.append(word)
-        w_txt = word.get("word") or word.get("text") or ""
-        # Split segment if it has 8+ words or ends with a punctuation
-        if len(curr_seg) >= 8 or w_txt.endswith((".", "?", "!")):
-            start_t, _ = extract_word_timing(curr_seg[0])
-            _, end_t = extract_word_timing(curr_seg[-1])
-            text_str = " ".join([w.get("word") or w.get("text") or "" for w in curr_seg]).strip()
-            segments.append({
-                "id": seg_idx,
-                "start": round(start_t, 2),
-                "end": round(max(start_t + 0.5, end_t), 2),
-                "text": text_str
-            })
-            curr_seg = []
-            seg_idx += 1
-            
-    # Handle leftover words
-    if curr_seg:
-        start_t, _ = extract_word_timing(curr_seg[0])
-        _, end_t = extract_word_timing(curr_seg[-1])
-        text_str = " ".join([w.get("word") or w.get("text") or "" for w in curr_seg]).strip()
-        segments.append({
-            "id": seg_idx,
-            "start": round(start_t, 2),
-            "end": round(max(start_t + 0.5, end_t), 2),
-            "text": text_str
-        })
-        
-    # If no alignments are found, split based on simple punctuation
-    if not segments:
-        words = text.split()
-        for i in range(0, len(words), 8):
-            chunk = words[i:i+8]
-            duration = float(os.path.getsize(job.original_audio_path)) / (24000 * 2)  # rough estimate
-            step = duration / max(1, len(words) // 8)
-            segments.append({
-                "id": len(segments) + 1,
-                "start": round(i * (step / 8), 2),
-                "end": round(min(duration, (i+8) * (step / 8)), 2),
-                "text": " ".join(chunk)
-            })
-
-    # Preprocess and merge short/fragmented segments into complete sentences
-    merged_orig_segments = VideoDubbingService.merge_and_normalize_subtitles(segments)
+    merged_orig_segments = VideoDubbingService.build_clean_asr_segments(
+        alignment_data=alignment_data,
+        raw_text=text or "",
+        total_duration=est_duration,
+    )
     job.original_subtitles = json.dumps(merged_orig_segments)
     db.commit()
-    VideoDubbingService.log_to_job(dub_job_id, f"Hoàn tất phân tích & hợp nhất phụ đề gốc: gồm {len(merged_orig_segments)} phân đoạn hoàn chỉnh.")
+    VideoDubbingService.log_to_job(dub_job_id, f"Hoàn tất phân tích, khử nhiễu ảo giác ASR & hợp nhất phụ đề gốc: gồm {len(merged_orig_segments)} phân đoạn chuẩn.")
 
-    # Call LLM translator with resilient fallback
+    # Call LLM translator with resilient fallback (preserving strict 1:1 segment alignment)
     llm_prof_id = getattr(job, "llm_profile_id", None)
     VideoDubbingService.log_to_job(dub_job_id, f"Bắt đầu dịch thuật phụ đề tự động sang tiếng: {job.target_language} bằng LLM (Profile ID: {llm_prof_id or 'Default'})...")
     
     try:
         translated = VideoDubbingService.translate_subtitles_llm(merged_orig_segments, job.target_language, db, llm_profile_id=llm_prof_id)
-        merged_translated = VideoDubbingService.merge_and_normalize_subtitles(translated)
-        job.translated_subtitles = json.dumps(merged_translated)
+        normalized_translated = VideoDubbingService.normalize_translated_subtitles(translated, merged_orig_segments)
+        job.translated_subtitles = json.dumps(normalized_translated)
         job.error_message = None
         VideoDubbingService.log_to_job(dub_job_id, "Dịch thuật phụ đề hoàn tất. Chuyển trạng thái sang: AWAITING_REVIEW.")
     except Exception as e:
@@ -1433,6 +1378,10 @@ def retry_dubbing_translation(
     except Exception:
         raise HTTPException(status_code=400, detail="Dữ liệu phụ đề gốc không hợp lệ.")
 
+    # Clean any ASR hallucinations or overlapping tail segments in original_subtitles
+    orig_segments = VideoDubbingService.merge_and_normalize_subtitles(orig_segments)
+    job.original_subtitles = json.dumps(orig_segments)
+
     target_lang = payload.target_language or job.target_language
     llm_prof_id = payload.llm_profile_id or job.llm_profile_id
 
@@ -1448,8 +1397,8 @@ def retry_dubbing_translation(
     VideoDubbingService.log_to_job(job_id, f"Bắt đầu dịch lại phụ đề sang tiếng: {target_lang} bằng LLM (Profile ID: {llm_prof_id or 'Default'})...")
     try:
         translated = VideoDubbingService.translate_subtitles_llm(orig_segments, target_lang, db, llm_profile_id=llm_prof_id)
-        merged_translated = VideoDubbingService.merge_and_normalize_subtitles(translated)
-        job.translated_subtitles = json.dumps(merged_translated)
+        normalized_translated = VideoDubbingService.normalize_translated_subtitles(translated, orig_segments)
+        job.translated_subtitles = json.dumps(normalized_translated)
         job.target_language = target_lang
         job.llm_profile_id = llm_prof_id
         job.status = "awaiting_review"
@@ -1480,13 +1429,28 @@ def reseparate_audio_job(
     os.makedirs(job_dir, exist_ok=True)
     
     orig_audio_path = job.original_audio_path
-    if not orig_audio_path or not os.path.exists(orig_audio_path):
+    need_reextract = not orig_audio_path or not os.path.exists(orig_audio_path)
+    if not need_reextract and job.input_file_path and os.path.exists(job.input_file_path):
+        try:
+            import soundfile as sf
+            info = sf.info(orig_audio_path)
+            if info.samplerate < 44100 or info.channels < 2:
+                need_reextract = True
+        except Exception:
+            pass
+
+    if need_reextract:
         if job.input_file_path and os.path.exists(job.input_file_path):
             orig_audio_path = os.path.join(job_dir, "original_audio.wav")
-            VideoDubbingService.extract_audio_ffmpeg(job.input_file_path, orig_audio_path)
-            job.original_audio_path = orig_audio_path
-            db.commit()
-        else:
+            try:
+                VideoDubbingService.extract_audio_ffmpeg(job.input_file_path, orig_audio_path)
+                job.original_audio_path = orig_audio_path
+                db.commit()
+            except Exception:
+                if not job.original_audio_path or not os.path.exists(job.original_audio_path):
+                    raise HTTPException(status_code=400, detail="Không thể trích xuất âm thanh từ video gốc.")
+                orig_audio_path = job.original_audio_path
+        elif not orig_audio_path or not os.path.exists(orig_audio_path):
             raise HTTPException(status_code=400, detail="Không tìm thấy tệp video hoặc audio gốc để tách lại.")
 
     vocals_path = os.path.join(job_dir, "vocals.wav")

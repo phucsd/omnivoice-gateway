@@ -1019,7 +1019,7 @@ class VideoDubbingService:
                     "-i", wav_path,
                     "-vn",
                     "-c:a", "aac",
-                    "-b:a", "128k",
+                    "-b:a", "192k",
                     "-movflags", "+faststart",
                     tmp_m4a,
                 ],
@@ -1693,11 +1693,12 @@ class VideoDubbingService:
     @staticmethod
     def extract_audio_ffmpeg(video_path: str, output_audio_path: str) -> float:
         """
-        Extracts mono WAV audio at 24000Hz from video. Returns the duration in seconds.
+        Extracts 44.1kHz Stereo WAV audio from video so Demucs preserves full stereo phase cues
+        and 22.05kHz frequency bandwidth during vocal/BGM separation. Returns duration in seconds.
         """
         cmd = [
             "ffmpeg", "-y", "-i", video_path,
-            "-vn", "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "1",
+            "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
             output_audio_path
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -1710,17 +1711,35 @@ class VideoDubbingService:
     def separate_audio_stems(input_audio_path: str, vocals_path: str, bgm_path: str, job_id: Optional[str] = None) -> bool:
         """
         Separates audio into vocals and bgm stems.
-        Attempts Demucs first if installed. Falls back to FFmpeg speech/music isolation filters.
+        Attempts Demucs first if installed (with overlap=0.25 & clamp clip-mode on 44.1kHz stereo).
+        Falls back to FFmpeg Stereo Mid/Side + FFT spectral denoising filters.
         Never duplicates the exact same audio for both stems.
         """
         # 1. Try Demucs if installed
         try:
-            import demucs
+            import demucs  # noqa: F401
+            import torch
+            demucs_dev = "cuda" if torch.cuda.is_available() else "cpu"
             temp_out = os.path.join(os.path.dirname(vocals_path), "demucs_tmp")
             if job_id:
-                VideoDubbingService.log_to_job(job_id, "Đang chạy Demucs để tách track Vocals và BGM...")
-            demucs_cmd = [sys.executable, "-m", "demucs", "--two-stems=vocals", "-o", temp_out, input_audio_path]
-            subprocess.run(demucs_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                VideoDubbingService.log_to_job(job_id, f"Đang chạy Demucs ({demucs_dev}) tách track Vocals và BGM chuẩn 44.1kHz Stereo...")
+            demucs_cmd = [
+                sys.executable, "-m", "demucs",
+                "--two-stems=vocals",
+                "--overlap", "0.25",
+                "--clip-mode", "clamp",
+                "-d", demucs_dev,
+                "-o", temp_out,
+                input_audio_path,
+            ]
+            res_d = subprocess.run(demucs_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res_d.returncode != 0:
+                subprocess.run(
+                    [sys.executable, "-m", "demucs", "--two-stems=vocals", "-o", temp_out, input_audio_path],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             
             ext_vox = None
             ext_bgm = None
@@ -1737,31 +1756,67 @@ class VideoDubbingService:
                 shutil.copy2(ext_vox, vocals_path)
                 shutil.copy2(ext_bgm, bgm_path)
                 shutil.rmtree(temp_out, ignore_errors=True)
+                # Refresh browser preview caches if present
+                for st_p in (vocals_path, bgm_path):
+                    prev_m4a = f"{os.path.splitext(st_p)[0]}_preview.m4a"
+                    if os.path.exists(prev_m4a):
+                        try:
+                            os.remove(prev_m4a)
+                        except Exception:
+                            pass
                 if job_id:
                     VideoDubbingService.log_to_job(job_id, "Tách track Vocals và BGM thành công bằng Demucs AI.")
                 return True
         except Exception as d_err:
             if job_id:
-                VideoDubbingService.log_to_job(job_id, f"Demucs cục bộ không khả dụng ({d_err}), chuyển sang bộ lọc âm học FFmpeg...")
+                VideoDubbingService.log_to_job(job_id, f"Demucs cục bộ không khả dụng ({d_err}), chuyển sang bộ lọc Mid/Side & khử nhiễu FFmpeg...")
 
-        # 2. Fallback: High-quality FFmpeg acoustic separation
-        # BGM: suppress vocal frequencies (300Hz - 3400Hz)
-        # Vocals: isolate vocal frequencies (bandpass 200Hz - 3600Hz)
+        # 2. Fallback: Stereo Mid/Side + FFT Spectral Denoising via FFmpeg (44.1kHz full bandwidth)
         try:
+            is_stereo = False
+            try:
+                is_stereo = sf.info(input_audio_path).channels >= 2
+            except Exception:
+                pass
+
+            if is_stereo:
+                bgm_af = (
+                    "pan=stereo|c0=0.5*c0-0.5*c1|c1=0.5*c1-0.5*c0,"
+                    "equalizer=f=1000:width_type=h:width=700:g=-12,volume=1.35"
+                )
+                vox_af = (
+                    "pan=mono|c0=0.5*c0+0.5*c1,"
+                    "highpass=f=85,lowpass=f=12000,afftdn=nf=-25,volume=1.25"
+                )
+            else:
+                bgm_af = (
+                    "equalizer=f=300:width_type=h:width=200:g=-16,"
+                    "equalizer=f=1000:width_type=h:width=600:g=-22,"
+                    "equalizer=f=2500:width_type=h:width=800:g=-16,volume=1.3"
+                )
+                vox_af = "highpass=f=85,lowpass=f=11000,afftdn=nf=-25,volume=1.2"
+
             cmd_bgm = [
                 "ffmpeg", "-y", "-i", input_audio_path,
-                "-af", "equalizer=f=300:width_type=h:width=200:g=-18,equalizer=f=1000:width_type=h:width=600:g=-26,equalizer=f=2500:width_type=h:width=800:g=-18,volume=1.4",
-                "-vn", "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "1",
+                "-af", bgm_af,
+                "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
                 bgm_path
             ]
             cmd_vox = [
                 "ffmpeg", "-y", "-i", input_audio_path,
-                "-af", "highpass=f=200,lowpass=f=3500,volume=1.3",
-                "-vn", "-acodec", "pcm_s16le", "-ar", "24000", "-ac", "1",
+                "-af", vox_af,
+                "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1",
                 vocals_path
             ]
             subprocess.run(cmd_bgm, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             subprocess.run(cmd_vox, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            for st_p in (vocals_path, bgm_path):
+                prev_m4a = f"{os.path.splitext(st_p)[0]}_preview.m4a"
+                if os.path.exists(prev_m4a):
+                    try:
+                        os.remove(prev_m4a)
+                    except Exception:
+                        pass
             if job_id:
                 VideoDubbingService.log_to_job(job_id, "Tách track Vocals và BGM thành công bằng bộ lọc âm học FFmpeg.")
             return True
@@ -2070,77 +2125,350 @@ class VideoDubbingService:
         return text
 
     @staticmethod
+    def _has_hallucination_or_script_corruption(text: str) -> bool:
+        """
+        Detects Whisper ASR hallucinations such as mixed-script token corruption
+        (e.g., Greek 'δiem' or Cyrillic characters inside Latin text) or known YouTube outro hallucinations.
+        """
+        if not text or not text.strip():
+            return True
+        t_clean = text.strip()
+        t_lower = t_clean.lower()
+
+        hallucination_phrases = (
+            "thank you for watching",
+            "thanks for watching",
+            "subtitles by",
+            "amara.org",
+            "please subscribe",
+            "like and subscribe",
+            "transcribed by",
+        )
+        if any(hp in t_lower for hp in hallucination_phrases):
+            return True
+
+        # Detect stray Greek (\u0370-\u03ff) or Cyrillic (\u0400-\u04ff) characters in Latin text (e.g. "δiem")
+        has_latin = bool(re.search(r"[A-Za-z]", t_clean))
+        has_stray_script = bool(re.search(r"[\u0370-\u03ff\u0400-\u04ff]", t_clean))
+        if has_latin and has_stray_script:
+            return True
+
+        # Detect excessive n-gram repetition inside a single segment (classic Whisper loop)
+        words = [w.strip(".,!?;:\"'()-").lower() for w in t_clean.split() if w.strip(".,!?;:\"'()-")]
+        if len(words) >= 8:
+            trigrams = [" ".join(words[i:i+3]) for i in range(len(words) - 2)]
+            for tg in set(trigrams):
+                if trigrams.count(tg) >= 3:
+                    return True
+
+        return False
+
+    @staticmethod
+    def _strip_hallucinated_subsentences(text: str) -> str:
+        """
+        Splits a multi-sentence segment and removes any trailing/embedded sub-sentence
+        that contains Whisper script corruption (e.g. 'δiem') or known hallucination patterns.
+        """
+        if not text or not text.strip():
+            return ""
+        parts = re.split(r"(?<=[.!?])\s+", text.strip())
+        if len(parts) <= 1:
+            return "" if VideoDubbingService._has_hallucination_or_script_corruption(text) else text.strip()
+
+        valid_parts = [
+            p.strip()
+            for p in parts
+            if p.strip() and not VideoDubbingService._has_hallucination_or_script_corruption(p)
+        ]
+        return " ".join(valid_parts).strip()
+
+    @staticmethod
+    def build_clean_asr_segments(
+        alignment_data: List[Dict[str, Any]],
+        raw_text: str,
+        total_duration: float = 120.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Constructs accurate, non-overlapping sentence segments from Whisper word alignments:
+        - Filters low-probability hallucinated words and retrograde timestamp jumps
+        - Respects natural Whisper segment boundaries, punctuation, and speech pauses (>= 0.65s)
+        - Cleans tail hallucinations and normalizes segment boundaries
+        """
+        def _extract_timing(w_item: dict) -> Tuple[float, float]:
+            s_v = w_item.get("start")
+            e_v = w_item.get("end")
+            if s_v is None or e_v is None:
+                ts = w_item.get("timestamp")
+                if isinstance(ts, (list, tuple)) and len(ts) >= 2:
+                    if s_v is None:
+                        s_v = ts[0]
+                    if e_v is None:
+                        e_v = ts[1]
+            try:
+                sf_val = float(s_v) if s_v is not None else 0.0
+            except (ValueError, TypeError):
+                sf_val = 0.0
+            try:
+                ef_val = float(e_v) if e_v is not None else sf_val
+            except (ValueError, TypeError):
+                ef_val = sf_val
+            return sf_val, max(sf_val, ef_val)
+
+        # 1. Filter words for monotonic timing, confidence, and script validity
+        filtered_words: List[Dict[str, Any]] = []
+        last_end_t = 0.0
+        for item in alignment_data or []:
+            if not isinstance(item, dict):
+                continue
+            w_str = str(item.get("word") or item.get("text") or "").strip()
+            if not w_str:
+                continue
+            prob = item.get("prob") if item.get("prob") is not None else item.get("probability")
+            if prob is not None:
+                try:
+                    if float(prob) < 0.18:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            if VideoDubbingService._has_hallucination_or_script_corruption(w_str):
+                continue
+
+            s_t, e_t = _extract_timing(item)
+            # Drop retrograde hallucination words that jump backward in time
+            if filtered_words and s_t < last_end_t - 0.20:
+                continue
+            s_t = max(last_end_t, s_t)
+            e_t = max(s_t + 0.04, e_t)
+            last_end_t = e_t
+
+            filtered_words.append({
+                "word": w_str,
+                "start": s_t,
+                "end": e_t,
+                "seg_end": bool(item.get("seg_end")),
+                "prob": float(prob) if prob is not None else 1.0,
+            })
+
+        # 2. Group words into natural clauses/sentences using pause & punctuation detection
+        segments: List[Dict[str, Any]] = []
+        curr_seg: List[Dict[str, Any]] = []
+        seg_idx = 1
+
+        def _flush_curr_seg(words_buf: List[Dict[str, Any]], idx_val: int) -> Optional[Dict[str, Any]]:
+            if not words_buf:
+                return None
+            # Check average word probability of segment if available
+            avg_p = sum(w.get("prob", 1.0) for w in words_buf) / len(words_buf)
+            if avg_p < 0.38:
+                return None
+            st = words_buf[0]["start"]
+            et = max(st + 0.5, words_buf[-1]["end"])
+            txt = " ".join(w["word"] for w in words_buf).strip()
+            txt = VideoDubbingService._strip_hallucinated_subsentences(txt)
+            if not txt:
+                return None
+            return {
+                "id": idx_val,
+                "start": round(st, 2),
+                "end": round(et, 2),
+                "text": txt,
+            }
+
+        for i, w_obj in enumerate(filtered_words):
+            if curr_seg:
+                prev_end = curr_seg[-1]["end"]
+                pause_gap = w_obj["start"] - prev_end
+                # Split BEFORE adding current word if there is a clear speech pause (>= 0.65s)
+                if pause_gap >= 0.65:
+                    flushed = _flush_curr_seg(curr_seg, seg_idx)
+                    if flushed:
+                        segments.append(flushed)
+                        seg_idx += 1
+                    curr_seg = []
+
+            curr_seg.append(w_obj)
+            w_txt = w_obj["word"]
+            seg_dur = curr_seg[-1]["end"] - curr_seg[0]["start"]
+            ends_punct = w_txt.endswith((".", "?", "!", ";"))
+            ends_clause = w_txt.endswith((",", ":", "-"))
+
+            if (
+                ends_punct
+                or w_obj.get("seg_end")
+                or (ends_clause and (len(curr_seg) >= 10 or seg_dur >= 6.5))
+                or len(curr_seg) >= 15
+                or seg_dur >= 9.0
+            ):
+                flushed = _flush_curr_seg(curr_seg, seg_idx)
+                if flushed:
+                    segments.append(flushed)
+                    seg_idx += 1
+                curr_seg = []
+
+        if curr_seg:
+            flushed = _flush_curr_seg(curr_seg, seg_idx)
+            if flushed:
+                segments.append(flushed)
+
+        # Fallback if alignment_data was empty
+        if not segments and raw_text and raw_text.strip():
+            clean_raw = VideoDubbingService._strip_hallucinated_subsentences(raw_text.strip())
+            words = clean_raw.split()
+            if words:
+                dur = max(1.0, float(total_duration or 60.0))
+                chunk_size = 10
+                total_chunks = max(1, (len(words) + chunk_size - 1) // chunk_size)
+                step_dur = dur / total_chunks
+                for c_idx in range(total_chunks):
+                    chunk = words[c_idx * chunk_size:(c_idx + 1) * chunk_size]
+                    st = round(c_idx * step_dur, 2)
+                    et = round(min(dur, (c_idx + 1) * step_dur), 2)
+                    segments.append({
+                        "id": len(segments) + 1,
+                        "start": st,
+                        "end": max(round(st + 0.5, 2), et),
+                        "text": " ".join(chunk),
+                    })
+
+        return VideoDubbingService.merge_and_normalize_subtitles(segments)
+
+    @staticmethod
     def merge_and_normalize_subtitles(subs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Filters out empty/junk segments, merges fragmented short sentences into coherent paragraphs,
-        and normalizes capitalization/punctuation for natural native Vietnamese TTS intonation.
+        Filters out empty/hallucinated/overlapping segments, merges only incomplete or ultra-short fragments
+        without ever merging across completed sentences or long pauses, and normalizes punctuation/timing.
         """
         if not subs:
             return []
 
-        # 1. Filter out empty or punctuation-only segments
-        cleaned = []
+        # 1. Filter out empty, punctuation-only, or hallucinated/retrograde segments
+        cleaned: List[Dict[str, Any]] = []
         for s in subs:
             txt = str(s.get("text", "")).strip()
             for tag in ["[Korean]", "[Vietnamese]", "[Japanese]", "[English]", "[Chinese]"]:
                 txt = txt.replace(tag, "").strip()
+            txt = VideoDubbingService._strip_hallucinated_subsentences(txt)
             alpha_chars = [c for c in txt if c.isalnum()]
             if not alpha_chars:
                 continue
+
+            st = float(s.get("start", 0.0) or 0.0)
+            et = float(s.get("end", st + 0.5) or (st + 0.5))
+            if et <= st:
+                et = st + 0.5
+
+            # Drop overlapping retrograde tail hallucination segments (e.g. #21 204.38s->205.28s after #20 202.70s->204.82s)
+            if cleaned:
+                prev = cleaned[-1]
+                if st < prev["end"] - 0.12 and et <= prev["end"] + 0.75:
+                    continue
+                if st < prev["end"]:
+                    st = round(prev["end"] + 0.04, 2)
+                    if et <= st + 0.2:
+                        continue
+
             cleaned.append({
                 "id": len(cleaned) + 1,
-                "start": float(s.get("start", 0.0)),
-                "end": float(s.get("end", 0.0)),
-                "text": txt
+                "start": st,
+                "end": et,
+                "text": txt,
             })
 
         if not cleaned:
             return []
 
-        # 2. Merge short adjacent fragments into natural sentences
-        merged = []
+        # 2. Merge fragmented clauses carefully without merging completed sentences with trailing segments
+        merged: List[Dict[str, Any]] = []
         curr = dict(cleaned[0])
 
         for nxt in cleaned[1:]:
             curr_txt = curr["text"].strip()
+            nxt_txt = nxt["text"].strip()
             curr_words = len(curr_txt.split())
+            nxt_words = len(nxt_txt.split())
             time_gap = nxt["start"] - curr["end"]
-            
-            does_not_end_sentence = not any(curr_txt.endswith(p) for p in [".", "!", "?", "...", ":"])
-            is_short = curr_words < 6
             merged_duration = nxt["end"] - curr["start"]
 
-            if (does_not_end_sentence or is_short) and time_gap < 1.2 and merged_duration <= 12.0:
-                curr["end"] = nxt["end"]
-                curr["text"] = f"{curr_txt} {nxt['text'].strip()}"
+            ends_sentence = any(curr_txt.endswith(p) for p in [".", "!", "?"])
+
+            should_merge = False
+            if ends_sentence:
+                # Only merge a completed sentence if it is a 1-2 word acronym/title (e.g. "MIS.")
+                # immediately followed (< 0.45s) by a short slogan (<= 5 words, e.g. "Make it simple.")
+                if curr_words <= 2 and nxt_words <= 5 and time_gap < 0.45 and merged_duration <= 5.0:
+                    should_merge = True
+            else:
+                # Incomplete clause: merge if pause is short (< 0.85s) and combined segment stays concise
+                if time_gap < 0.85 and merged_duration <= 10.0 and (curr_words + nxt_words) <= 18:
+                    should_merge = True
+
+            if should_merge:
+                curr["end"] = max(curr["end"], nxt["end"])
+                curr["text"] = f"{curr_txt} {nxt_txt}"
             else:
                 merged.append(curr)
                 curr = dict(nxt)
 
         merged.append(curr)
 
-        # 3. Final normalization (Capitalization, punctuation ending, re-numbering)
-        final_subs = []
+        # 3. Final normalization (Capitalization, punctuation ending, monotonic timestamps, re-numbering)
+        final_subs: List[Dict[str, Any]] = []
+        prev_end_val = 0.0
         for i, s in enumerate(merged):
-            txt = s["text"].strip()
+            txt = VideoDubbingService._strip_hallucinated_subsentences(s["text"].strip())
+            if not txt:
+                continue
+            txt = txt[0].upper() + txt[1:]
+            if not any(txt.endswith(p) for p in [".", "!", "?", "...", ":", ";"]):
+                txt += "."
+
+            st_val = round(max(prev_end_val, float(s["start"])), 2)
+            # If segment 1 includes intro music (0.0s - 8.5s), shift start to actual speech onset (~8.5s)
+            if i == 0 and st_val < 3.0 and s["end"] >= 8.0:
+                st_val = 8.5
+            et_val = round(max(st_val + 0.4, float(s["end"])), 2)
+            prev_end_val = et_val
+
+            final_subs.append({
+                "id": len(final_subs) + 1,
+                "start": st_val,
+                "end": et_val,
+                "text": txt,
+            })
+
+        return final_subs
+
+    @staticmethod
+    def normalize_translated_subtitles(
+        translated: List[Dict[str, Any]],
+        orig_segments: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Normalizes LLM-translated subtitle text while strictly preserving 1-to-1 segment count,
+        IDs, and timestamps with orig_segments so English and translated subtitles never go out of sync.
+        """
+        if not orig_segments:
+            return []
+        final_list: List[Dict[str, Any]] = []
+        for idx, orig in enumerate(orig_segments):
+            cand = translated[idx] if (translated and idx < len(translated)) else orig
+            txt = str(cand.get("text", orig.get("text", ""))).strip()
+            for tag in ["[Korean]", "[Vietnamese]", "[Japanese]", "[English]", "[Chinese]"]:
+                txt = txt.replace(tag, "").strip()
             if txt:
                 txt = txt[0].upper() + txt[1:]
                 if not any(txt.endswith(p) for p in [".", "!", "?", "...", ":", ";"]):
                     txt += "."
-            
-            st_val = round(s["start"], 2)
-            # If segment 1 includes intro music (0.0s - 8.5s), shift start to actual speech onset (~8.5s)
-            if i == 0 and st_val < 3.0 and s["end"] >= 8.0:
-                st_val = 8.5
+            else:
+                txt = str(orig.get("text", "")).strip()
 
-            final_subs.append({
-                "id": i + 1,
-                "start": st_val,
-                "end": round(s["end"], 2),
-                "text": txt
+            final_list.append({
+                "id": orig["id"],
+                "start": float(orig["start"]),
+                "end": float(orig["end"]),
+                "text": txt,
             })
-
-        return final_subs
+        return final_list
 
     @staticmethod
     def assemble_dubbed_vocal(segments: List[Dict[str, Any]], output_vocal_path: str, total_duration: float):
@@ -2271,7 +2599,7 @@ class VideoDubbingService:
                 "-i", vocal_path,
                 "-filter_complex", f"[0:a]volume={vocal_vol}[out]",
                 "-map", "[out]",
-                "-acodec", "pcm_s16le", "-ar", "24000",
+                "-acodec", "pcm_s16le", "-ar", "44100",
                 temp_mixed_audio
             ]
         else:
@@ -2290,7 +2618,7 @@ class VideoDubbingService:
                 "-i", bgm_path,
                 "-filter_complex", ducking_filter,
                 "-map", "[out]",
-                "-acodec", "pcm_s16le", "-ar", "24000",
+                "-acodec", "pcm_s16le", "-ar", "44100",
                 temp_mixed_audio
             ]
         
@@ -2303,7 +2631,7 @@ class VideoDubbingService:
                 "-i", bgm_path,
                 "-filter_complex", f"[0:a]volume={vocal_vol}[vocal];[1:a]volume={bgm_vol}[bgm];[vocal][bgm]amix=inputs=2:normalize=0:duration=first:dropout_transition=0[out]",
                 "-map", "[out]",
-                "-acodec", "pcm_s16le", "-ar", "24000",
+                "-acodec", "pcm_s16le", "-ar", "44100",
                 temp_mixed_audio
             ]
             res_fb = subprocess.run(fallback_cmd, capture_output=True, text=True)

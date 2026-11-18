@@ -1072,11 +1072,13 @@ def main():
                         ensure_secondary_tools(need_whisper=False, need_demucs=True)
                             
                         demucs_device = "cuda" if torch.cuda.is_available() else "cpu"
-                        log(f"Running Demucs (--two-stems=vocals, device={{demucs_device}}) on {{local_ref_path}}...")
+                        log(f"Running Demucs (--two-stems=vocals, overlap=0.25, device={{demucs_device}}) on {{local_ref_path}}...")
                         t_sep0 = time.time()
                         demucs_cmd = [
                             sys.executable, "-m", "demucs",
                             "--two-stems=vocals",
+                            "--overlap", "0.25",
+                            "--clip-mode", "clamp",
                             "-d", demucs_device,
                             "-o", "demucs_out",
                             local_ref_path,
@@ -1106,6 +1108,22 @@ def main():
                         if extracted_vocals and extracted_no_vocals:
                             shutil.copy2(extracted_vocals, vocals_path)
                             shutil.copy2(extracted_no_vocals, bgm_path)
+                            # Post-clean vocals: remove DC offset & attenuate residual noise floor in silent gaps
+                            try:
+                                v_arr, v_sr = sf.read(vocals_path, dtype="float32")
+                                v_arr = v_arr - np.mean(v_arr, axis=0, keepdims=True)
+                                win = max(1, int(v_sr * 0.05))
+                                mono_env = np.mean(np.abs(v_arr), axis=1) if v_arr.ndim > 1 else np.abs(v_arr)
+                                kernel = np.ones(win, dtype=np.float32) / win
+                                smooth_env = np.convolve(mono_env, kernel, mode="same")
+                                gate = np.clip((smooth_env - 0.003) / 0.012, 0.08, 1.0).astype(np.float32)
+                                if v_arr.ndim > 1:
+                                    v_arr = v_arr * gate[:, None]
+                                else:
+                                    v_arr = v_arr * gate
+                                sf.write(vocals_path, v_arr, v_sr, format="WAV", subtype="PCM_16")
+                            except Exception as vc_err:
+                                log(f"Notice: vocal post-gate skipped: {{vc_err}}")
                             log(f"Demucs separation finished in {{time.time() - t_sep0:.1f}}s. Vocals: {{extracted_vocals}}, BGM: {{extracted_no_vocals}}")
                         else:
                             raise Exception(f"Could not locate demucs output files (vocals={{extracted_vocals}}, no_vocals={{extracted_no_vocals}})")
@@ -1173,20 +1191,52 @@ def main():
                     created_files = []
                     total_segs = max(1, len(segments))
                     
-                    # Pre-compute VoiceClonePrompt ONCE for all segments to save massive processing time
+                    # Pre-compute VoiceClonePrompt ONCE using the cleanest 6-12s active speech window (skipping intro/outro music noise)
                     voice_clone_prompt = None
+                    clean_ref_clip_path = local_ref_path
                     if local_ref_path and os.path.exists(local_ref_path):
+                        try:
+                            full_vox, full_sr = sf.read(local_ref_path, dtype="float32")
+                            mono_vox = np.mean(full_vox, axis=1) if full_vox.ndim > 1 else full_vox
+                            best_rms = -1.0
+                            best_slice = None
+                            for s_cand in segments[:10]:
+                                if not isinstance(s_cand, dict):
+                                    continue
+                                cs = float(s_cand.get("start", 0.0) or 0.0)
+                                ce = float(s_cand.get("end", cs + 4.0) or (cs + 4.0))
+                                dur_c = ce - cs
+                                if 3.0 <= dur_c <= 14.0:
+                                    i0 = max(0, int(cs * full_sr))
+                                    i1 = min(len(mono_vox), int(ce * full_sr))
+                                    if i1 - i0 > int(2.5 * full_sr):
+                                        rms = float(np.sqrt(np.mean(np.square(mono_vox[i0:i1]))))
+                                        if rms > best_rms:
+                                            best_rms = rms
+                                            best_slice = full_vox[i0:i1]
+                            if best_slice is not None and best_rms > 0.005:
+                                clean_ref_clip_path = "clean_voice_ref.wav"
+                                sf.write(clean_ref_clip_path, best_slice, full_sr, format="WAV", subtype="PCM_16")
+                                log(f"Extracted clean speech reference slice ({{len(best_slice)/full_sr:.2f}}s, rms={{best_rms:.4f}}) for VoiceClonePrompt.")
+                        except Exception as sl_err:
+                            log(f"Notice: speech slice extraction fallback to full vocals: {{sl_err}}")
+
                         if hasattr(model, "create_voice_clone_prompt"):
                             try:
                                 log("Pre-computing reusable VoiceClonePrompt for all segments...")
                                 voice_clone_prompt = model.create_voice_clone_prompt(
-                                    ref_audio=local_ref_path,
+                                    ref_audio=clean_ref_clip_path,
                                     ref_text=job.get("ref_text")
                                 )
                                 log("VoiceClonePrompt successfully pre-computed.")
                             except Exception as p_err:
                                 log(f"Notice: create_voice_clone_prompt fallback to raw audio: {{p_err}}")
                                 voice_clone_prompt = None
+                        if clean_ref_clip_path != local_ref_path and os.path.exists(clean_ref_clip_path):
+                            try:
+                                os.remove(clean_ref_clip_path)
+                            except Exception:
+                                pass
 
                     for idx, seg in enumerate(segments):
                         seg_id = seg.get("id", idx + 1) if isinstance(seg, dict) else (idx + 1)
@@ -1303,33 +1353,79 @@ def main():
                         asr_model = get_asr_whisper_model()
                         seg_iter, asr_info = asr_model.transcribe(
                             audio_16k,
+                            beam_size=5,
+                            best_of=5,
+                            temperature=(0.0, 0.2),
+                            condition_on_previous_text=False,
+                            compression_ratio_threshold=2.2,
+                            log_prob_threshold=-0.8,
+                            no_speech_threshold=0.55,
+                            hallucination_silence_threshold=1.5,
                             word_timestamps=True,
                             vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=400),
+                            vad_parameters=dict(
+                                threshold=0.55,
+                                min_speech_duration_ms=250,
+                                min_silence_duration_ms=500,
+                                speech_pad_ms=200,
+                            ),
                         )
                         seg_list = list(seg_iter)
                         text_parts = []
                         for seg_obj in seg_list:
-                            if seg_obj.text and seg_obj.text.strip():
-                                text_parts.append(seg_obj.text.strip())
+                            s_txt = (seg_obj.text or "").strip()
+                            if not s_txt:
+                                continue
+                            # Segment-level anti-hallucination filter
+                            no_speech_p = float(getattr(seg_obj, "no_speech_prob", 0.0) or 0.0)
+                            avg_lp = float(getattr(seg_obj, "avg_logprob", 0.0) or 0.0)
+                            comp_r = float(getattr(seg_obj, "compression_ratio", 1.0) or 1.0)
+                            if no_speech_p > 0.60 or avg_lp < -0.95 or comp_r > 2.4:
+                                log(f"Skipping hallucinated ASR segment '{{s_txt[:40]}}' (no_speech={{no_speech_p:.2f}}, logprob={{avg_lp:.2f}})")
+                                continue
+
+                            # Verify actual audio RMS energy in segment window
+                            i0 = max(0, int(float(seg_obj.start) * 16000))
+                            i1 = min(len(audio_16k), int(float(seg_obj.end) * 16000))
+                            if i1 > i0:
+                                seg_rms = float(np.sqrt(np.mean(np.square(audio_16k[i0:i1]))))
+                                if seg_rms < 0.0035:
+                                    log(f"Skipping near-silent ASR segment '{{s_txt[:40]}}' (rms={{seg_rms:.5f}})")
+                                    continue
+
                             if seg_obj.words:
-                                for w in seg_obj.words:
+                                valid_w_objs = [w for w in seg_obj.words if (w.word or "").strip()]
+                                if not valid_w_objs:
+                                    continue
+                                mean_w_prob = sum(float(getattr(w, "probability", 1.0) or 1.0) for w in valid_w_objs) / len(valid_w_objs)
+                                if mean_w_prob < 0.42 or (no_speech_p > 0.35 and mean_w_prob < 0.55):
+                                    log(f"Skipping low-confidence ASR segment '{{s_txt[:40]}}' (mean_prob={{mean_w_prob:.2f}})")
+                                    continue
+                                kept_words_text = []
+                                for wi_idx, w in enumerate(valid_w_objs):
                                     w_str = (w.word or "").strip()
-                                    if not w_str:
+                                    w_prob = float(getattr(w, "probability", 1.0) or 1.0)
+                                    if w_prob < 0.18:
                                         continue
                                     s_val = round(float(w.start), 3)
                                     e_val = round(float(w.end), 3)
+                                    kept_words_text.append(w_str)
                                     chunks.append({{
                                         "word": w_str,
                                         "text": w_str,
                                         "start": s_val,
                                         "end": e_val,
                                         "timestamp": [s_val, e_val],
+                                        "prob": round(w_prob, 3),
+                                        "seg_end": (wi_idx == len(valid_w_objs) - 1),
                                     }})
-                            elif seg_obj.text and seg_obj.text.strip():
+                                if kept_words_text:
+                                    text_parts.append(" ".join(kept_words_text))
+                            else:
+                                text_parts.append(s_txt)
                                 s_val = round(float(seg_obj.start), 3)
                                 e_val = round(float(seg_obj.end), 3)
-                                seg_words = seg_obj.text.strip().split()
+                                seg_words = s_txt.split()
                                 step_w = max(0.05, (e_val - s_val) / max(1, len(seg_words)))
                                 for wi, sw in enumerate(seg_words):
                                     ws = round(s_val + wi * step_w, 3)
@@ -1340,6 +1436,7 @@ def main():
                                         "start": ws,
                                         "end": we,
                                         "timestamp": [ws, we],
+                                        "seg_end": (wi == len(seg_words) - 1),
                                     }})
                         transcribed_text = " ".join(text_parts).strip()
                         log(f"faster-whisper ASR completed in {{time.time() - t_asr0:.1f}}s ({{len(chunks)}} words, lang={{getattr(asr_info, 'language', 'auto')}}).")

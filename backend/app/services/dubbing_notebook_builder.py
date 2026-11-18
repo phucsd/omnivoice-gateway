@@ -240,7 +240,16 @@ def main():
 
                 try:
                     log(f"Executing Demucs separation on {{local_ref_path}}...")
-                    demucs_cmd = [sys.executable, "-m", "demucs", "--two-stems=vocals", "-o", "demucs_out", local_ref_path]
+                    demucs_dev = "cuda" if torch.cuda.is_available() else "cpu"
+                    demucs_cmd = [
+                        sys.executable, "-m", "demucs",
+                        "--two-stems=vocals",
+                        "--overlap", "0.25",
+                        "--clip-mode", "clamp",
+                        "-d", demucs_dev,
+                        "-o", "demucs_out",
+                        local_ref_path
+                    ]
                     try:
                         subprocess.run(demucs_cmd, check=True)
                     except Exception:
