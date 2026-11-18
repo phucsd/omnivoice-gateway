@@ -152,6 +152,12 @@ class KaggleOrchestrator:
                     if (datetime.utcnow() - t1).total_seconds() < 60:
                         return "worker_2"
             elif s1 and s2:
+                s1_bad = any(k in (s1.message or "").lower() for k in ("timeout", "push failed", "error"))
+                s2_bad = any(k in (s2.message or "").lower() for k in ("timeout", "push failed", "error"))
+                if s1_bad and not s2_bad:
+                    return "worker_2"
+                if s2_bad and not s1_bad:
+                    return "worker_1"
                 t1 = s1.stopped_at or s1.last_heartbeat_at
                 t2 = s2.stopped_at or s2.last_heartbeat_at
                 if t1 and t2 and t2 < t1:
@@ -661,10 +667,22 @@ class KaggleOrchestrator:
             if "queued" in status_lower:
                 cls._unknown_status_count.pop(job.id, None)
                 cls._complete_grace_count.pop(job.id, None)
-                job.status = "queued_kaggle"
-                job.message = f"Kaggle ({job.worker_id}) chưa cấp runtime/GPU, đang xếp hàng..."
-                job.progress = 15
-                db.commit()
+                import time as _time
+                boot_t0 = cls._boot_started_at.get(job.id)
+                if boot_t0 is None:
+                    cls._boot_started_at[job.id] = _time.monotonic()
+                    queued_elapsed = 0.0
+                else:
+                    queued_elapsed = _time.monotonic() - boot_t0
+
+                if queued_elapsed > 60:
+                    print(f"[KaggleOrchestrator] Worker {job.worker_id} stuck in QUEUED for {queued_elapsed:.0f}s. Failing over to alternate slot...")
+                    cls._failover_or_retry_worker(db, job, f"Queued timeout ({int(queued_elapsed)}s)", "Worker Queued Timeout")
+                else:
+                    job.status = "queued_kaggle"
+                    job.message = f"Kaggle ({job.worker_id}) chưa cấp runtime/GPU, đang xếp hàng..."
+                    job.progress = 15
+                    db.commit()
             elif "running" in status_lower:
                 cls._unknown_status_count.pop(job.id, None)
                 cls._complete_grace_count.pop(job.id, None)
