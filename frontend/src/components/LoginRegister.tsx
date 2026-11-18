@@ -1,6 +1,8 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Radio, ShieldAlert, CheckCircle2, ArrowRight, ExternalLink, KeyRound, Mail, UserPlus, LogIn } from "lucide-react";
 import { api, getErrorMessage } from "../api/client";
+
+const processedOAuthCodes = new Set<string>();
 
 interface LoginRegisterProps {
   onLoginSuccess: (token: string) => void;
@@ -30,28 +32,42 @@ export const LoginRegister: React.FC<LoginRegisterProps> = ({ onLoginSuccess }) 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
-  // Handle Google OAuth Callback (code + signed state exchange)
+  const onLoginSuccessRef = useRef(onLoginSuccess);
+  useEffect(() => {
+    onLoginSuccessRef.current = onLoginSuccess;
+  }, [onLoginSuccess]);
+
+  // Handle Google OAuth Callback (code + signed state exchange) without cancelling on parent re-render
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
+    const oauthError = urlParams.get("error");
     const code = urlParams.get("code");
-    if (!code) return;
+
+    if (oauthError && !code) {
+      window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+      void Promise.resolve().then(() => {
+        setErrorMsg(`Đăng nhập Google không thành công (${oauthError}).`);
+      });
+      return;
+    }
+
+    if (!code || processedOAuthCodes.has(code)) return;
+    processedOAuthCodes.add(code);
 
     const returnedState = urlParams.get("state") || sessionStorage.getItem("ov_oauth_state") || "";
     sessionStorage.removeItem("ov_oauth_state");
     const redirectUri = window.location.origin + window.location.pathname;
     window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
 
-    let cancelled = false;
-    (async () => {
+    void Promise.resolve().then(async () => {
       setLoading(true);
       setErrorMsg(null);
       try {
         const res = await api.oauthCallback("google", code, redirectUri, returnedState);
-        if (cancelled) return;
         localStorage.setItem("VITE_JWT_TOKEN", res.access_token);
-        onLoginSuccess(res.access_token);
+        onLoginSuccessRef.current(res.access_token);
       } catch (err: unknown) {
-        if (cancelled) return;
+        processedOAuthCodes.delete(code);
         const msg = getErrorMessage(err, "Lỗi xác thực OAuth từ Google.");
         if (msg.includes("chưa được duyệt") || msg.includes("chưa xác thực")) {
           setErrorMsg("Tài khoản Google của bạn đã được đăng ký nhưng hiện đang ở trạng thái chờ Admin phê duyệt.");
@@ -59,14 +75,10 @@ export const LoginRegister: React.FC<LoginRegisterProps> = ({ onLoginSuccess }) 
           setErrorMsg(msg);
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        setLoading(false);
       }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [onLoginSuccess]);
+    });
+  }, []);
 
   const handleGoogleLogin = async () => {
     setErrorMsg(null);
@@ -74,6 +86,7 @@ export const LoginRegister: React.FC<LoginRegisterProps> = ({ onLoginSuccess }) 
     setLoading(true);
 
     const redirectUri = window.location.origin + window.location.pathname;
+    let navigating = false;
     try {
       const res = await api.oauthLogin("google", redirectUri);
       if (res && res.auth_url) {
@@ -84,15 +97,19 @@ export const LoginRegister: React.FC<LoginRegisterProps> = ({ onLoginSuccess }) 
           window.open(res.auth_url, "_blank", "noopener,noreferrer");
           setSuccessMsg("Đã mở trang đăng nhập Google ở cửa sổ mới do Space đang chạy trong iframe.");
         } else {
+          navigating = true;
           window.location.href = res.auth_url;
+          return;
         }
-        return;
+      } else {
+        setErrorMsg("Không thể nhận liên kết đăng nhập Google từ hệ thống.");
       }
-      setErrorMsg("Không thể nhận liên kết đăng nhập Google từ hệ thống.");
     } catch (err: unknown) {
       setErrorMsg(getErrorMessage(err, "Không thể khởi tạo đăng nhập Google."));
     } finally {
-      setLoading(false);
+      if (!navigating) {
+        setLoading(false);
+      }
     }
   };
 

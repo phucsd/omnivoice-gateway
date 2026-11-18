@@ -385,3 +385,64 @@ def test_auto_align_legacy_user_ids_preserves_multi_tenant_owners(tmp_path):
         assert cur.fetchone()[0] == "usr_admin_legacy"
     finally:
         conn.close()
+
+
+def test_google_oauth_full_callback_flow(monkeypatch):
+    from app.routers import auth as auth_router
+
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", "test-google-client-id")
+    monkeypatch.setattr(settings, "GOOGLE_CLIENT_SECRET", "test-google-client-secret")
+    monkeypatch.setattr(settings, "FRONTEND_ORIGINS", f"{settings.FRONTEND_ORIGINS},https://voice.oloka.net")
+
+    login_res = client.get("/v1/auth/oauth/login/google", params={"redirect_uri": "https://voice.oloka.net/"})
+    assert login_res.status_code == 200
+    state = login_res.json()["state"]
+
+    class _DummyResp:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def _fake_post(url, data=None, timeout=15):
+        assert url == "https://oauth2.googleapis.com/token"
+        assert data["code"] == "valid_google_code_999"
+        return _DummyResp(200, {"access_token": "google_access_tok_abc"})
+
+    def _fake_get(url, headers=None, timeout=15):
+        assert url == "https://www.googleapis.com/oauth2/v3/userinfo"
+        return _DummyResp(
+            200,
+            {
+                "email": "oauth_e2e_user@example.com",
+                "sub": "sub_oauth_e2e_999",
+                "email_verified": True,
+                "name": "OAuth E2E User",
+            },
+        )
+
+    monkeypatch.setattr(auth_router.requests, "post", _fake_post)
+    monkeypatch.setattr(auth_router.requests, "get", _fake_get)
+
+    cb_res = client.get(
+        "/v1/auth/oauth/callback/google",
+        params={"code": "valid_google_code_999", "redirect_uri": "https://voice.oloka.net/", "state": state},
+    )
+    assert cb_res.status_code == 200, cb_res.text
+    access_token = cb_res.json()["access_token"]
+    assert access_token
+
+    me_res = client.get("/v1/auth/me", headers={"Authorization": f"Bearer {access_token}"})
+    assert me_res.status_code == 200, me_res.text
+    assert me_res.json()["is_verified"] is True
+
+    db = SessionLocal()
+    try:
+        u = db.query(User).filter(User.email == "oauth_e2e_user@example.com").first()
+        if u:
+            db.delete(u)
+            db.commit()
+    finally:
+        db.close()

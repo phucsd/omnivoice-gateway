@@ -619,10 +619,10 @@ def oauth_callback(
             # Associate
             user.oauth_provider = "google"
             user.oauth_id = oauth_id
+            user.is_verified = True
             if email == "phucsd@gmail.com":
                 user.is_admin = True
                 user.is_approved = True
-                user.is_verified = True
             db.commit()
         else:
             # Create user

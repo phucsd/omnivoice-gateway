@@ -197,23 +197,36 @@ function App() {
     };
   }, []);
 
+  const handleLoginSuccess = useCallback((newToken: string) => {
+    localStorage.setItem("VITE_JWT_TOKEN", newToken);
+    setToken(newToken);
+  }, []);
+
   useEffect(() => {
     if (!token) return;
     let active = true;
     (async () => {
       try {
-        const [meRes, settingsRes] = await Promise.all([api.getMe(), api.getSettings()]);
+        const meRes = await api.getMe();
         if (!active) return;
         setCurrentUser({ id: meRes.id, username: meRes.username, is_admin: meRes.is_admin });
+      } catch (err) {
+        console.error("Lỗi xác thực phiên đăng nhập:", err);
+        if (active) handleLogout();
+        return;
+      }
+
+      try {
+        const settingsRes = await api.getSettings();
+        if (!active) return;
         setUiLayout(settingsRes.ui_layout === "classic" ? "classic" : "modern");
         if (!settingsRes.kaggle_username || !settingsRes.kaggle_key_configured) {
           setKaggleStatus("unconfigured");
         } else {
           setKaggleStatus("connected");
         }
-      } catch (err) {
-        console.error("Lỗi tải dữ liệu phiên đăng nhập:", err);
-        if (active) handleLogout();
+      } catch (settingsErr) {
+        console.warn("Không thể tải cấu hình người dùng:", settingsErr);
       }
     })();
     return () => {
@@ -239,7 +252,7 @@ function App() {
         />
       );
     }
-    return <LoginRegister onLoginSuccess={(t) => setToken(t)} />;
+    return <LoginRegister onLoginSuccess={handleLoginSuccess} />;
   }
 
   const { colorClass: orbColorClass, pulseClass: orbPulseClass, label: orbLabel, desc: orbDesc } = getAgentOrbState(
