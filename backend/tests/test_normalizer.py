@@ -66,3 +66,20 @@ def test_preserves_omnivoice_inline_control_tags():
     assert "tám giờ ba mươi phút" in res
     assert "một nghìn năm trăm đồng" in res
 
+
+def test_technical_units_decimals_and_medical_acronyms_for_dubbing():
+    assert normalize_vietnamese_text("Sử dụng implant đường kính 4,2 mm và chiều dài 13 mm.") == (
+        "Sử dụng implant đường kính bốn phẩy hai mi li mét và chiều dài mười ba mi li mét."
+    )
+    assert normalize_vietnamese_text("Mô-men xoắn khuyến nghị cho implant MIS là 35 đến 60 Nm.") == (
+        "Mô-men xoắn khuyến nghị cho implant em ai ét là ba mươi lăm đến sáu mươi niu tơn mét."
+    )
+    assert normalize_vietnamese_text("Video này sẽ hướng dẫn đặt implant MIS-C1XD.") == (
+        "Video này sẽ hướng dẫn đặt implant em ai ét xi một ích đi."
+    )
+    assert normalize_vietnamese_text("Mũi khoan XD Pilot có đầu mũi 2mm.") == (
+        "Mũi khoan ích đi pai lốt có đầu mũi hai mi li mét."
+    )
+    assert normalize_vietnamese_text("MIS. Đơn giản hóa.") == "Em ai ét. Đơn giản hóa."
+
+

@@ -1622,19 +1622,66 @@ def run_finalization_pipeline(job_id: str):
             VideoDubbingService.log_to_job(job_id, "Quy trình lồng tiếng hoàn tất thành công. Trạng thái: COMPLETED.")
 
         else:
-            # Kaggle Worker Mode: Submit segment dubbing batch job
+            # Kaggle Worker Mode: Submit segment dubbing batch job with verified orig_text + language + Vietnamese normalization
             job.status = "generating_tts"
             job.progress = 20
             job.message = "Đang gửi yêu cầu sinh giọng đọc lồng tiếng lên Kaggle GPU..."
             db.commit()
 
-            VideoDubbingService.log_to_job(job_id, f"[KAGGLE] Tạo sub-job dub_segments 'dub_{job_id}' trong hàng đợi với {len(translated_subs)} phân đoạn...")
+            orig_subs = json.loads(job.original_subtitles or "[]")
+            orig_by_id = {
+                int(o.get("id", i + 1)): str(o.get("text", "")).strip()
+                for i, o in enumerate(orig_subs)
+                if isinstance(o, dict)
+            }
+            enriched_segments = []
+            for i, seg in enumerate(translated_subs):
+                if isinstance(seg, dict):
+                    sid = int(seg.get("id", i + 1))
+                    item = dict(seg)
+                    if sid in orig_by_id and orig_by_id[sid]:
+                        item["orig_text"] = orig_by_id[sid]
+                    elif i < len(orig_subs) and isinstance(orig_subs[i], dict):
+                        item["orig_text"] = str(orig_subs[i].get("text", "")).strip()
+                    enriched_segments.append(item)
+                else:
+                    enriched_segments.append(seg)
+
+            lang_map = {
+                "vietnamese": "vi", "tiếng việt": "vi", "vi": "vi",
+                "english": "en", "tiếng anh": "en", "en": "en",
+                "japanese": "ja", "ja": "ja",
+                "korean": "ko", "ko": "ko",
+                "chinese": "zh", "zh": "zh",
+                "french": "fr", "fr": "fr",
+                "german": "de", "de": "de",
+                "spanish": "es", "es": "es",
+                "russian": "ru", "ru": "ru",
+                "thai": "th", "th": "th",
+                "indonesian": "id", "id": "id",
+            }
+            tgt_lang_key = (job.target_language or "Vietnamese").strip().lower()
+            ov_lang = lang_map.get(tgt_lang_key, "vi" if "việt" in tgt_lang_key or "viet" in tgt_lang_key else None)
+            should_norm_vi = (ov_lang == "vi")
+            dub_payload_json = json.dumps(enriched_segments, ensure_ascii=False)
+
+            VideoDubbingService.log_to_job(
+                job_id,
+                f"[KAGGLE] Tạo sub-job dub_segments 'dub_{job_id}' ({len(enriched_segments)} phân đoạn, lang={ov_lang}, normalize_vi={should_norm_vi})..."
+            )
 
             # Check if sub-job already exists to prevent UNIQUE constraint error
             existing_tts = db.query(TTSJob).filter(TTSJob.id == f"dub_{job_id}").first()
             if existing_tts:
-                existing_tts.text = job.translated_subtitles
+                existing_tts.text = dub_payload_json
                 existing_tts.ref_audio_path = job.vocals_audio_path
+                existing_tts.language = ov_lang
+                existing_tts.normalize_text = should_norm_vi
+                existing_tts.speed = 0.92
+                existing_tts.guidance_scale = 2.5
+                existing_tts.postprocess_output = False
+                existing_tts.worker_id = None
+                existing_tts.error_message = None
                 existing_tts.status = "queued"
                 existing_tts.progress = 0
                 existing_tts.message = "Đang chờ Kaggle lồng tiếng..."
@@ -1643,9 +1690,14 @@ def run_finalization_pipeline(job_id: str):
                     id=f"dub_{job_id}",
                     user_id=job.user_id,
                     job_type="dub_segments",
-                    text=job.translated_subtitles,  # passing JSON translated subtitles
+                    text=dub_payload_json,
                     voice_sample_id=None,
                     ref_audio_path=job.vocals_audio_path,
+                    language=ov_lang,
+                    normalize_text=should_norm_vi,
+                    speed=0.92,
+                    guidance_scale=2.5,
+                    postprocess_output=False,
                     status="queued",
                     progress=0,
                     message="Đang chờ Kaggle lồng tiếng..."

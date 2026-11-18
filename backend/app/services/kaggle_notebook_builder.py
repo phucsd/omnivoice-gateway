@@ -1191,44 +1191,73 @@ def main():
                     created_files = []
                     total_segs = max(1, len(segments))
                     
-                    # Pre-compute VoiceClonePrompt ONCE using the cleanest 6-12s active speech window (skipping intro/outro music noise)
+                    # Pre-compute VoiceClonePrompt ONCE using a complete sentence with clean post-utterance pause,
+                    # natural vowel decay tail (+0.35s), digital silence padding, and exact verified ref_text (eliminates 'Oh.' boundary leak!)
                     voice_clone_prompt = None
                     clean_ref_clip_path = local_ref_path
+                    chosen_ref_text = job.get("ref_text")
                     if local_ref_path and os.path.exists(local_ref_path):
                         try:
                             full_vox, full_sr = sf.read(local_ref_path, dtype="float32")
                             mono_vox = np.mean(full_vox, axis=1) if full_vox.ndim > 1 else full_vox
-                            best_rms = -1.0
+                            total_vox_sec = len(mono_vox) / float(full_sr)
+                            best_score = -1.0
                             best_slice = None
-                            for s_cand in segments[:10]:
+                            best_orig_txt = None
+                            for c_idx, s_cand in enumerate(segments[:15]):
                                 if not isinstance(s_cand, dict):
                                     continue
                                 cs = float(s_cand.get("start", 0.0) or 0.0)
                                 ce = float(s_cand.get("end", cs + 4.0) or (cs + 4.0))
+                                prev_ce = float(segments[c_idx - 1].get("end", 0.0)) if (c_idx > 0 and isinstance(segments[c_idx - 1], dict)) else 0.0
+                                nxt_cs = float(segments[c_idx + 1].get("start", total_vox_sec)) if (c_idx + 1 < len(segments) and isinstance(segments[c_idx + 1], dict)) else total_vox_sec
+                                gap_before = max(0.0, cs - prev_ce)
+                                gap_after = max(0.0, nxt_cs - ce)
                                 dur_c = ce - cs
-                                if 3.0 <= dur_c <= 14.0:
-                                    i0 = max(0, int(cs * full_sr))
-                                    i1 = min(len(mono_vox), int(ce * full_sr))
-                                    if i1 - i0 > int(2.5 * full_sr):
-                                        rms = float(np.sqrt(np.mean(np.square(mono_vox[i0:i1]))))
-                                        if rms > best_rms:
-                                            best_rms = rms
-                                            cand_mono = mono_vox[i0:i1]
-                                            peak_v = float(np.max(np.abs(cand_mono)))
-                                            best_slice = cand_mono * min(2.5, 0.90 / peak_v) if peak_v > 1e-4 else cand_mono
-                            if best_slice is not None and best_rms > 0.005:
+                                if 3.2 <= dur_c <= 9.0 and gap_after >= 0.25:
+                                    pre_ext = min(0.10, gap_before * 0.5)
+                                    post_ext = min(0.38, max(0.18, gap_after * 0.65))
+                                    i0 = max(0, int((cs - pre_ext) * full_sr))
+                                    i1 = min(len(mono_vox), int((ce + post_ext) * full_sr))
+                                    if i1 - i0 > int(2.8 * full_sr):
+                                        cand_raw = mono_vox[i0:i1].copy()
+                                        rms = float(np.sqrt(np.mean(np.square(cand_raw))))
+                                        orig_t = str(s_cand.get("orig_text") or "").strip()
+                                        # Strongly prefer segments with >=0.5s clean pause after sentence end AND verified orig_text
+                                        pause_bonus = 1.35 if gap_after >= 0.50 else 1.0
+                                        txt_bonus = 1.20 if (orig_t and orig_t.endswith((".", "!", "?"))) else 1.0
+                                        score = rms * pause_bonus * txt_bonus
+                                        if rms > 0.005 and score > best_score:
+                                            best_score = score
+                                            fade_in_n = min(len(cand_raw) // 8, int(0.025 * full_sr))
+                                            fade_out_n = min(len(cand_raw) // 8, int(0.045 * full_sr))
+                                            if fade_in_n > 1:
+                                                cand_raw[:fade_in_n] *= np.linspace(0.0, 1.0, fade_in_n, dtype=np.float32)
+                                            if fade_out_n > 1:
+                                                cand_raw[-fade_out_n:] *= np.linspace(1.0, 0.0, fade_out_n, dtype=np.float32)
+                                            peak_v = float(np.max(np.abs(cand_raw)))
+                                            if peak_v > 1e-4:
+                                                cand_raw = cand_raw * min(2.5, 0.88 / peak_v)
+                                            # Pad pure digital silence (120ms pre + 300ms post) so no trailing vowel ever leaks into generated speech!
+                                            pad_pre = np.zeros(int(0.12 * full_sr), dtype=np.float32)
+                                            pad_post = np.zeros(int(0.30 * full_sr), dtype=np.float32)
+                                            best_slice = np.concatenate([pad_pre, cand_raw, pad_post])
+                                            best_orig_txt = orig_t if orig_t else None
+                            if best_slice is not None:
                                 clean_ref_clip_path = "clean_voice_ref.wav"
                                 sf.write(clean_ref_clip_path, best_slice, full_sr, format="WAV", subtype="PCM_16")
-                                log(f"Extracted clean speech reference slice ({{len(best_slice)/full_sr:.2f}}s, rms={{best_rms:.4f}}) for VoiceClonePrompt.")
+                                if best_orig_txt:
+                                    chosen_ref_text = best_orig_txt
+                                log(f"Extracted padded clean reference slice ({{len(best_slice)/full_sr:.2f}}s, ref_text={{bool(chosen_ref_text)}}) for VoiceClonePrompt.")
                         except Exception as sl_err:
                             log(f"Notice: speech slice extraction fallback to full vocals: {{sl_err}}")
 
                         if hasattr(model, "create_voice_clone_prompt"):
                             try:
-                                log("Pre-computing reusable VoiceClonePrompt for all segments...")
+                                log(f"Pre-computing reusable VoiceClonePrompt (ref_text={{chosen_ref_text[:60] if chosen_ref_text else 'auto-ASR'}})...")
                                 voice_clone_prompt = model.create_voice_clone_prompt(
                                     ref_audio=clean_ref_clip_path,
-                                    ref_text=job.get("ref_text")
+                                    ref_text=chosen_ref_text,
                                 )
                                 log("VoiceClonePrompt successfully pre-computed.")
                             except Exception as p_err:
@@ -1239,6 +1268,36 @@ def main():
                                 os.remove(clean_ref_clip_path)
                             except Exception:
                                 pass
+
+                    def _gentle_trim_dub_wav(wav_arr, sr=24000):
+                        \"\"\"Trims only dead digital silence while preserving 35ms onset pre-roll and 150ms final consonant decay.\"\"\"
+                        arr = np.asarray(wav_arr, dtype=np.float32).reshape(-1)
+                        if len(arr) < int(0.15 * sr):
+                            return arr
+                        hop = max(1, int(0.01 * sr))
+                        win = max(hop, int(0.02 * sr))
+                        rms_env = np.array([
+                            float(np.sqrt(np.mean(np.square(arr[p:p + win]))))
+                            for p in range(0, max(1, len(arr) - win + 1), hop)
+                        ])
+                        active = np.where(rms_env > 0.0038)[0]  # ~ -48.4 dBFS
+                        if len(active) == 0:
+                            return arr
+                        s_idx = max(0, int(active[0] * hop - 0.035 * sr))
+                        e_idx = min(len(arr), int((active[-1] + 1) * hop + 0.150 * sr))
+                        out = arr[s_idx:e_idx].copy()
+                        fi = min(len(out) // 6, int(0.015 * sr))
+                        fo = min(len(out) // 6, int(0.028 * sr))
+                        if fi > 1:
+                            out[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)
+                        if fo > 1:
+                            out[-fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)
+                        return out
+
+                    vi_diacritics = set("áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗợúùủũụưứừửữựýỳỷỹỵđ")
+                    job_lang = (job.get("language") or "").strip() or None
+                    base_speed = float(job.get("speed") or 0.92)
+                    base_guidance = float(job.get("guidance_scale") or 2.5)
 
                     for idx, seg in enumerate(segments):
                         seg_id = seg.get("id", idx + 1) if isinstance(seg, dict) else (idx + 1)
@@ -1262,48 +1321,95 @@ def main():
                                 )
                             except Exception:
                                 pass
-                        
-                        log(f"Dubbing segment {{seg_id}} ({{idx+1}}/{{total_segs}}): '{{seg_text[:60]}}' (target: {{target_dur:.2f}}s)")
-                        if job.get("normalize_text", True) and seg_text:
+
+                        is_vi_seg = (job_lang == "vi") or any(ch in vi_diacritics for ch in seg_text.lower())
+                        seg_lang = job_lang or ("vi" if is_vi_seg else None)
+                        if seg_text and (is_vi_seg or job.get("normalize_text", True)):
                             seg_text = normalize_vietnamese_text(seg_text)
-                        
-                        gen_kwargs = {{"text": seg_text}}
+
+                        log(f"Dubbing segment {{seg_id}} ({{idx+1}}/{{total_segs}}, lang={{seg_lang}}): '{{seg_text[:75]}}' (target: {{target_dur:.2f}}s)")
+
+                        gen_kwargs = {{
+                            "text": seg_text,
+                            "speed": base_speed,
+                            "guidance_scale": base_guidance,
+                            "postprocess_output": False,
+                        }}
+                        if seg_lang:
+                            gen_kwargs["language"] = seg_lang
                         if voice_clone_prompt is not None:
                             gen_kwargs["voice_clone_prompt"] = voice_clone_prompt
                         elif local_ref_path and os.path.exists(local_ref_path):
                             gen_kwargs["ref_audio"] = local_ref_path
-                        
-                        try:
-                            audio_res = model.generate(**gen_kwargs)
-                        except (TypeError, ImportError, Exception) as t_err:
-                            err_str = str(t_err).lower()
-                            if any(k in err_str for k in ["normalize_text", "wetextprocessing", "pynini", "no module named 'tn'", "module 'tn'"]):
-                                log(f"Notice: normalize_text failed ({{t_err}}). Retrying without text normalization...")
-                                gen_kwargs.pop("normalize_text", None)
-                                audio_res = model.generate(**gen_kwargs)
-                            else:
-                                raise
-                        
-                        synth_dur = len(audio_res[0]) / 24000.0
-                        log(f"Segment {{seg_id}} synthesized duration: {{synth_dur:.2f}}s")
-                        
-                        if synth_dur > target_dur + 0.2:
-                            speed_val = min(2.5, max(1.1, synth_dur / target_dur))
-                            log(f"Re-generating segment {{seg_id}} with speed={{speed_val:.2f}}...")
-                            gen_kwargs["speed"] = speed_val
+                            if chosen_ref_text:
+                                gen_kwargs["ref_text"] = chosen_ref_text
+
+                        def _run_omni_gen(kw):
                             try:
-                                audio_res = model.generate(**gen_kwargs)
+                                return model.generate(**kw)
                             except (TypeError, ImportError, Exception) as t_err:
                                 err_str = str(t_err).lower()
                                 if any(k in err_str for k in ["normalize_text", "wetextprocessing", "pynini", "no module named 'tn'", "module 'tn'"]):
-                                    log(f"Notice: normalize_text failed ({{t_err}}). Retrying without text normalization...")
-                                    gen_kwargs.pop("normalize_text", None)
-                                    audio_res = model.generate(**gen_kwargs)
-                                else:
-                                    raise
-                        
+                                    kw.pop("normalize_text", None)
+                                    return model.generate(**kw)
+                                if "language" in err_str and "unexpected keyword" in err_str:
+                                    kw.pop("language", None)
+                                    return model.generate(**kw)
+                                raise
+
+                        audio_res = _run_omni_gen(dict(gen_kwargs))
+                        wav_seg = _gentle_trim_dub_wav(audio_res[0], 24000)
+
+                        # Fast GPU Whisper QA verification: catch & retry any stochastic word-skip or prompt prefix artifact
+                        exp_words = [w for w in seg_text.split() if any(c.isalnum() for c in w)]
+                        if len(exp_words) >= 4:
+                            try:
+                                wm_qa = get_whisper_model()
+                                qa_segs, _ = wm_qa.transcribe(
+                                    resample_to_16k(wav_seg, 24000),
+                                    language=seg_lang if seg_lang in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None,
+                                    without_timestamps=True,
+                                )
+                                qa_txt = " ".join(s.text.strip() for s in qa_segs if s.text).strip()
+                                qa_words = [w.strip(".,!?;:()-").lower() for w in qa_txt.split() if w.strip(".,!?;:()-")]
+                                has_oh_leak = bool(qa_words and qa_words[0] in ("oh", "ồ", "ờ"))
+                                coverage = len(qa_words) / float(max(1, len(exp_words)))
+                                if has_oh_leak or coverage < 0.70:
+                                    log(f"QA retry on segment {{seg_id}} (coverage={{coverage:.2f}}, oh_leak={{has_oh_leak}}, heard='{{qa_txt[:55]}}')...")
+                                    retry_kw = dict(gen_kwargs)
+                                    retry_kw["position_temperature"] = 2.0
+                                    retry_kw["guidance_scale"] = 2.8
+                                    retry_res = _run_omni_gen(retry_kw)
+                                    retry_wav = _gentle_trim_dub_wav(retry_res[0], 24000)
+                                    qa_segs2, _ = wm_qa.transcribe(
+                                        resample_to_16k(retry_wav, 24000),
+                                        language=seg_lang if seg_lang in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None,
+                                        without_timestamps=True,
+                                    )
+                                    qa_txt2 = " ".join(s.text.strip() for s in qa_segs2 if s.text).strip()
+                                    qa_words2 = [w.strip(".,!?;:()-").lower() for w in qa_txt2.split() if w.strip(".,!?;:()-")]
+                                    oh2 = bool(qa_words2 and qa_words2[0] in ("oh", "ồ", "ờ"))
+                                    cov2 = len(qa_words2) / float(max(1, len(exp_words)))
+                                    if (not oh2 and has_oh_leak) or cov2 >= coverage:
+                                        wav_seg = retry_wav
+                                        log(f"QA retry improved segment {{seg_id}} -> coverage={{cov2:.2f}}, heard='{{qa_txt2[:55]}}'")
+                            except Exception as qa_err:
+                                log(f"Notice: QA check skipped on segment {{seg_id}}: {{qa_err}}")
+
+                        synth_dur = len(wav_seg) / 24000.0
+                        log(f"Segment {{seg_id}} synthesized duration: {{synth_dur:.2f}}s (slot={{target_dur:.2f}}s)")
+
+                        # Only re-generate at faster speed when grossly exceeding slot (>1.38x); Gateway WSOLA handles gentle 1.0-1.35x fit!
+                        if synth_dur > max(target_dur + 0.65, target_dur * 1.38):
+                            speed_val = min(1.28, max(1.06, (synth_dur / target_dur) * 0.92))
+                            log(f"Re-generating segment {{seg_id}} with gentle speed={{speed_val:.2f}}...")
+                            fast_kw = dict(gen_kwargs)
+                            fast_kw["speed"] = speed_val
+                            audio_res = _run_omni_gen(fast_kw)
+                            wav_seg = _gentle_trim_dub_wav(audio_res[0], 24000)
+
                         seg_wav_name = f"segment_{{seg_id}}.wav"
-                        sf.write(seg_wav_name, audio_res[0], 24000, format='WAV', subtype='PCM_16')
+                        sf.write(seg_wav_name, wav_seg, 24000, format='WAV', subtype='PCM_16')
                         created_files.append(seg_wav_name)
                         
                     with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
