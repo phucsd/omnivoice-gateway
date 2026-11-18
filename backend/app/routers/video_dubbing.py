@@ -970,6 +970,8 @@ def _format_dubbing_job_response(job: VideoDubbingJob) -> VideoDubbingJobRespons
         has_source_video=has_source_video,
         target_language=job.target_language or "Vietnamese",
         llm_profile_id=getattr(job, "llm_profile_id", None),
+        voice_mode=getattr(job, "voice_mode", None) or "auto_native",
+        voice_sample_id=getattr(job, "voice_sample_id", None),
         original_subtitles=orig_subs,
         translated_subtitles=trans_subs,
         vocals_audio_path=resolved_vocals,
@@ -1207,6 +1209,8 @@ async def create_dubbing_job(
     video_title: Optional[str] = Form(None),
     video_thumbnail: Optional[str] = Form(None),
     video_duration: Optional[float] = Form(None),
+    voice_mode: Optional[str] = Form("auto_native"),
+    voice_sample_id: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key)
 ):
@@ -1235,6 +1239,11 @@ async def create_dubbing_job(
                 detail=f"URL video không hợp lệ hoặc không được phép: {ve}",
             )
 
+    clean_v_mode = (voice_mode or "auto_native").strip()
+    clean_vs_id = (voice_sample_id or "").strip() or None
+    if clean_vs_id and clean_v_mode == "auto_native":
+        clean_v_mode = "voice_sample"
+
     if uploaded_job_id:
         job = _get_accessible_dubbing_job(db, uploaded_job_id, current_user)
         
@@ -1243,6 +1252,8 @@ async def create_dubbing_job(
             job.llm_profile_id = llm_profile_id
         if preferred_quality:
             job.preferred_quality = preferred_quality
+        job.voice_mode = clean_v_mode
+        job.voice_sample_id = clean_vs_id
         job.error_message = None
         job.status = "queued"
         job.progress = 5
@@ -1250,7 +1261,7 @@ async def create_dubbing_job(
         db.commit()
         db.refresh(job)
 
-        VideoDubbingService.log_to_job(job.id, f"Bắt đầu tác vụ lồng tiếng từ video đã tải lên trước đó. Ngôn ngữ đích: {target_language}. Profile LLM ID: {llm_profile_id or 'Default'}")
+        VideoDubbingService.log_to_job(job.id, f"Bắt đầu tác vụ lồng tiếng từ video đã tải lên trước đó. Ngôn ngữ đích: {target_language}. Giọng đọc: {clean_v_mode} ({clean_vs_id or 'auto'})")
 
         # Trigger background execution pipeline with isolated daemon thread
         import threading
@@ -1266,7 +1277,7 @@ async def create_dubbing_job(
     input_file_path = None
     source_type = "youtube" if youtube_url else "upload"
 
-    VideoDubbingService.log_to_job(job_id, f"Khởi tạo tác vụ lồng tiếng mới. Nguồn: {source_type}. Ngôn ngữ đích: {target_language}. Profile LLM ID: {llm_profile_id or 'Default'}")
+    VideoDubbingService.log_to_job(job_id, f"Khởi tạo tác vụ lồng tiếng mới. Nguồn: {source_type}. Ngôn ngữ đích: {target_language}. Giọng đọc: {clean_v_mode} ({clean_vs_id or 'auto'})")
 
     if file:
         filename = os.path.basename(file.filename or "uploaded_video")
@@ -1293,6 +1304,8 @@ async def create_dubbing_job(
         preferred_quality=preferred_quality or "1080p",
         target_language=target_language,
         llm_profile_id=llm_profile_id,
+        voice_mode=clean_v_mode,
+        voice_sample_id=clean_vs_id,
         input_file_path=input_file_path
     )
     db.add(job)
@@ -1512,6 +1525,8 @@ def finalize_dubbing_job(
     background_tasks: BackgroundTasks,
     vocals_volume: Optional[float] = Form(None),
     bgm_volume: Optional[float] = Form(None),
+    voice_mode: Optional[str] = Form(None),
+    voice_sample_id: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key)
 ):
@@ -1525,6 +1540,15 @@ def finalize_dubbing_job(
         job.vocals_volume = vocals_volume
     if bgm_volume is not None:
         job.bgm_volume = bgm_volume
+    if voice_mode is not None and voice_mode.strip():
+        job.voice_mode = voice_mode.strip()
+    if voice_sample_id is not None:
+        vs_clean = voice_sample_id.strip() or None
+        job.voice_sample_id = vs_clean
+        if vs_clean and (not voice_mode or voice_mode.strip() == "auto_native"):
+            job.voice_mode = "voice_sample"
+    elif job.voice_mode in ("auto_native", "clone_original"):
+        job.voice_sample_id = None
 
     job.status = "generating_tts"
     job.progress = 10
@@ -1665,20 +1689,101 @@ def run_finalization_pipeline(job_id: str):
             should_norm_vi = (ov_lang == "vi")
             dub_payload_json = json.dumps(enriched_segments, ensure_ascii=False)
 
+            # Resolve dubbing voice source:
+            # - "voice_sample": explicit VoiceSample from library (100% native pronunciation, zero foreign accent bleed)
+            # - "auto_native": auto-matches speaker gender (F0) to a native Vietnamese VoiceSample when dubbing foreign -> VI
+            # - "clone_original": cross-lingual clone from separated video vocals (preserves foreign speaker timbre + accent)
+            from app.models import VoiceSample
+            v_mode = (getattr(job, "voice_mode", None) or "auto_native").strip()
+            req_vs_id = (getattr(job, "voice_sample_id", None) or "").strip() or None
+
+            resolved_vs_id = None
+            resolved_ref_audio = None
+            resolved_ref_text = None
+            resolved_instruct = None
+            resolved_speed = 0.96
+            resolved_guidance = 2.0
+
+            vi_diac_set = set("áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗợúùủũụưứừửữựýỳỷỹỵđ")
+            orig_is_vi = any(
+                ch in vi_diac_set
+                for o in orig_subs[:8]
+                if isinstance(o, dict)
+                for ch in str(o.get("text", "")).lower()
+            )
+
+            if v_mode == "voice_sample" and req_vs_id:
+                vs_obj = db.query(VoiceSample).filter(
+                    VoiceSample.id == req_vs_id,
+                    (VoiceSample.user_id == job.user_id) | (VoiceSample.is_public == True),
+                ).first()
+                if vs_obj and vs_obj.file_path and os.path.exists(vs_obj.file_path):
+                    resolved_vs_id = vs_obj.id
+                    resolved_ref_text = (vs_obj.ref_text or "").strip() or None
+                    VideoDubbingService.log_to_job(job_id, f"[VOICE] Sử dụng giọng mẫu bản ngữ đã chọn: '{vs_obj.name or vs_obj.id}' ({vs_obj.id})")
+                else:
+                    VideoDubbingService.log_to_job(job_id, f"[VOICE WARNING] Không tìm thấy giọng mẫu '{req_vs_id}', chuyển sang tự động khớp giọng bản ngữ.")
+                    v_mode = "auto_native"
+
+            if v_mode == "auto_native" and ov_lang == "vi" and not orig_is_vi:
+                gender = VideoDubbingService.detect_speaker_gender(job.vocals_audio_path)
+                preferred_ids = (
+                    ["tuan_anh", "bao_mien_nam_ro", "tien_mien_nam_quang_cao", "quach_mien_nam", "nhat", "anh_am_ap"]
+                    if gender == "male"
+                    else ["ngoc_minh_nu_quang_cao", "an_nhien", "ha_mien_nam_ke_chuyen", "ngan_nguyen", "ngoc_nu_nhi_nhanh_tre_va_nang_luong"]
+                )
+                accessible_samples = db.query(VoiceSample).filter(
+                    (VoiceSample.user_id == job.user_id) | (VoiceSample.is_public == True)
+                ).all()
+                by_id_map = {s.id: s for s in accessible_samples if s.file_path and os.path.exists(s.file_path)}
+                chosen_vs = None
+                for pid in preferred_ids:
+                    if pid in by_id_map:
+                        chosen_vs = by_id_map[pid]
+                        break
+                if not chosen_vs and by_id_map:
+                    chosen_vs = next(iter(by_id_map.values()))
+
+                if chosen_vs:
+                    resolved_vs_id = chosen_vs.id
+                    resolved_ref_text = (chosen_vs.ref_text or "").strip() or None
+                    VideoDubbingService.log_to_job(
+                        job_id,
+                        f"[VOICE] Tự động khớp giới tính ({gender}) sang giọng Việt chuẩn bản xứ: '{chosen_vs.name or chosen_vs.id}' ({chosen_vs.id}) — loại bỏ hoàn toàn giọng Tây lơ lớ."
+                    )
+                else:
+                    resolved_instruct = (
+                        "male, adult, northern Vietnamese accent, clear warm professional narration"
+                        if gender == "male"
+                        else "female, adult, clear Vietnamese accent, warm natural narration"
+                    )
+                    VideoDubbingService.log_to_job(
+                        job_id,
+                        f"[VOICE] Tự động dùng thiết kế giọng Việt bản ngữ ({gender}): '{resolved_instruct}'."
+                    )
+            elif resolved_vs_id is None:
+                resolved_ref_audio = job.vocals_audio_path
+                resolved_speed = 0.92
+                resolved_guidance = 2.4
+                VideoDubbingService.log_to_job(job_id, "[VOICE] Sử dụng chế độ Clone giọng diễn giả gốc từ video (vocals.wav).")
+
             VideoDubbingService.log_to_job(
                 job_id,
-                f"[KAGGLE] Tạo sub-job dub_segments 'dub_{job_id}' ({len(enriched_segments)} phân đoạn, lang={ov_lang}, normalize_vi={should_norm_vi})..."
+                f"[KAGGLE] Tạo sub-job dub_segments 'dub_{job_id}' ({len(enriched_segments)} phân đoạn, lang={ov_lang}, voice_sample={resolved_vs_id or 'none'})..."
             )
 
             # Check if sub-job already exists to prevent UNIQUE constraint error
             existing_tts = db.query(TTSJob).filter(TTSJob.id == f"dub_{job_id}").first()
             if existing_tts:
                 existing_tts.text = dub_payload_json
-                existing_tts.ref_audio_path = job.vocals_audio_path
+                existing_tts.voice_sample_id = resolved_vs_id
+                existing_tts.ref_audio_path = resolved_ref_audio
+                existing_tts.ref_text = resolved_ref_text
+                existing_tts.instruct = resolved_instruct
                 existing_tts.language = ov_lang
                 existing_tts.normalize_text = should_norm_vi
-                existing_tts.speed = 0.92
-                existing_tts.guidance_scale = 2.5
+                existing_tts.speed = resolved_speed
+                existing_tts.guidance_scale = resolved_guidance
                 existing_tts.postprocess_output = False
                 existing_tts.worker_id = None
                 existing_tts.error_message = None
@@ -1691,12 +1796,14 @@ def run_finalization_pipeline(job_id: str):
                     user_id=job.user_id,
                     job_type="dub_segments",
                     text=dub_payload_json,
-                    voice_sample_id=None,
-                    ref_audio_path=job.vocals_audio_path,
+                    voice_sample_id=resolved_vs_id,
+                    ref_audio_path=resolved_ref_audio,
+                    ref_text=resolved_ref_text,
+                    instruct=resolved_instruct,
                     language=ov_lang,
                     normalize_text=should_norm_vi,
-                    speed=0.92,
-                    guidance_scale=2.5,
+                    speed=resolved_speed,
+                    guidance_scale=resolved_guidance,
                     postprocess_output=False,
                     status="queued",
                     progress=0,

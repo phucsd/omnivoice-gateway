@@ -1109,3 +1109,23 @@ def test_cohesive_asr_clause_segmentation_orphan_reattachment_and_nonblocking_wo
     )
     assert vi_norm[0]["text"] == "Mỗi mũi khoan được đóng gói vô trùng, mã màu để dễ nhận biết."
 
+
+def test_detect_speaker_gender_male_vs_female(tmp_path):
+    import numpy as np
+    import soundfile as sf
+    from app.services.video_dubbing_service import VideoDubbingService
+
+    sr = 24000
+    t = np.linspace(0, 2.5, int(sr * 2.5), endpoint=False, dtype=np.float32)
+
+    male_wave = 0.45 * np.sin(2 * np.pi * 118.0 * t) + 0.22 * np.sin(2 * np.pi * 236.0 * t)
+    male_path = str(tmp_path / "male_vocals.wav")
+    sf.write(male_path, male_wave, sr)
+    assert VideoDubbingService.detect_speaker_gender(male_path) == "male"
+
+    female_wave = 0.45 * np.sin(2 * np.pi * 215.0 * t) + 0.22 * np.sin(2 * np.pi * 430.0 * t)
+    female_path = str(tmp_path / "female_vocals.wav")
+    sf.write(female_path, female_wave, sr)
+    assert VideoDubbingService.detect_speaker_gender(female_path) == "female"
+
+

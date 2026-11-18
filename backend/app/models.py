@@ -180,6 +180,8 @@ class VideoDubbingJob(Base):
     preferred_quality = Column(String(20), default="1080p", nullable=True)
     target_language = Column(String(50), nullable=False)
     llm_profile_id = Column(String(50), nullable=True)
+    voice_mode = Column(String(30), default="auto_native", nullable=True)  # "auto_native" | "voice_sample" | "clone_original"
+    voice_sample_id = Column(String(100), nullable=True)
     
     input_file_path = Column(String(255), nullable=True)
     original_audio_path = Column(String(255), nullable=True)

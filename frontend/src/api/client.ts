@@ -685,6 +685,13 @@ export const api = {
     return request<VoiceSampleResponse[]>(`/v1/voice-samples${params}`);
   },
 
+  getVoiceSampleAudioUrl: (voiceSampleId: string): string => {
+    const token = localStorage.getItem("VITE_JWT_TOKEN");
+    const baseUrl = getApiBaseUrl();
+    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+    return `${baseUrl}/v1/voice-samples/${encodeURIComponent(voiceSampleId)}/audio${qs}`;
+  },
+
   saveFavoriteVoice: async (payload: { job_id?: string; preview_id?: string; name: string; is_public: boolean; ref_text: string; custom_id?: string; tags?: string[] }): Promise<VoiceSampleUploadResponse> => {
     return request<VoiceSampleUploadResponse>("/v1/voice-samples/save-favorite", {
       method: "POST",
@@ -717,7 +724,14 @@ export const api = {
     targetLanguage?: string,
     uploadedJobId?: string,
     llmProfileId?: string,
-    extra?: { preferredQuality?: string; videoTitle?: string; videoThumbnail?: string; videoDuration?: number }
+    extra?: {
+      preferredQuality?: string;
+      videoTitle?: string;
+      videoThumbnail?: string;
+      videoDuration?: number;
+      voiceMode?: string;
+      voiceSampleId?: string;
+    }
   ): Promise<VideoDubbingJobResponse> => {
     const formData = new FormData();
     if (file) formData.append("file", file);
@@ -728,6 +742,8 @@ export const api = {
     if (extra?.videoTitle) formData.append("video_title", extra.videoTitle);
     if (extra?.videoThumbnail) formData.append("video_thumbnail", extra.videoThumbnail);
     if (extra?.videoDuration !== undefined) formData.append("video_duration", String(extra.videoDuration));
+    if (extra?.voiceMode) formData.append("voice_mode", extra.voiceMode);
+    if (extra?.voiceSampleId) formData.append("voice_sample_id", extra.voiceSampleId);
     formData.append("target_language", targetLanguage || "Vietnamese");
     
     const savedOauth = localStorage.getItem("youtube_oauth_token");
@@ -1087,10 +1103,18 @@ export const api = {
     });
   },
 
-  finalizeDubbingJob: async (jobId: string, vocalsVolume?: number, bgmVolume?: number): Promise<{ status: string; message: string }> => {
+  finalizeDubbingJob: async (
+    jobId: string,
+    vocalsVolume?: number,
+    bgmVolume?: number,
+    voiceMode?: string,
+    voiceSampleId?: string
+  ): Promise<{ status: string; message: string }> => {
     const formData = new FormData();
     if (vocalsVolume !== undefined) formData.append("vocals_volume", String(vocalsVolume));
     if (bgmVolume !== undefined) formData.append("bgm_volume", String(bgmVolume));
+    if (voiceMode) formData.append("voice_mode", voiceMode);
+    if (voiceSampleId !== undefined) formData.append("voice_sample_id", voiceSampleId);
     return request<{ status: string; message: string }>(`/v1/video-dubbing/jobs/${jobId}/finalize`, {
       method: "POST",
       body: formData,
@@ -1263,6 +1287,8 @@ export interface VideoDubbingJobResponse {
   preferred_quality?: string | null;
   has_source_video?: boolean;
   target_language: string;
+  voice_mode?: string | null;
+  voice_sample_id?: string | null;
   llm_profile_id?: string | null;
   original_subtitles: SubtitleSegment[] | null;
   translated_subtitles: SubtitleSegment[] | null;

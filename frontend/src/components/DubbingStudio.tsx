@@ -39,7 +39,7 @@ import {
   AlertTriangle,
   Edit3
 } from "lucide-react";
-import { api, getErrorMessage, type VideoDubbingJobResponse, type SubtitleSegment, type LLMProfilePublic, type YouTubeVideoInfo } from "../api/client";
+import { api, getErrorMessage, type VideoDubbingJobResponse, type SubtitleSegment, type LLMProfilePublic, type YouTubeVideoInfo, type VoiceSampleResponse } from "../api/client";
 import { PageHeader } from "./ui/PageHeader";
 import { SectionCard } from "./ui/SectionCard";
 
@@ -164,6 +164,13 @@ export default function DubbingStudio({
   const [llmProfiles, setLlmProfiles] = useState<LLMProfilePublic[]>([]);
   const [selectedLlmProfileId, setSelectedLlmProfileId] = useState<string>("");
 
+  // Native Vietnamese Voice Selection state (prevents cross-lingual foreign accent)
+  const [voiceSamples, setVoiceSamples] = useState<VoiceSampleResponse[]>([]);
+  const [voiceMode, setVoiceMode] = useState<"auto_native" | "voice_sample" | "clone_original">("auto_native");
+  const [selectedVoiceSampleId, setSelectedVoiceSampleId] = useState<string>("");
+  const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(null);
+  const voicePreviewAudioRef = useRef<HTMLAudioElement | null>(null);
+
   // Subtitle editor state
   const [originalSubs, setOriginalSubs] = useState<SubtitleSegment[]>([]);
   const [translatedSubs, setTranslatedSubs] = useState<SubtitleSegment[]>([]);
@@ -247,6 +254,12 @@ export default function DubbingStudio({
     if (data.preferred_quality) setRetryQuality(data.preferred_quality);
     if (typeof data.vocals_volume === "number") setVocalsVolume(Math.min(1, Math.max(0, data.vocals_volume)));
     if (typeof data.bgm_volume === "number") setBgmVolume(Math.min(1, Math.max(0, data.bgm_volume)));
+    if (data.voice_mode === "auto_native" || data.voice_mode === "voice_sample" || data.voice_mode === "clone_original") {
+      setVoiceMode(data.voice_mode);
+    } else {
+      setVoiceMode("auto_native");
+    }
+    setSelectedVoiceSampleId(data.voice_sample_id || "");
     setOriginalSubs(Array.isArray(data.original_subtitles) ? data.original_subtitles : []);
     setTranslatedSubs(Array.isArray(data.translated_subtitles) ? data.translated_subtitles : []);
   }, []);
@@ -363,6 +376,60 @@ export default function DubbingStudio({
     }
   }, []);
 
+  const fetchVoiceSamples = useCallback(async () => {
+    try {
+      const samples = await api.listVoiceSamples();
+      setVoiceSamples(Array.isArray(samples) ? samples : []);
+    } catch (err: unknown) {
+      console.debug("Voice samples unavailable:", err);
+    }
+  }, []);
+
+  const toggleVoicePreview = useCallback((sampleId: string) => {
+    if (!sampleId) return;
+    if (previewingVoiceId === sampleId && voicePreviewAudioRef.current) {
+      voicePreviewAudioRef.current.pause();
+      voicePreviewAudioRef.current = null;
+      setPreviewingVoiceId(null);
+      return;
+    }
+    if (voicePreviewAudioRef.current) {
+      voicePreviewAudioRef.current.pause();
+      voicePreviewAudioRef.current = null;
+    }
+    const audio = new Audio(api.getVoiceSampleAudioUrl(sampleId));
+    voicePreviewAudioRef.current = audio;
+    setPreviewingVoiceId(sampleId);
+    audio.onended = () => {
+      setPreviewingVoiceId(prev => (prev === sampleId ? null : prev));
+    };
+    audio.onerror = () => {
+      setPreviewingVoiceId(prev => (prev === sampleId ? null : prev));
+    };
+    void audio.play().catch(() => {
+      setPreviewingVoiceId(null);
+    });
+  }, [previewingVoiceId]);
+
+  const handleVoiceSelectChange = useCallback((rawVal: string) => {
+    if (voicePreviewAudioRef.current) {
+      voicePreviewAudioRef.current.pause();
+      voicePreviewAudioRef.current = null;
+      setPreviewingVoiceId(null);
+    }
+    if (rawVal === "clone_original") {
+      setVoiceMode("clone_original");
+      setSelectedVoiceSampleId("");
+    } else if (rawVal.startsWith("sample:")) {
+      const id = rawVal.slice("sample:".length);
+      setVoiceMode("voice_sample");
+      setSelectedVoiceSampleId(id);
+    } else {
+      setVoiceMode("auto_native");
+      setSelectedVoiceSampleId("");
+    }
+  }, []);
+
   const fetchSystemLlmSettings = useCallback(async () => {
     try {
       const settings = await api.adminGetSystemSettings();
@@ -440,6 +507,7 @@ export default function DubbingStudio({
     void Promise.resolve().then(() => {
       if (cancelled) return;
       void fetchLlmProfiles();
+      void fetchVoiceSamples();
       void fetchAllJobs(false);
 
       const initialJobId = localStorage.getItem("active_dubbing_job_id");
@@ -478,6 +546,10 @@ export default function DubbingStudio({
       cancelled = true;
       if (pollTimerRef.current) clearInterval(pollTimerRef.current);
       if (ytPreDownloadPollRef.current) clearInterval(ytPreDownloadPollRef.current);
+      if (voicePreviewAudioRef.current) {
+        voicePreviewAudioRef.current.pause();
+        voicePreviewAudioRef.current = null;
+      }
       clearInterval(allJobsInterval);
     };
   }, [
@@ -486,6 +558,7 @@ export default function DubbingStudio({
     fetchCookieStatus,
     fetchJobDetails,
     fetchLlmProfiles,
+    fetchVoiceSamples,
     fetchOAuthStatus,
     fetchProxyPool,
     fetchSystemLlmSettings,
@@ -956,6 +1029,8 @@ export default function DubbingStudio({
           videoTitle: uploadedJobId ? undefined : ytInfo?.title,
           videoThumbnail: uploadedJobId ? undefined : (ytInfo?.thumbnail_url || undefined),
           videoDuration: uploadedJobId ? undefined : (ytInfo?.duration ?? undefined),
+          voiceMode,
+          voiceSampleId: voiceMode === "voice_sample" && selectedVoiceSampleId ? selectedVoiceSampleId : undefined,
         }
       );
 
@@ -1015,9 +1090,15 @@ export default function DubbingStudio({
     setLoading(true);
     try {
       await api.updateDubbingSubtitles(jobId, originalSubs, translatedSubs);
-      await api.finalizeDubbingJob(jobId, vocalsVolume, bgmVolume);
+      await api.finalizeDubbingJob(
+        jobId,
+        vocalsVolume,
+        bgmVolume,
+        voiceMode,
+        voiceMode === "voice_sample" ? selectedVoiceSampleId : ""
+      );
       const data = await api.getDubbingJob(jobId);
-      setJob(data);
+      applyJobState(data);
     } catch (err: unknown) {
       setError(getErrorMessage(err, "Lỗi hoàn tất lồng tiếng."));
     } finally {
@@ -1092,6 +1173,98 @@ export default function DubbingStudio({
       videoPlayerRef.current.currentTime = start;
       videoPlayerRef.current.play();
     }
+  };
+
+  const renderVoiceSelector = (compact = false) => {
+    const selectValue =
+      voiceMode === "clone_original"
+        ? "clone_original"
+        : voiceMode === "voice_sample" && selectedVoiceSampleId
+          ? `sample:${selectedVoiceSampleId}`
+          : "auto_native";
+
+    const previewTargetId =
+      voiceMode === "voice_sample" && selectedVoiceSampleId
+        ? selectedVoiceSampleId
+        : voiceMode === "auto_native" && voiceSamples.length > 0
+          ? (voiceSamples.find(v => v.id === "tuan_anh")?.id || voiceSamples[0].id)
+          : "";
+
+    return (
+      <div className={`flex flex-col gap-2 ${compact ? "p-3" : "p-3.5"} bg-secondary/30 rounded-xl border border-border`}>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            <Mic className="w-3.5 h-3.5 text-primary" />
+            <span className="text-xs font-bold text-foreground">Giọng Đọc Lồng Tiếng</span>
+            {voiceMode !== "clone_original" ? (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-bold">
+                Chuẩn Bản Ngữ
+              </span>
+            ) : (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 font-bold">
+                Clone Ngoại Quốc
+              </span>
+            )}
+          </div>
+          {previewTargetId && (
+            <button
+              type="button"
+              onClick={() => toggleVoicePreview(previewTargetId)}
+              className={`px-2.5 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-colors cursor-pointer border ${
+                previewingVoiceId === previewTargetId
+                  ? "bg-primary text-primary-foreground border-primary"
+                  : "bg-background hover:bg-secondary text-foreground border-border"
+              }`}
+              title="Nghe thử mẫu giọng đọc"
+            >
+              {previewingVoiceId === previewTargetId ? (
+                <>
+                  <VolumeX className="w-3 h-3" />
+                  <span>Dừng nghe</span>
+                </>
+              ) : (
+                <>
+                  <Play className="w-3 h-3" />
+                  <span>Nghe mẫu</span>
+                </>
+              )}
+            </button>
+          )}
+        </div>
+
+        <select
+          value={selectValue}
+          onChange={(e) => handleVoiceSelectChange(e.target.value)}
+          className="w-full px-3 py-2 text-xs bg-background border border-border rounded-xl text-foreground font-medium focus:outline-none focus:ring-2 focus:ring-primary/30 cursor-pointer"
+        >
+          <option value="auto_native">
+            ✨ Tự động Giọng Việt Bản Ngữ (Khớp Nam/Nữ — Không bị lơ lớ)
+          </option>
+          {voiceSamples.length > 0 && (
+            <optgroup label="Kho Giọng Studio Bản Ngữ">
+              {voiceSamples.map((s) => (
+                <option key={s.id} value={`sample:${s.id}`}>
+                  🎙️ {s.name || s.id}{s.duration ? ` (${s.duration.toFixed(1)}s)` : ""}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          <optgroup label="Clone Giọng Gốc Video">
+            <option value="clone_original">
+              🌍 Clone Giọng Gốc Diễn Giả (Giữ màu giọng ngoại quốc — dễ lơ lớ)
+            </option>
+          </optgroup>
+        </select>
+
+        <span className="text-[10px] text-muted-foreground leading-relaxed">
+          {voiceMode === "clone_original"
+            ? "Lưu ý: Clone trực tiếp từ diễn giả tiếng Anh/ngoại quốc sẽ kéo theo ngữ điệu ngoại quốc khiến câu tiếng Việt hơi lơ lớ."
+            : voiceMode === "voice_sample"
+              ? "Sử dụng trực tiếp mẫu giọng Studio đã chọn để đọc tiếng Việt tròn vành rõ chữ 100%."
+              : "Tự động phân tích cao độ giọng gốc (Nam/Nữ) và chọn giọng Studio tiếng Việt tương ứng, loại bỏ hoàn toàn giọng Tây lơ lớ."}
+        </span>
+      </div>
+    );
   };
 
   const updateSubText = (id: number, text: string) => {
@@ -2634,6 +2807,9 @@ export default function DubbingStudio({
                   )}
                 </div>
 
+                {/* Native Vietnamese Voice Selector */}
+                {renderVoiceSelector(false)}
+
                 {/* Smart separation toggle */}
                 <div className="flex items-center gap-3 p-3.5 bg-secondary/30 rounded-xl border border-border">
                   <input
@@ -3046,6 +3222,8 @@ export default function DubbingStudio({
                   Giọng nói và nhạc nền đã được cách ly thành 2 track độc lập. Bạn có thể bấm <strong>Solo</strong> để thẩm âm từng track hoặc kéo thanh trượt để tinh chỉnh tỷ lệ hòa trộn trước khi hoàn tất lồng tiếng.
                 </p>
               </div>
+
+              {renderVoiceSelector(true)}
 
               <button
                 onClick={handleFinalize}

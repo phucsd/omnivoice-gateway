@@ -2632,6 +2632,61 @@ class VideoDubbingService:
         return final_subs
 
     @staticmethod
+    def detect_speaker_gender(vocals_path: Optional[str]) -> str:
+        """
+        Estimates dominant speaker gender ('male' or 'female') from separated vocals using
+        autocorrelation fundamental frequency (F0) analysis on active voiced frames (75-320 Hz).
+        """
+        if not vocals_path or not os.path.exists(vocals_path):
+            return "male"
+        try:
+            import soundfile as sf
+            data, sr = sf.read(vocals_path, dtype="float32")
+            mono = np.mean(data, axis=1) if data.ndim > 1 else data
+            # Analyze up to first 60s for speed
+            mono = mono[: min(len(mono), int(60 * sr))]
+            if len(mono) < int(0.5 * sr):
+                return "male"
+
+            frame_len = int(0.04 * sr)  # 40ms frame
+            hop_len = int(0.02 * sr)    # 20ms hop
+            min_lag = max(1, int(sr / 320.0))  # 320 Hz max F0
+            max_lag = max(min_lag + 2, int(sr / 75.0))  # 75 Hz min F0
+
+            f0_estimates = []
+            for start in range(0, len(mono) - frame_len, hop_len):
+                frame = mono[start : start + frame_len]
+                rms = float(np.sqrt(np.mean(np.square(frame))))
+                if rms < 0.018:
+                    continue
+                # Zero-crossing rate check: skip unvoiced fricatives ('s', 'sh', 'f')
+                zcr = float(np.mean(np.abs(np.diff(np.signbit(frame)))))
+                if zcr > 0.22:
+                    continue
+                win_frame = (frame - np.mean(frame)) * np.hanning(len(frame))
+                energy0 = float(np.dot(win_frame, win_frame))
+                if energy0 <= 1e-8:
+                    continue
+                corr = np.correlate(win_frame, win_frame, mode="full")[len(win_frame) - 1 :]
+                if len(corr) <= max_lag:
+                    continue
+                search = corr[min_lag:max_lag]
+                best_rel = int(np.argmax(search))
+                peak_norm = float(search[best_rel]) / energy0
+                if peak_norm >= 0.42:
+                    f0_estimates.append(float(sr) / float(min_lag + best_rel))
+                    if len(f0_estimates) >= 180:
+                        break
+
+            if not f0_estimates:
+                return "male"
+            median_f0 = float(np.median(f0_estimates))
+            return "female" if median_f0 >= 165.0 else "male"
+        except Exception as e:
+            print(f"[VideoDubbingService] Speaker gender detection fallback to male: {e}")
+            return "male"
+
+    @staticmethod
     def normalize_translated_subtitles(
         translated: List[Dict[str, Any]],
         orig_segments: List[Dict[str, Any]],

@@ -256,6 +256,8 @@ class VideoDubbingJobResponse(BaseModel):
     has_source_video: bool = False
     target_language: str
     llm_profile_id: Optional[str] = None
+    voice_mode: Optional[str] = "auto_native"
+    voice_sample_id: Optional[str] = None
     original_subtitles: Optional[List[SubtitleSegment]] = None
     translated_subtitles: Optional[List[SubtitleSegment]] = None
     vocals_audio_path: Optional[str] = None

@@ -1191,66 +1191,110 @@ def main():
                     created_files = []
                     total_segs = max(1, len(segments))
                     
-                    # Pre-compute VoiceClonePrompt ONCE using a complete sentence with clean post-utterance pause,
-                    # natural vowel decay tail (+0.35s), digital silence padding, and exact verified ref_text (eliminates 'Oh.' boundary leak!)
+                    # Pre-compute VoiceClonePrompt ONCE:
+                    # - For saved VoiceSample (/voice-samples/* or <=22s): pads digital silence + auto-transcribes exact native ref_text via large-v3-turbo if empty!
+                    # - For full-video vocals.wav: selects cleanest sentence with post-utterance pause + exact orig_text!
                     voice_clone_prompt = None
                     clean_ref_clip_path = local_ref_path
-                    chosen_ref_text = job.get("ref_text")
-                    if local_ref_path and os.path.exists(local_ref_path):
+                    chosen_ref_text = (job.get("ref_text") or "").strip() or None
+                    job_lang = (job.get("language") or "").strip() or None
+                    job_instruct = (job.get("instruct") or "").strip() or None
+                    is_voice_sample_url = bool(ref_path and "/voice-samples/" in ref_path)
+                    sample_cache_key = (ref_path, job_lang or "", chosen_ref_text or "") if is_voice_sample_url else None
+                    if sample_cache_key and sample_cache_key in VOICE_PROMPT_CACHE:
+                        voice_clone_prompt = VOICE_PROMPT_CACHE[sample_cache_key]
+                        log(f"Reusing cached native VoiceClonePrompt for {{ref_path}}")
+
+                    if voice_clone_prompt is None and local_ref_path and os.path.exists(local_ref_path):
                         try:
                             full_vox, full_sr = sf.read(local_ref_path, dtype="float32")
                             mono_vox = np.mean(full_vox, axis=1) if full_vox.ndim > 1 else full_vox
                             total_vox_sec = len(mono_vox) / float(full_sr)
-                            best_score = -1.0
                             best_slice = None
                             best_orig_txt = None
-                            for c_idx, s_cand in enumerate(segments[:15]):
-                                if not isinstance(s_cand, dict):
-                                    continue
-                                cs = float(s_cand.get("start", 0.0) or 0.0)
-                                ce = float(s_cand.get("end", cs + 4.0) or (cs + 4.0))
-                                prev_ce = float(segments[c_idx - 1].get("end", 0.0)) if (c_idx > 0 and isinstance(segments[c_idx - 1], dict)) else 0.0
-                                nxt_cs = float(segments[c_idx + 1].get("start", total_vox_sec)) if (c_idx + 1 < len(segments) and isinstance(segments[c_idx + 1], dict)) else total_vox_sec
-                                gap_before = max(0.0, cs - prev_ce)
-                                gap_after = max(0.0, nxt_cs - ce)
-                                dur_c = ce - cs
-                                if 3.2 <= dur_c <= 9.0 and gap_after >= 0.25:
-                                    pre_ext = min(0.10, gap_before * 0.5)
-                                    post_ext = min(0.38, max(0.18, gap_after * 0.65))
-                                    i0 = max(0, int((cs - pre_ext) * full_sr))
-                                    i1 = min(len(mono_vox), int((ce + post_ext) * full_sr))
-                                    if i1 - i0 > int(2.8 * full_sr):
-                                        cand_raw = mono_vox[i0:i1].copy()
-                                        rms = float(np.sqrt(np.mean(np.square(cand_raw))))
-                                        orig_t = str(s_cand.get("orig_text") or "").strip()
-                                        # Strongly prefer segments with >=0.5s clean pause after sentence end AND verified orig_text
-                                        pause_bonus = 1.35 if gap_after >= 0.50 else 1.0
-                                        txt_bonus = 1.20 if (orig_t and orig_t.endswith((".", "!", "?"))) else 1.0
-                                        score = rms * pause_bonus * txt_bonus
-                                        if rms > 0.005 and score > best_score:
-                                            best_score = score
-                                            fade_in_n = min(len(cand_raw) // 8, int(0.025 * full_sr))
-                                            fade_out_n = min(len(cand_raw) // 8, int(0.045 * full_sr))
-                                            if fade_in_n > 1:
-                                                cand_raw[:fade_in_n] *= np.linspace(0.0, 1.0, fade_in_n, dtype=np.float32)
-                                            if fade_out_n > 1:
-                                                cand_raw[-fade_out_n:] *= np.linspace(1.0, 0.0, fade_out_n, dtype=np.float32)
-                                            peak_v = float(np.max(np.abs(cand_raw)))
-                                            if peak_v > 1e-4:
-                                                cand_raw = cand_raw * min(2.5, 0.88 / peak_v)
-                                            # Pad pure digital silence (120ms pre + 300ms post) so no trailing vowel ever leaks into generated speech!
-                                            pad_pre = np.zeros(int(0.12 * full_sr), dtype=np.float32)
-                                            pad_post = np.zeros(int(0.30 * full_sr), dtype=np.float32)
-                                            best_slice = np.concatenate([pad_pre, cand_raw, pad_post])
-                                            best_orig_txt = orig_t if orig_t else None
+
+                            if is_voice_sample_url or total_vox_sec <= 22.0:
+                                # Short curated VoiceSample (e.g. tuan_anh / bao_mien_nam_ro): use entire clip + digital silence padding!
+                                cand_raw = mono_vox[: min(len(mono_vox), int(12.0 * full_sr))].copy()
+                                fade_in_n = min(len(cand_raw) // 10, int(0.020 * full_sr))
+                                fade_out_n = min(len(cand_raw) // 10, int(0.040 * full_sr))
+                                if fade_in_n > 1:
+                                    cand_raw[:fade_in_n] *= np.linspace(0.0, 1.0, fade_in_n, dtype=np.float32)
+                                if fade_out_n > 1:
+                                    cand_raw[-fade_out_n:] *= np.linspace(1.0, 0.0, fade_out_n, dtype=np.float32)
+                                peak_v = float(np.max(np.abs(cand_raw)))
+                                if peak_v > 1e-4:
+                                    cand_raw = cand_raw * min(2.5, 0.88 / peak_v)
+                                pad_pre = np.zeros(int(0.10 * full_sr), dtype=np.float32)
+                                pad_post = np.zeros(int(0.30 * full_sr), dtype=np.float32)
+                                best_slice = np.concatenate([pad_pre, cand_raw, pad_post])
+
+                                # If VoiceSample in DB had empty ref_text, transcribe accurately with large-v3-turbo using job_lang ('vi')!
+                                if not chosen_ref_text:
+                                    try:
+                                        asr_m = get_asr_whisper_model()
+                                        r_segs, _ = asr_m.transcribe(
+                                            resample_to_16k(cand_raw, full_sr),
+                                            language=job_lang if job_lang in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None,
+                                            beam_size=5,
+                                            condition_on_previous_text=False,
+                                        )
+                                        tr_ref = " ".join(s.text.strip() for s in r_segs if s.text).strip()
+                                        if tr_ref:
+                                            if not tr_ref.endswith((".", "!", "?")):
+                                                tr_ref += "."
+                                            best_orig_txt = tr_ref
+                                            log(f"Transcribed native VoiceSample ref_text ({{job_lang}}): '{{tr_ref[:80]}}'")
+                                    except Exception as vs_tr_err:
+                                        log(f"Notice: VoiceSample ASR ref_text fallback: {{vs_tr_err}}")
+                            else:
+                                best_score = -1.0
+                                for c_idx, s_cand in enumerate(segments[:15]):
+                                    if not isinstance(s_cand, dict):
+                                        continue
+                                    cs = float(s_cand.get("start", 0.0) or 0.0)
+                                    ce = float(s_cand.get("end", cs + 4.0) or (cs + 4.0))
+                                    prev_ce = float(segments[c_idx - 1].get("end", 0.0)) if (c_idx > 0 and isinstance(segments[c_idx - 1], dict)) else 0.0
+                                    nxt_cs = float(segments[c_idx + 1].get("start", total_vox_sec)) if (c_idx + 1 < len(segments) and isinstance(segments[c_idx + 1], dict)) else total_vox_sec
+                                    gap_before = max(0.0, cs - prev_ce)
+                                    gap_after = max(0.0, nxt_cs - ce)
+                                    dur_c = ce - cs
+                                    if 3.2 <= dur_c <= 9.0 and gap_after >= 0.25:
+                                        pre_ext = min(0.10, gap_before * 0.5)
+                                        post_ext = min(0.38, max(0.18, gap_after * 0.65))
+                                        i0 = max(0, int((cs - pre_ext) * full_sr))
+                                        i1 = min(len(mono_vox), int((ce + post_ext) * full_sr))
+                                        if i1 - i0 > int(2.8 * full_sr):
+                                            cand_raw = mono_vox[i0:i1].copy()
+                                            rms = float(np.sqrt(np.mean(np.square(cand_raw))))
+                                            orig_t = str(s_cand.get("orig_text") or "").strip()
+                                            pause_bonus = 1.35 if gap_after >= 0.50 else 1.0
+                                            txt_bonus = 1.20 if (orig_t and orig_t.endswith((".", "!", "?"))) else 1.0
+                                            score = rms * pause_bonus * txt_bonus
+                                            if rms > 0.005 and score > best_score:
+                                                best_score = score
+                                                fade_in_n = min(len(cand_raw) // 8, int(0.025 * full_sr))
+                                                fade_out_n = min(len(cand_raw) // 8, int(0.045 * full_sr))
+                                                if fade_in_n > 1:
+                                                    cand_raw[:fade_in_n] *= np.linspace(0.0, 1.0, fade_in_n, dtype=np.float32)
+                                                if fade_out_n > 1:
+                                                    cand_raw[-fade_out_n:] *= np.linspace(1.0, 0.0, fade_out_n, dtype=np.float32)
+                                                peak_v = float(np.max(np.abs(cand_raw)))
+                                                if peak_v > 1e-4:
+                                                    cand_raw = cand_raw * min(2.5, 0.88 / peak_v)
+                                                pad_pre = np.zeros(int(0.12 * full_sr), dtype=np.float32)
+                                                pad_post = np.zeros(int(0.30 * full_sr), dtype=np.float32)
+                                                best_slice = np.concatenate([pad_pre, cand_raw, pad_post])
+                                                best_orig_txt = orig_t if orig_t else None
+
                             if best_slice is not None:
                                 clean_ref_clip_path = "clean_voice_ref.wav"
                                 sf.write(clean_ref_clip_path, best_slice, full_sr, format="WAV", subtype="PCM_16")
                                 if best_orig_txt:
                                     chosen_ref_text = best_orig_txt
-                                log(f"Extracted padded clean reference slice ({{len(best_slice)/full_sr:.2f}}s, ref_text={{bool(chosen_ref_text)}}) for VoiceClonePrompt.")
+                                log(f"Prepared clean reference clip ({{len(best_slice)/full_sr:.2f}}s, ref_text={{bool(chosen_ref_text)}}) for VoiceClonePrompt.")
                         except Exception as sl_err:
-                            log(f"Notice: speech slice extraction fallback to full vocals: {{sl_err}}")
+                            log(f"Notice: reference preparation fallback to raw audio: {{sl_err}}")
 
                         if hasattr(model, "create_voice_clone_prompt"):
                             try:
@@ -1259,6 +1303,10 @@ def main():
                                     ref_audio=clean_ref_clip_path,
                                     ref_text=chosen_ref_text,
                                 )
+                                if sample_cache_key is not None and voice_clone_prompt is not None:
+                                    if len(VOICE_PROMPT_CACHE) >= 32:
+                                        VOICE_PROMPT_CACHE.pop(next(iter(VOICE_PROMPT_CACHE)), None)
+                                    VOICE_PROMPT_CACHE[sample_cache_key] = voice_clone_prompt
                                 log("VoiceClonePrompt successfully pre-computed.")
                             except Exception as p_err:
                                 log(f"Notice: create_voice_clone_prompt fallback to raw audio: {{p_err}}")
@@ -1295,9 +1343,8 @@ def main():
                         return out
 
                     vi_diacritics = set("áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗợúùủũụưứừửữựýỳỷỹỵđ")
-                    job_lang = (job.get("language") or "").strip() or None
-                    base_speed = float(job.get("speed") or 0.92)
-                    base_guidance = float(job.get("guidance_scale") or 2.5)
+                    base_speed = float(job.get("speed") or 0.96)
+                    base_guidance = float(job.get("guidance_scale") or 2.0)
 
                     for idx, seg in enumerate(segments):
                         seg_id = seg.get("id", idx + 1) if isinstance(seg, dict) else (idx + 1)
@@ -1343,6 +1390,8 @@ def main():
                             gen_kwargs["ref_audio"] = local_ref_path
                             if chosen_ref_text:
                                 gen_kwargs["ref_text"] = chosen_ref_text
+                        elif job_instruct:
+                            gen_kwargs["instruct"] = job_instruct
 
                         def _run_omni_gen(kw):
                             try:

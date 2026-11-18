@@ -275,6 +275,8 @@ def migrate_database(db_url: str):
                 "video_thumbnail": "TEXT",
                 "video_duration": "FLOAT",
                 "preferred_quality": "VARCHAR(20) DEFAULT '1080p'",
+                "voice_mode": "VARCHAR(30) DEFAULT 'auto_native'",
+                "voice_sample_id": "VARCHAR(100)",
             }
             for col, col_type in vd_new_cols.items():
                 if col not in vd_columns:
