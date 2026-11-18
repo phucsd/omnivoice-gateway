@@ -105,6 +105,14 @@ def normalize_vietnamese_text(text: str) -> str:
 
     # Normalize unicode spaces
     s = text.replace("\u00a0", " ")
+
+    # Protect OmniVoice inline control / pronunciation tags (e.g. [laughter], [sigh], [B EY1 S])
+    protected_tags = []
+    def _stash_tag(m):
+        idx = len(protected_tags)
+        protected_tags.append(m.group(0))
+        return f"__OVTAG_{idx}__"
+    s = re.sub(r'\[[^\[\]\n]{1,64}\]', _stash_tag, s)
     
     # 1. Version numbers: v1.6, V1.6, ver 1.6 -> phiên bản một chấm sáu
     s = re.sub(r'\b(?:v|ver|phiên bản\s*v)\s*(\d+)\.(\d+)\b', r'phiên bản \1.\2', s, flags=re.IGNORECASE)
@@ -175,6 +183,10 @@ def normalize_vietnamese_text(text: str) -> str:
         except ValueError:
             return val_str
     s = re.sub(r'\b\d+\b', repl_lone_int, s)
+
+    # Restore protected OmniVoice inline control tags
+    for idx, tag_val in enumerate(protected_tags):
+        s = s.replace(f"__OVTAG_{idx}__", tag_val)
 
     # Collapse repeated whitespace
     s = re.sub(r'\s+', ' ', s).strip()

@@ -163,6 +163,13 @@ async def single_inference(
     db.add(db_job)
     db.commit()
     db.refresh(db_job)
+
+    if os.environ.get("APP_ENV") != "testing":
+        try:
+            from app.services.kaggle_orchestrator import KaggleOrchestrator
+            KaggleOrchestrator.ensure_worker_running(db)
+        except Exception:
+            pass
     
     if os.environ.get("APP_ENV") == "testing":
         from app.services.audio_service import AudioService
@@ -193,9 +200,9 @@ async def single_inference(
         JobService.complete_job_output(db, job_id, out_path, alignment=alignment_str)
         db.refresh(db_job)
     
-    # 4. Wait synchronously for completion (with 90s timeout)
+    # 4. Wait synchronously for completion (with 150s timeout to accommodate cold GPU VM allocation)
     start_time = time.time()
-    timeout = 90.0
+    timeout = 150.0
     while True:
         db.refresh(db_job)
         if db_job.status == "completed":
@@ -348,6 +355,11 @@ async def batch_inference(
         job_ids.append(job_id)
         
     db.commit()
+    try:
+        from app.services.kaggle_orchestrator import KaggleOrchestrator
+        KaggleOrchestrator.ensure_worker_running(db)
+    except Exception:
+        pass
     
     return {
         "batch_id": batch_id,

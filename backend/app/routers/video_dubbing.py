@@ -455,6 +455,18 @@ def run_dubbing_pipeline(job_id: str):
 
         VideoDubbingService.log_to_job(job_id, f"Khởi chạy pipeline lồng tiếng video. Trạng thái ban đầu: {job.status}")
 
+        # Stage 0: Proactively pre-warm Kaggle GPU worker in parallel while video downloads & FFmpeg extracts audio!
+        try:
+            early_mode_setting = db.query(SystemSetting).filter(SystemSetting.key == "worker_mode").first()
+            early_mode = early_mode_setting.value.strip() if early_mode_setting else settings.WORKER_MODE
+            if early_mode == "kaggle":
+                from app.services.kaggle_orchestrator import KaggleOrchestrator
+                if not KaggleOrchestrator.has_live_worker(db):
+                    VideoDubbingService.log_to_job(job_id, "[PRE-WARM] Khởi động sớm máy chủ GPU Kaggle chạy song song với quá trình tải video...")
+                    KaggleOrchestrator.prewarm_worker_async(user_id=job.user_id)
+        except Exception as pw_e:
+            print(f"[run_dubbing_pipeline] Pre-warm notice: {pw_e}")
+
         job_dir = os.path.join(settings.dubbing_dir, job_id)
         os.makedirs(job_dir, exist_ok=True)
         log_path = os.path.join(job_dir, "process.log")
@@ -607,6 +619,10 @@ def run_dubbing_pipeline(job_id: str):
                 )
                 db.add(parent_tts_job)
             db.commit()
+            try:
+                KaggleOrchestrator.ensure_worker_running(db)
+            except Exception:
+                pass
             VideoDubbingService.log_to_job(job_id, "[GPU WORKER] Đã đưa sub-job tách nhạc vào hàng đợi, chờ GPU Worker xử lý...")
             
     except Exception as e:
@@ -663,6 +679,11 @@ def trigger_transcription_stage(dub_job_id: str, db: Session):
         )
         db.add(asr_job)
     db.commit()
+    try:
+        from app.services.kaggle_orchestrator import KaggleOrchestrator
+        KaggleOrchestrator.ensure_worker_running(db)
+    except Exception:
+        pass
     VideoDubbingService.log_to_job(dub_job_id, "[KAGGLE] Đã đưa sub-job Whisper ASR vào hàng đợi, chờ GPU Worker xử lý...")
 
 def trigger_translation_stage(dub_job_id: str, text: str, alignment_str: str, db: Session):
@@ -1667,6 +1688,11 @@ def run_finalization_pipeline(job_id: str):
                 )
                 db.add(dub_tts_job)
             db.commit()
+            try:
+                from app.services.kaggle_orchestrator import KaggleOrchestrator
+                KaggleOrchestrator.ensure_worker_running(db)
+            except Exception:
+                pass
             VideoDubbingService.log_to_job(job_id, "[KAGGLE] Đã đưa sub-job dub_segments vào hàng đợi, chờ GPU Worker xử lý...")
             
     except Exception as e:

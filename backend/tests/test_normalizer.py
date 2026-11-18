@@ -55,3 +55,14 @@ def test_full_complex_sentence():
     assert "một nghìn sáu trăm người dùng" in normalized
     assert "một phẩy ba bốn năm sáu phần trăm" in normalized
     assert "một nghìn sáu trăm đồng" in normalized
+
+
+def test_preserves_omnivoice_inline_control_tags():
+    raw = "[laughter] Anh ấy chơi [B EY1 S] lúc 8h30 với giá 1.500đ [sigh]"
+    res = normalize_vietnamese_text(raw)
+    assert "[laughter]" in res
+    assert "[B EY1 S]" in res
+    assert "[sigh]" in res
+    assert "tám giờ ba mươi phút" in res
+    assert "một nghìn năm trăm đồng" in res
+

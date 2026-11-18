@@ -67,7 +67,7 @@ class KaggleNotebookBuilder:
     def generate_requirements(worker_dir: str) -> str:
         """Generates or updates the requirements.txt file."""
         req_path = os.path.join(worker_dir, "requirements.txt")
-        req_content = "omnivoice @ git+https://github.com/k2-fsa/OmniVoice.git\nsoundfile\nnumpy\nrequests\nfaster-whisper\ndemucs\nnum2words\n"
+        req_content = "omnivoice\nsoundfile\nnumpy\nrequests\nfaster-whisper\ndemucs\n"
         
         with open(req_path, "w", encoding="utf-8") as f:
             f.write(req_content)
@@ -117,11 +117,14 @@ class KaggleNotebookBuilder:
                         pass
             poll_interval = settings.WORKER_POLL_INTERVAL_SECONDS
             
-            # Optimized Daemon script template
+            # Optimized Turbo Daemon script template (v3.0 - Overlapped /dev/shm + Xet + uv)
             code = f"""import os
 import sys
+import io
+import glob
 import time
 import uuid
+import ctypes
 import tempfile
 import traceback
 import requests
@@ -131,102 +134,54 @@ import zipfile
 import json
 import subprocess
 import threading
+import importlib
+import importlib.util
+import importlib.metadata
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
+_BOOT_T0 = time.perf_counter()
+
 os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+os.environ["SAFETENSORS_FAST_GPU"] = "1"
+os.environ["USE_TF"] = "0"
+os.environ["USE_JAX"] = "0"
+os.environ["USE_FLAX"] = "0"
+os.environ["USE_TORCH"] = "1"
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["HF_HUB_DISABLE_XET"] = "0"
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["DISABLE_TELEMETRY"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "15"
-os.environ["HF_TOKEN"] = {repr(hf_token)}
-os.environ["HUGGING_FACE_HUB_TOKEN"] = {repr(hf_token)}
+if {repr(hf_token)}:
+    os.environ["HF_TOKEN"] = {repr(hf_token)}
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = {repr(hf_token)}
 warnings.filterwarnings("ignore")
 
-def ensure_dependencies():
-    \"\"\"Dynamically checks and installs required packages inside the Kaggle environment if missing or outdated.\"\"\"
-    missing = []
-    need_omnivoice_upgrade = False
-    try:
-        import omnivoice
-        from omnivoice.models.omnivoice import VoiceClonePrompt
-    except (ImportError, AttributeError):
-        need_omnivoice_upgrade = True
-
-    try:
-        import soundfile
-    except ImportError:
-        missing.append("soundfile")
-    try:
-        import num2words
-    except ImportError:
-        missing.append("num2words")
-    try:
-        import modelscope
-    except ImportError:
-        missing.append("modelscope")
-    try:
-        import sentencepiece
-    except ImportError:
-        missing.append("sentencepiece")
-    try:
-        import tiktoken
-    except ImportError:
-        missing.append("tiktoken")
-    try:
-        import faster_whisper
-    except ImportError:
-        missing.append("faster-whisper")
-    try:
-        import demucs
-    except ImportError:
-        missing.append("demucs")
-        
-    import subprocess
-    packages_to_install = []
-    if need_omnivoice_upgrade:
-        packages_to_install.append("git+https://github.com/k2-fsa/OmniVoice.git")
-    packages_to_install.extend(missing)
-
-    if packages_to_install:
-        print(f"Installing missing dependencies: {{', '.join(packages_to_install)}}", flush=True)
-        try:
-            # Install packages silently with fast flags
-            subprocess.check_call([
-                sys.executable, "-m", "pip", "install", "-q", 
-                "--no-cache-dir", "--prefer-binary", 
-                "--no-warn-script-location"
-            ] + packages_to_install)
-            print("Dependencies installed successfully.", flush=True)
-        except Exception as e:
-            if need_omnivoice_upgrade:
-                print(f"Notice: Batch install failed ({{e}}), falling back to omnivoice[tn]...", flush=True)
-                try:
-                    fallback_packages = ["omnivoice[tn]"] + missing
-                    subprocess.check_call([
-                        sys.executable, "-m", "pip", "install", "-q",
-                        "--no-cache-dir", "--prefer-binary",
-                        "--no-warn-script-location"
-                    ] + fallback_packages)
-                    print("Fallback dependencies installed successfully.", flush=True)
-                except Exception as fb_err:
-                    print(f"Failed to install fallback dependencies: {{fb_err}}", flush=True)
-                    sys.exit(1)
-            else:
-                print(f"Failed to install dependencies: {{e}}", flush=True)
-                sys.exit(1)
-
-# Ensure dependencies are available before anything else runs
-ensure_dependencies()
-
-import numpy as np
-import torch
-import soundfile as sf
-from omnivoice import OmniVoice
-
-{KaggleNotebookBuilder.get_normalizer_code()}
+# PEP-451 compliant PathFinder filter: skips probing unused heavy ML/CV packages during cold import
+try:
+    import importlib._bootstrap_external as _ibe
+    _orig_pf_find_spec = _ibe.PathFinder.find_spec
+    _SKIP_UNUSED_TOP = frozenset({{
+        "tensorflow", "tensorboard", "keras", "jax", "jaxlib", "flax",
+        "torchvision", "sklearn", "scikit_learn", "matplotlib", "pandas",
+        "cv2", "timm", "peft", "bitsandbytes", "optimum",
+    }})
+    @classmethod
+    def _fast_pf_find_spec(cls, fullname, path=None, target=None):
+        if fullname.split(".")[0] in _SKIP_UNUSED_TOP:
+            return None
+        return _orig_pf_find_spec(fullname, path, target)
+    _ibe.PathFinder.find_spec = _fast_pf_find_spec
+except Exception:
+    pass
 
 PUBLIC_API_BASE_URL = {repr(public_api_url)}.rstrip("/")
 WORKER_TOKEN = {repr(worker_token)}
@@ -236,18 +191,18 @@ POLL_INTERVAL = {poll_interval}
 
 HEADERS = {{
     "Authorization": f"Bearer {{WORKER_TOKEN}}",
-    "X-Worker-Version": "2.2.0"
+    "X-Worker-Version": "3.0.0"
 }}
 
 WORKER_STATE = {{
     "status": "starting",
     "current_job_id": None,
-    "message": "OmniVoice worker starting up...",
+    "message": "OmniVoice turbo worker booting...",
     "stop": False,
 }}
 
 def log(msg: str):
-    print(f"[{{time.strftime('%Y-%m-%d %H:%M:%S')}}] [Worker-{{WORKER_ID}}] {{msg}}", flush=True)
+    print(f"[{{time.strftime('%Y-%m-%d %H:%M:%S')}}] [+{{time.perf_counter()-_BOOT_T0:5.1f}}s] [Worker-{{WORKER_ID}}] {{msg}}", flush=True)
 
 def make_request(method: str, path: str, **kwargs) -> requests.Response:
     url = f"{{PUBLIC_API_BASE_URL}}{{path}}"
@@ -286,6 +241,211 @@ def start_heartbeat_daemon():
     t = threading.Thread(target=_hb_loop, daemon=True)
     t.start()
     return t
+
+def _select_fast_scratch_dir() -> str:
+    try:
+        if os.path.exists("/dev/shm"):
+            st = os.statvfs("/dev/shm")
+            if (st.f_bavail * st.f_frsize) / (1024 ** 3) >= 6.0:
+                return "/dev/shm"
+    except Exception:
+        pass
+    return tempfile.gettempdir()
+
+FAST_SCRATCH_DIR = _select_fast_scratch_dir()
+FAST_MODEL_DIR = os.path.join(FAST_SCRATCH_DIR, "omnivoice_fast_weights")
+FAST_PKGS_DIR = os.path.join(FAST_SCRATCH_DIR, "omnivoice_fast_pkgs")
+os.makedirs(FAST_PKGS_DIR, exist_ok=True)
+
+def _warm_filesystem_caches():
+    \"\"\"Triggers async Linux kernel readahead on CUDA/PyTorch .so libs and warms .dist-info inodes.\"\"\"
+    py_ver = f"python{{sys.version_info.major}}.{{sys.version_info.minor}}"
+    base = f"/usr/local/lib/{{py_ver}}/dist-packages"
+    if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_WILLNEED"):
+        for pat in (f"{{base}}/torch/lib/*.so*", f"{{base}}/torchaudio/lib/*.so*", f"{{base}}/nvidia/*/lib/*.so*"):
+            for p in glob.glob(pat):
+                try:
+                    fd = os.open(p, os.O_RDONLY)
+                    try:
+                        os.posix_fadvise(fd, 0, os.fstat(fd).st_size, os.POSIX_FADV_WILLNEED)
+                    finally:
+                        os.close(fd)
+                except Exception:
+                    pass
+    meta_files = glob.glob(f"{{base}}/*.dist-info/METADATA")
+    if meta_files:
+        def _read_meta(p):
+            try:
+                with open(p, "rb") as f:
+                    f.read(4096)
+            except Exception:
+                pass
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(_read_meta, meta_files, chunksize=32))
+
+def _pip_or_uv_install(packages):
+    if not packages:
+        return
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        subprocess.check_call([uv_bin, "pip", "install", "--system", "--no-compile", "--quiet"] + list(packages))
+    else:
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "-q",
+            "--no-cache-dir", "--no-compile", "--prefer-binary", "--no-warn-script-location"
+        ] + list(packages))
+
+def _prepare_core_packages():
+    \"\"\"Installs only minimal core requirements for OmniVoice in ~0.2-5s without blocking torch import.\"\"\"
+    need_tf_upgrade = False
+    try:
+        tf_ver = importlib.metadata.version("transformers")
+        major, minor = [int(x) for x in tf_ver.split(".")[:2]]
+        if (major, minor) < (5, 3):
+            need_tf_upgrade = True
+    except Exception:
+        need_tf_upgrade = True
+
+    ov_ready = importlib.util.find_spec("omnivoice") is not None
+
+    if not ov_ready:
+        try:
+            req = urllib.request.Request(
+                "https://codeload.github.com/k2-fsa/OmniVoice/zip/refs/heads/master",
+                headers={{"User-Agent": "OmniVoiceWorker/3.0"}}
+            )
+            raw = urllib.request.urlopen(req, timeout=20).read()
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                for member in zf.infolist():
+                    if member.filename.startswith("OmniVoice-master/omnivoice/") and not member.is_dir():
+                        rel = member.filename[len("OmniVoice-master/"):]
+                        dst = os.path.join(FAST_PKGS_DIR, rel)
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        with zf.open(member) as src, open(dst, "wb") as out:
+                            shutil.copyfileobj(src, out)
+            ov_ready = True
+        except Exception as zip_err:
+            log(f"Notice: Direct OmniVoice zip unpack fallback ({{zip_err}}), using uv/pip...")
+            _pip_or_uv_install(["omnivoice"])
+
+    extra_core = []
+    if need_tf_upgrade:
+        extra_core.append("transformers>=5.3.0")
+    try:
+        importlib.metadata.version("soundfile")
+    except Exception:
+        extra_core.append("soundfile")
+    if extra_core:
+        _pip_or_uv_install(extra_core)
+
+def _spawn_parallel_weights_download():
+    \"\"\"Spawns a separate OS process using native Rust hf_xet to download 3.12GB into /dev/shm with zero GIL contention.\"\"\"
+    dl_script = f\"\"\"
+import os
+os.environ["HF_HUB_DISABLE_XET"] = "0"
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+from huggingface_hub import snapshot_download
+snapshot_download(
+    "k2-fsa/OmniVoice",
+    local_dir={{repr(FAST_MODEL_DIR)}},
+    allow_patterns=[
+        "config.json",
+        "chat_template.jinja",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "model.safetensors",
+        "audio_tokenizer/config.json",
+        "audio_tokenizer/preprocessor_config.json",
+        "audio_tokenizer/model.safetensors",
+    ],
+    max_workers=16,
+)
+\"\"\"
+    return subprocess.Popen([sys.executable, "-c", dl_script])
+
+# Register early startup with Gateway & launch parallel warmup + download BEFORE heavy torch import!
+_EARLY_REGISTERED = False
+if PUBLIC_API_BASE_URL:
+    def _early_register():
+        global _EARLY_REGISTERED
+        try:
+            make_request(
+                "POST",
+                "/v1/internal/workers/register",
+                json={{"worker_id": WORKER_ID, "status": "starting", "message": "OmniVoice turbo worker booting..."}},
+                timeout=(10, 20),
+            )
+            _EARLY_REGISTERED = True
+        except Exception as reg_e:
+            log(f"Notice: early startup register deferred: {{reg_e}}")
+    threading.Thread(target=_early_register, daemon=True).start()
+    start_heartbeat_daemon()
+
+_warm_filesystem_caches()
+_WEIGHTS_DL_PROC = _spawn_parallel_weights_download()
+_CORE_PKG_POOL = ThreadPoolExecutor(max_workers=1)
+_CORE_PKG_FUT = _CORE_PKG_POOL.submit(_prepare_core_packages)
+
+# Import pre-installed PyTorch & initialize CUDA immediately while download & core pkgs finish in parallel!
+import numpy as np
+import torch
+if torch.cuda.is_available():
+    try:
+        torch.cuda.init()
+        _ = torch.empty(1, device="cuda:0")
+    except Exception:
+        pass
+
+def ensure_dependencies():
+    _CORE_PKG_FUT.result()
+    _CORE_PKG_POOL.shutdown(wait=False)
+    if FAST_PKGS_DIR not in sys.path:
+        sys.path.insert(0, FAST_PKGS_DIR)
+    importlib.invalidate_caches()
+
+ensure_dependencies()
+
+import soundfile as sf
+from omnivoice import OmniVoice
+
+{KaggleNotebookBuilder.get_normalizer_code()}
+
+_SECONDARY_TOOLS_LOCK = threading.Lock()
+_SECONDARY_TOOLS_INSTALLED = False
+
+def ensure_secondary_tools(need_whisper: bool = True, need_demucs: bool = False):
+    \"\"\"Thread-safely installs faster-whisper / demucs via uv (~2s) on-demand or in idle background.\"\"\"
+    global _SECONDARY_TOOLS_INSTALLED
+    with _SECONDARY_TOOLS_LOCK:
+        to_install = []
+        if need_whisper:
+            try:
+                import faster_whisper
+            except ImportError:
+                to_install.append("faster-whisper")
+        if need_demucs:
+            try:
+                import demucs
+            except ImportError:
+                to_install.append("demucs")
+        if to_install:
+            log(f"Installing secondary audio tools via uv: {{', '.join(to_install)}}")
+            _pip_or_uv_install(to_install)
+        if need_whisper and need_demucs:
+            _SECONDARY_TOOLS_INSTALLED = True
+
+def _preload_cuda_runtime_libs():
+    \"\"\"Exposes PyTorch's bundled cuBLAS/cuDNN shared libraries globally for CTranslate2 compatibility.\"\"\"
+    py_ver = f"python{{sys.version_info.major}}.{{sys.version_info.minor}}"
+    base = f"/usr/local/lib/{{py_ver}}/dist-packages/nvidia"
+    for pat in (f"{{base}}/cublas/lib/libcublas*.so*", f"{{base}}/cudnn/lib/libcudnn*.so*"):
+        for lib_path in sorted(glob.glob(pat)):
+            try:
+                ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+            except Exception:
+                pass
 
 WHISPER_MODEL = None
 ASR_WHISPER_MODEL = None
@@ -334,20 +494,29 @@ def resample_to_16k(audio_arr, orig_sr=24000):
     target_idx = np.linspace(0, orig_len, target_len, endpoint=False)
     return np.interp(target_idx, orig_idx, audio_arr).astype(np.float32)
 
+def _verify_whisper_instance(wm):
+    \"\"\"Runs a tiny 0.1s dummy audio pass to verify CTranslate2 cuBLAS runtime linkage before returning.\"\"\"
+    segs, _ = wm.transcribe(np.zeros(3200, dtype=np.float32), language="en", without_timestamps=True)
+    list(segs)
+    return wm
+
 def get_whisper_model():
     global WHISPER_MODEL
     if WHISPER_MODEL is None:
-        log("Loading Whisper model for word alignment...")
+        ensure_secondary_tools(need_whisper=True, need_demucs=False)
+        _preload_cuda_runtime_libs()
+        log("Loading Whisper model for word alignment / prompt transcription...")
         from faster_whisper import WhisperModel
         
         if torch.cuda.is_available():
             try:
                 log("Attempting to load WhisperModel ('small') on GPU (cuda)...")
-                WHISPER_MODEL = WhisperModel("small", device="cuda", compute_type="float16")
-                log("Whisper model ('small') loaded on GPU successfully.")
+                cand = WhisperModel("small", device="cuda", compute_type="float16")
+                WHISPER_MODEL = _verify_whisper_instance(cand)
+                log("Whisper model ('small') loaded & verified on GPU successfully.")
                 return WHISPER_MODEL
             except Exception as gpu_err:
-                log(f"Warning: Failed to load WhisperModel on GPU: {{gpu_err}}. Falling back to CPU...")
+                log(f"Warning: WhisperModel GPU runtime unavailable ({{gpu_err}}). Falling back to CPU int8...")
                 
         try:
             log("Attempting to load WhisperModel ('small') on CPU...")
@@ -362,16 +531,19 @@ def get_whisper_model():
 def get_asr_whisper_model():
     global ASR_WHISPER_MODEL
     if ASR_WHISPER_MODEL is None:
+        ensure_secondary_tools(need_whisper=True, need_demucs=False)
+        _preload_cuda_runtime_libs()
         from faster_whisper import WhisperModel
         if torch.cuda.is_available():
             for m_name in ("large-v3-turbo", "small"):
                 try:
                     log(f"Loading faster-whisper '{{m_name}}' on GPU for full-length ASR...")
-                    ASR_WHISPER_MODEL = WhisperModel(m_name, device="cuda", compute_type="float16")
-                    log(f"faster-whisper '{{m_name}}' loaded on GPU successfully.")
+                    cand = WhisperModel(m_name, device="cuda", compute_type="float16")
+                    ASR_WHISPER_MODEL = _verify_whisper_instance(cand)
+                    log(f"faster-whisper '{{m_name}}' loaded & verified on GPU successfully.")
                     return ASR_WHISPER_MODEL
                 except Exception as err:
-                    log(f"Warning: Could not load faster-whisper '{{m_name}}' on GPU: {{err}}")
+                    log(f"Warning: Could not run faster-whisper '{{m_name}}' on GPU: {{err}}")
         ASR_WHISPER_MODEL = get_whisper_model()
     return ASR_WHISPER_MODEL
 
@@ -550,8 +722,8 @@ def align_words(original_words, transcribed_words, audio_duration):
     return aligned
 
 def _copy_dataset_to_local_ssd(src_root: str) -> str:
-    \"\"\"Copies a mounted /kaggle/input model directory sequentially onto local SSD (/tmp) to avoid 20+ min gcsfuse mmap stalls.\"\"\"
-    dst_root = os.path.join(tempfile.gettempdir(), "omnivoice_local_weights")
+    \"\"\"Copies a mounted /kaggle/input model directory sequentially onto /dev/shm (RAM) or local SSD to avoid 20+ min gcsfuse mmap stalls.\"\"\"
+    dst_root = os.path.join(FAST_SCRATCH_DIR, "omnivoice_local_weights")
     if os.path.exists(dst_root):
         shutil.rmtree(dst_root, ignore_errors=True)
     os.makedirs(dst_root, exist_ok=True)
@@ -580,68 +752,124 @@ def _copy_dataset_to_local_ssd(src_root: str) -> str:
                 pass
     return dst_root
 
+def _attach_fast_asr_bridge(model):
+    \"\"\"
+    1. Binds faster-whisper onto model.transcribe so load_asr=False saves 1.62GB download & 1.6GB VRAM.
+    2. Wraps create_voice_clone_prompt in torch.inference_mode() (upstream PR #283 fix preventing autograd VRAM leak/OOM).
+    \"\"\"
+    orig_load_asr = model.load_asr_model
+    orig_transcribe = model.transcribe
+    orig_create_prompt = getattr(model, "create_voice_clone_prompt", None)
+    model._orig_load_asr_model = orig_load_asr
+    model._asr_pipe = True
+
+    def _fast_transcribe(audio):
+        try:
+            wm = get_whisper_model()
+            if isinstance(audio, str):
+                raw_wav, raw_sr = sf.read(audio, dtype="float32")
+                audio_16k = resample_to_16k(raw_wav, orig_sr=raw_sr)
+            else:
+                waveform, sr = audio
+                audio_16k = resample_to_16k(waveform, orig_sr=sr)
+            segs, _ = wm.transcribe(audio_16k, without_timestamps=True)
+            return " ".join(s.text.strip() for s in segs if s.text).strip()
+        except Exception as fw_err:
+            log(f"Notice: fast transcribe bridge fallback to HF ASR ({{fw_err}})")
+            if not callable(model._asr_pipe):
+                model._asr_pipe = None
+                orig_load_asr()
+            return orig_transcribe(audio)
+
+    model.transcribe = _fast_transcribe
+
+    if callable(orig_create_prompt):
+        def _inference_mode_create_prompt(*args, **kwargs):
+            with torch.inference_mode():
+                return orig_create_prompt(*args, **kwargs)
+        model.create_voice_clone_prompt = _inference_mode_create_prompt
+
+    return model
+
+VOICE_PROMPT_CACHE = {{}}
+
 def main():
     if not PUBLIC_API_BASE_URL:
         print("ERROR: PUBLIC_API_BASE_URL is not set. Exiting.", flush=True)
         sys.exit(1)
 
-    log(f"Starting Kaggle Worker Daemon. Gateway: {{PUBLIC_API_BASE_URL}}")
+    log(f"Starting Kaggle Turbo Worker Daemon (scratch={{FAST_SCRATCH_DIR}}). Gateway: {{PUBLIC_API_BASE_URL}}")
     
-    # 1. Register starting & launch background heartbeat thread so Gateway never times out during long tasks
-    try:
-        set_worker_state("starting", None, "OmniVoice worker starting up...")
-        make_request(
-            "POST", 
-            "/v1/internal/workers/register", 
-            json={{"worker_id": WORKER_ID, "status": "starting", "message": "OmniVoice worker starting up..."}}
-        )
-    except Exception as e:
-        print(f"Failed to register startup with gateway: {{e}}", flush=True)
-        sys.exit(1)
+    # 1. Ensure startup registration succeeded (if early async register hasn't completed yet)
+    if not _EARLY_REGISTERED:
+        try:
+            set_worker_state("starting", None, "OmniVoice turbo worker starting up...")
+            make_request(
+                "POST", 
+                "/v1/internal/workers/register", 
+                json={{"worker_id": WORKER_ID, "status": "starting", "message": "OmniVoice turbo worker starting up..."}}
+            )
+        except Exception as e:
+            print(f"Failed to register startup with gateway: {{e}}", flush=True)
+            sys.exit(1)
 
-    start_heartbeat_daemon()
-
-    # 2. Load OmniVoice onto local SSD -> GPU VRAM (~15s from HF Hub; avoids 22-min /kaggle/input gcsfuse mmap stall)
+    # 2. Load OmniVoice from /dev/shm RAM disk -> GPU VRAM (~2.5s load after overlapped Xet download!)
     log("Loading OmniVoice model into GPU VRAM...")
     try:
         set_worker_state("loading_model", None, "Loading OmniVoice weights into GPU VRAM...")
-        make_request(
-            "POST", 
-            "/v1/internal/workers/heartbeat", 
-            json={{"worker_id": WORKER_ID, "status": "loading_model", "message": "Loading OmniVoice weights into GPU VRAM..."}}
-        )
+        threading.Thread(
+            target=lambda: make_request(
+                "POST",
+                "/v1/internal/workers/heartbeat",
+                json={{"worker_id": WORKER_ID, "status": "loading_model", "message": "Loading OmniVoice weights into GPU VRAM..."}},
+                timeout=(8, 15),
+            ),
+            daemon=True,
+        ).start()
 
         model = None
         model_loaded = False
 
-        # 1. First priority: Hugging Face Hub directly onto container local SSD (~15s total on Kaggle 10Gbps link)
+        # 1. First priority: Overlapped Xet High-Perf download in /dev/shm RAM disk -> SAFETENSORS_FAST_GPU=1 (~2.5s load!)
         try:
             t_load0 = time.time()
-            log("Downloading & loading OmniVoice from Hugging Face Hub onto local SSD...")
-            model = OmniVoice.from_pretrained(
-                "k2-fsa/OmniVoice",
-                device_map="cuda:0",
-                dtype=torch.float16,
-                load_asr=True,
-            )
-            log(f"OmniVoice model loaded from Hugging Face Hub in {{time.time() - t_load0:.1f}}s.")
+            dl_rc = _WEIGHTS_DL_PROC.wait()
+            if dl_rc == 0 and os.path.exists(os.path.join(FAST_MODEL_DIR, "model.safetensors")):
+                log(f"Loading pre-fetched OmniVoice weights from {{FAST_MODEL_DIR}}...")
+                model = OmniVoice.from_pretrained(
+                    FAST_MODEL_DIR,
+                    device_map="cuda:0",
+                    dtype=torch.float16,
+                    load_asr=False,
+                    local_files_only=True,
+                )
+            else:
+                log(f"Subprocess prefetch exited {{dl_rc}}; downloading directly from Hugging Face Hub...")
+                model = OmniVoice.from_pretrained(
+                    "k2-fsa/OmniVoice",
+                    device_map="cuda:0",
+                    dtype=torch.float16,
+                    load_asr=False,
+                )
+            log(f"OmniVoice model loaded into GPU VRAM in {{time.time() - t_load0:.2f}}s.")
             model_loaded = True
         except Exception as hf_err:
             log(f"Warning: Hugging Face Hub load failed ({{hf_err}}). Trying ModelScope fallback...")
             model_loaded = False
 
-        # 2. Second priority: ModelScope fallback onto local SSD
+        # 2. Second priority: Lazy-installed ModelScope fallback onto FAST_SCRATCH_DIR
         if not model_loaded:
             try:
+                _pip_or_uv_install(["modelscope"])
                 from modelscope import snapshot_download
                 t_ms0 = time.time()
-                log("Downloading model weights via ModelScope onto local SSD...")
-                ms_dir = snapshot_download("k2-fsa/OmniVoice")
+                log("Downloading model weights via ModelScope...")
+                ms_dir = snapshot_download("k2-fsa/OmniVoice", cache_dir=FAST_SCRATCH_DIR)
                 model = OmniVoice.from_pretrained(
                     ms_dir,
                     device_map="cuda:0",
                     dtype=torch.float16,
-                    load_asr=True,
+                    load_asr=False,
                 )
                 log(f"OmniVoice model loaded via ModelScope in {{time.time() - t_ms0:.1f}}s.")
                 model_loaded = True
@@ -649,7 +877,7 @@ def main():
                 log(f"Warning: ModelScope fallback failed ({{ms_err}}). Checking mounted /kaggle/input...")
                 model_loaded = False
 
-        # 3. Third priority: Mounted Kaggle Dataset (MUST copy sequentially to /tmp local SSD first, NEVER mmap on /kaggle/input!)
+        # 3. Third priority: Mounted Kaggle Dataset copied sequentially to /dev/shm
         if not model_loaded and os.path.exists("/kaggle/input"):
             mounted_dir = None
             for root, dirs, files in os.walk("/kaggle/input"):
@@ -657,32 +885,25 @@ def main():
                     mounted_dir = root
                     break
             if mounted_dir:
-                log(f"Copying mounted weights from {{mounted_dir}} to local /tmp SSD...")
+                log(f"Copying mounted weights from {{mounted_dir}} to {{FAST_SCRATCH_DIR}}...")
                 local_ssd_dir = _copy_dataset_to_local_ssd(mounted_dir)
                 model = OmniVoice.from_pretrained(
                     local_ssd_dir,
                     device_map="cuda:0",
                     dtype=torch.float16,
-                    load_asr=True,
+                    load_asr=False,
                 )
-                log(f"OmniVoice model loaded from local SSD copy: {{local_ssd_dir}}.")
+                log(f"OmniVoice model loaded from local copy: {{local_ssd_dir}}.")
                 model_loaded = True
 
         if not model_loaded or model is None:
             raise RuntimeError("Could not load OmniVoice model from Hugging Face Hub, ModelScope, or local dataset.")
 
+        if hasattr(model, "llm") and hasattr(model.llm, "config"):
+            model.llm.config.use_cache = False
+        _attach_fast_asr_bridge(model)
+
         log("OmniVoice model ready in GPU memory.")
-
-        # Background preload faster-whisper so ASR & alignment run with zero cold-start delay
-        def preload_whisper():
-            try:
-                log("Background preloading faster-whisper model...")
-                get_whisper_model()
-                log("Background faster-whisper model preloaded successfully.")
-            except Exception as wp_err:
-                log(f"Notice: faster-whisper background preload deferred: {{wp_err}}")
-
-        threading.Thread(target=preload_whisper, daemon=True).start()
 
     except Exception as e:
         log(f"CRITICAL ERROR loading OmniVoice model: {{e}}")
@@ -697,7 +918,7 @@ def main():
             pass
         sys.exit(1)
 
-    # Register as Ready
+    # Register as Ready IMMEDIATELY before starting any secondary background tasks!
     set_worker_state("ready", None, "OmniVoice model ready for requests.")
     make_request(
         "POST", 
@@ -705,19 +926,39 @@ def main():
         json={{"worker_id": WORKER_ID, "status": "ready", "message": "OmniVoice model ready for requests."}}
     )
 
+    # Background install & preload secondary tools ONLY when worker is NOT busy with an active synthesis job!
+    def preload_secondary_when_idle():
+        try:
+            time.sleep(0.5)
+            ensure_secondary_tools(need_whisper=True, need_demucs=True)
+            while WORKER_STATE.get("status") == "busy" and not WORKER_STATE.get("stop"):
+                time.sleep(0.5)
+            if not WORKER_STATE.get("stop"):
+                log("Background preloading faster-whisper model during idle window...")
+                get_whisper_model()
+                log("Background faster-whisper model preloaded successfully.")
+        except Exception as wp_err:
+            log(f"Notice: secondary tools background preload deferred: {{wp_err}}")
+
+    threading.Thread(target=preload_secondary_when_idle, daemon=True).start()
+
     idle_seconds = 0
+    first_poll = True
+    cuda_warmed = False
     log("Entering job polling loop...")
     
     while True:
         try:
             set_worker_state("idle", None, f"Worker polling. Idle time: {{idle_seconds}}s")
-            make_request(
-                "POST",
-                "/v1/internal/workers/heartbeat",
-                json={{"worker_id": WORKER_ID, "status": "idle", "message": f"Worker polling. Idle time: {{idle_seconds}}s"}}
-            )
+            if not first_poll and idle_seconds % 15 == 0:
+                make_request(
+                    "POST",
+                    "/v1/internal/workers/heartbeat",
+                    json={{"worker_id": WORKER_ID, "status": "idle", "message": f"Worker polling. Idle time: {{idle_seconds}}s"}}
+                )
+            first_poll = False
 
-            # Poll for job
+            # Poll for job immediately
             response = make_request("GET", f"/v1/internal/jobs/next?worker_id={{WORKER_ID}}")
             if response.status_code == 401:
                 log("Unauthorized (401). Worker token invalid. Exiting.")
@@ -733,6 +974,17 @@ def main():
             job = data.get("job")
 
             if not job:
+                if not cuda_warmed:
+                    cuda_warmed = True
+                    try:
+                        log("Running 1-step idle CUDA micro-warmup for instant first-token synthesis...")
+                        _ = model.generate(text="Alo.", num_step=1, postprocess_output=False)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        log("Idle CUDA micro-warmup completed.")
+                    except Exception:
+                        pass
+                    continue
                 time.sleep(POLL_INTERVAL)
                 idle_seconds += POLL_INTERVAL
                 if idle_seconds >= IDLE_TIMEOUT:
@@ -747,6 +999,7 @@ def main():
                 continue
 
             # Reset idle counter on job receipt
+            cuda_warmed = True
             idle_seconds = 0
             job_id = job["job_id"]
             job_type = job["job_type"]
@@ -770,19 +1023,28 @@ def main():
             # Process job based on type
             try:
                 local_ref_path = None
+                cached_voice_prompt = None
                 ref_audio_url = job.get("ref_audio_url")
-                
-                if job_type in ["clone_voice", "asr", "separate_audio", "dub_segments"] and ref_audio_url:
+                parsed_ref = urlparse(ref_audio_url) if ref_audio_url else None
+                ref_path = ""
+                if parsed_ref:
+                    ref_path = parsed_ref.path + (f"?{{parsed_ref.query}}" if parsed_ref.query else "")
+
+                # Reuse cached VoiceClonePrompt (OmniVoice 0.2.1+) for saved voice samples — skips HTTP download & tokenizer encode!
+                prompt_cache_key = None
+                if job_type == "clone_voice" and ref_path and "/voice-samples/" in ref_path and job.get("preprocess_prompt", True) is not False:
+                    prompt_cache_key = (ref_path, job.get("ref_text") or "")
+                    cached_voice_prompt = VOICE_PROMPT_CACHE.get(prompt_cache_key)
+                    if cached_voice_prompt is not None:
+                        log(f"Reusing cached VoiceClonePrompt for {{ref_path}} (zero download/encode latency)")
+
+                if job_type in ["clone_voice", "asr", "separate_audio", "dub_segments"] and ref_audio_url and cached_voice_prompt is None:
                     make_request(
                         "POST",
                         f"/v1/internal/jobs/{{job_id}}/status",
                         json={{"status": "preparing_input", "message": "Đang tải tệp âm thanh lên GPU Worker...", "progress": 45}}
                     )
                     
-                    parsed_ref = urlparse(ref_audio_url)
-                    ref_path = parsed_ref.path
-                    if parsed_ref.query:
-                        ref_path = ref_path + "?" + parsed_ref.query
                     res = make_request("GET", ref_path, stream=True, timeout=(15, 300))
                     if res.status_code == 200:
                         temp_fd, local_ref_path = tempfile.mkstemp(suffix=".wav")
@@ -807,11 +1069,7 @@ def main():
                     bgm_path = "bgm.wav"
                     
                     try:
-                        try:
-                            import demucs
-                        except ImportError:
-                            log("Installing demucs dynamically...")
-                            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--prefer-binary", "demucs"])
+                        ensure_secondary_tools(need_whisper=False, need_demucs=True)
                             
                         demucs_device = "cuda" if torch.cuda.is_available() else "cpu"
                         log(f"Running Demucs (--two-stems=vocals, device={{demucs_device}}) on {{local_ref_path}}...")
@@ -1087,6 +1345,9 @@ def main():
                         log(f"faster-whisper ASR completed in {{time.time() - t_asr0:.1f}}s ({{len(chunks)}} words, lang={{getattr(asr_info, 'language', 'auto')}}).")
                     except Exception as fw_asr_err:
                         log(f"Warning: faster-whisper ASR failed ({{fw_asr_err}}). Falling back to chunked HF pipeline...")
+                        if not callable(getattr(model, "_asr_pipe", None)):
+                            model._asr_pipe = None
+                            model._orig_load_asr_model()
                         asr_res = model._asr_pipe(local_ref_path, chunk_length_s=30, return_timestamps=True)
                         transcribed_text = (asr_res.get("text") or "").strip()
                         raw_chunks = asr_res.get("chunks") or []
@@ -1140,9 +1401,27 @@ def main():
                 }}
                 
                 if job_type == "clone_voice":
-                    generate_args["ref_audio"] = local_ref_path
-                    if job.get("ref_text"):
-                        generate_args["ref_text"] = job["ref_text"]
+                    if cached_voice_prompt is not None:
+                        generate_args["voice_clone_prompt"] = cached_voice_prompt
+                    elif prompt_cache_key is not None and local_ref_path and hasattr(model, "create_voice_clone_prompt"):
+                        try:
+                            cached_voice_prompt = model.create_voice_clone_prompt(
+                                ref_audio=local_ref_path,
+                                ref_text=job.get("ref_text"),
+                            )
+                            if len(VOICE_PROMPT_CACHE) >= 32:
+                                VOICE_PROMPT_CACHE.pop(next(iter(VOICE_PROMPT_CACHE)), None)
+                            VOICE_PROMPT_CACHE[prompt_cache_key] = cached_voice_prompt
+                            generate_args["voice_clone_prompt"] = cached_voice_prompt
+                        except Exception as cp_err:
+                            log(f"Notice: VoiceClonePrompt cache fallback ({{cp_err}})")
+                            generate_args["ref_audio"] = local_ref_path
+                            if job.get("ref_text"):
+                                generate_args["ref_text"] = job["ref_text"]
+                    else:
+                        generate_args["ref_audio"] = local_ref_path
+                        if job.get("ref_text"):
+                            generate_args["ref_text"] = job["ref_text"]
                 elif job_type in ["voice_design_preview", "voice_design_tts"]:
                     generate_args["instruct"] = job.get("instruct")
                 elif job_type != "auto_voice":
@@ -1392,83 +1671,63 @@ import subprocess
 from urllib.parse import urlparse
 
 os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+os.environ["SAFETENSORS_FAST_GPU"] = "1"
+os.environ["USE_TF"] = "0"
+os.environ["USE_JAX"] = "0"
+os.environ["USE_FLAX"] = "0"
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_DISABLE_XET"] = "0"
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "15"
-os.environ["HF_TOKEN"] = {repr(hf_token)}
-os.environ["HUGGING_FACE_HUB_TOKEN"] = {repr(hf_token)}
+if {repr(hf_token)}:
+    os.environ["HF_TOKEN"] = {repr(hf_token)}
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = {repr(hf_token)}
 warnings.filterwarnings("ignore")
 
 def ensure_dependencies():
-    \"\"\"Dynamically checks and installs required packages inside the Kaggle environment if missing or outdated.\"\"\"
-    missing = []
-    need_omnivoice_upgrade = False
+    \"\"\"Dynamically installs minimal required packages inside Kaggle using uv or pip.\"\"\"
+    import io, importlib.metadata, urllib.request
+    fast_pkgs = "/dev/shm/omnivoice_fast_pkgs" if os.path.exists("/dev/shm") else os.path.join(tempfile.gettempdir(), "omnivoice_fast_pkgs")
+    os.makedirs(fast_pkgs, exist_ok=True)
+    uv_bin = shutil.which("uv")
+    def _inst(pkgs):
+        if not pkgs:
+            return
+        if uv_bin:
+            subprocess.check_call([uv_bin, "pip", "install", "--system", "--no-compile", "--quiet"] + list(pkgs))
+        else:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--no-compile", "--prefer-binary"] + list(pkgs))
     try:
         import omnivoice
         from omnivoice.models.omnivoice import VoiceClonePrompt
-    except (ImportError, AttributeError):
-        need_omnivoice_upgrade = True
-
+    except Exception:
+        try:
+            raw = urllib.request.urlopen("https://codeload.github.com/k2-fsa/OmniVoice/zip/refs/heads/master", timeout=20).read()
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                for m in zf.infolist():
+                    if m.filename.startswith("OmniVoice-master/omnivoice/") and not m.is_dir():
+                        dst = os.path.join(fast_pkgs, m.filename[len("OmniVoice-master/"):])
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        with zf.open(m) as s, open(dst, "wb") as o:
+                            shutil.copyfileobj(s, o)
+            sys.path.insert(0, fast_pkgs)
+        except Exception:
+            _inst(["omnivoice"])
+    need = []
+    try:
+        tf_v = importlib.metadata.version("transformers")
+        if tuple(int(x) for x in tf_v.split(".")[:2]) < (5, 3):
+            need.append("transformers>=5.3.0")
+    except Exception:
+        need.append("transformers>=5.3.0")
     try:
         import soundfile
     except ImportError:
-        missing.append("soundfile")
-    try:
-        import num2words
-    except ImportError:
-        missing.append("num2words")
-    try:
-        import modelscope
-    except ImportError:
-        missing.append("modelscope")
-    try:
-        import sentencepiece
-    except ImportError:
-        missing.append("sentencepiece")
-    try:
-        import tiktoken
-    except ImportError:
-        missing.append("tiktoken")
-    try:
-        import faster_whisper
-    except ImportError:
-        missing.append("faster-whisper")
-        
-    import subprocess
-    packages_to_install = []
-    if need_omnivoice_upgrade:
-        packages_to_install.append("git+https://github.com/k2-fsa/OmniVoice.git")
-    packages_to_install.extend(missing)
-
-    if packages_to_install:
-        print(f"Installing missing dependencies: {{', '.join(packages_to_install)}}")
-        try:
-            # Install packages silently with fast flags
-            subprocess.check_call([
-                sys.executable, "-m", "pip", "install", "-q", 
-                "--no-cache-dir", "--prefer-binary", 
-                "--no-warn-script-location"
-            ] + packages_to_install)
-            print("Dependencies installed successfully.")
-        except Exception as e:
-            if need_omnivoice_upgrade:
-                print(f"Notice: Batch install failed ({{e}}), falling back to omnivoice[tn]...")
-                try:
-                    fallback_packages = ["omnivoice[tn]"] + missing
-                    subprocess.check_call([
-                        sys.executable, "-m", "pip", "install", "-q",
-                        "--no-cache-dir", "--prefer-binary",
-                        "--no-warn-script-location"
-                    ] + fallback_packages)
-                    print("Fallback dependencies installed successfully.")
-                except Exception as fb_err:
-                    print(f"Failed to install fallback dependencies: {{fb_err}}")
-                    sys.exit(1)
-            else:
-                print(f"Failed to install dependencies: {{e}}")
-                sys.exit(1)
+        need.append("soundfile")
+    if need:
+        _inst(need)
 
 # Ensure dependencies are available before anything else runs
 ensure_dependencies()

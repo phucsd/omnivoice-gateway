@@ -94,11 +94,15 @@ class KaggleOrchestrator:
 
     _runner_thread = None
     _runner_stop_event = None
+    _wake_event = threading.Event()
     _consecutive_poll_failures = {}
     _unknown_status_count = {}
     _complete_grace_count = {}
     _boot_attempts = {}
     _boot_started_at = {}
+    _last_poll_at = {}
+    _prewarm_lock = threading.Lock()
+    _last_prewarm_at = 0.0
 
     @classmethod
     def _cleanup_job_tracking(cls, job_id: str):
@@ -108,11 +112,111 @@ class KaggleOrchestrator:
         cls._complete_grace_count.pop(job_id, None)
         cls._boot_attempts.pop(job_id, None)
         cls._boot_started_at.pop(job_id, None)
+        cls._last_poll_at.pop(job_id, None)
+
+    @classmethod
+    def notify_new_job(cls):
+        """Wakes up the background queue runner immediately (<1ms) instead of waiting for sleep timeout."""
+        if cls._wake_event:
+            cls._wake_event.set()
 
     @classmethod
     def ensure_worker_running(cls, db=None):
-        """Ensures background queue runner is active."""
+        """Ensures background queue runner is active and wakes it immediately."""
         cls.start_queue_runner()
+        cls.notify_new_job()
+
+    @classmethod
+    def _select_best_worker_slot(cls, db, total_active_or_booting: set) -> str:
+        """
+        Selects the optimal worker slot. When both slots are free, prefers the slot
+        that has been stopped/idle longest to avoid Kaggle's ~30-35s container teardown queue.
+        """
+        if "worker_1" in total_active_or_booting:
+            return "worker_2"
+        if "worker_2" in total_active_or_booting:
+            return "worker_1"
+
+        try:
+            from app.models import WorkerSession
+            s1 = db.query(WorkerSession).filter(WorkerSession.worker_id == "worker_1").first()
+            s2 = db.query(WorkerSession).filter(WorkerSession.worker_id == "worker_2").first()
+            if s1 and not s2:
+                # worker_2 has never recently shut down -> guaranteed clean slot if worker_1 stopped recently
+                t1 = s1.stopped_at or s1.last_heartbeat_at
+                if t1:
+                    from datetime import datetime
+                    if (datetime.utcnow() - t1).total_seconds() < 60:
+                        return "worker_2"
+            elif s1 and s2:
+                t1 = s1.stopped_at or s1.last_heartbeat_at
+                t2 = s2.stopped_at or s2.last_heartbeat_at
+                if t1 and t2 and t2 < t1:
+                    return "worker_2"
+        except Exception:
+            pass
+        return "worker_1"
+
+    @classmethod
+    def prewarm_worker_async(cls, user_id: str = None):
+        """
+        Proactively boots an idle Kaggle GPU worker slot in the background (e.g. during YouTube download)
+        so the GPU container is already warm or booting by the time audio tasks are queued.
+        """
+        if settings.WORKER_MODE != "kaggle":
+            return
+        import time as _time
+        with cls._prewarm_lock:
+            now = _time.monotonic()
+            if now - cls._last_prewarm_at < 30.0:
+                return
+            cls._last_prewarm_at = now
+
+        def _bg_prewarm():
+            from app.database import SessionLocal
+            from app.models import TTSJob
+            from app.services.worker_session_service import WorkerSessionService
+            from app.services.kaggle_notebook_builder import KaggleNotebookBuilder
+
+            db = SessionLocal()
+            try:
+                if cls.has_live_worker(db):
+                    return
+                booting = db.query(TTSJob).filter(TTSJob.status.in_(["starting_worker", "queued_kaggle"])).first()
+                if booting:
+                    return
+                username, key, _, default_worker_dir = cls.get_credentials(db, user_id)
+                if not username or not key:
+                    return
+                slot = cls._select_best_worker_slot(db, set())
+                worker_dir_path = f"{default_worker_dir}-2" if slot == "worker_2" else f"{default_worker_dir}-1"
+                worker_dir_abs = os.path.abspath(worker_dir_path)
+
+                KaggleNotebookBuilder.prepare_all(job={"worker_id": slot, "user_id": user_id}, db=db, is_daemon=True, user_id=user_id)
+                WorkerSessionService.register_worker(db, slot, "starting", "Pre-warming Kaggle GPU worker...")
+
+                env = os.environ.copy()
+                env["KAGGLE_USERNAME"] = username
+                env["KAGGLE_KEY"] = key
+                env["KAGGLE_API_TOKEN"] = key
+                env["PYTHONUTF8"] = "1"
+                import sys
+                cmd = [
+                    sys.executable, "-c", "from kaggle.cli import main; main()",
+                    "kernels", "push",
+                    "-p", worker_dir_abs,
+                    "--timeout", str(settings.KAGGLE_TIMEOUT_SECONDS),
+                    "--accelerator", "NvidiaTeslaT4",
+                ]
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, shell=False)
+                out, err = proc.communicate()
+                print(f"[KaggleOrchestrator] Pre-warm push on {slot} exited {proc.returncode}: {(out or err or '').strip()}")
+            except Exception as pw_err:
+                print(f"[KaggleOrchestrator] Pre-warm notice: {pw_err}")
+            finally:
+                db.close()
+
+        threading.Thread(target=_bg_prewarm, daemon=True).start()
 
     @classmethod
     def _failover_or_retry_worker(cls, db, job, status_output: str, reason_label: str):
@@ -156,8 +260,8 @@ class KaggleOrchestrator:
     @classmethod
     def start_queue_runner(cls):
         """Starts the background queue runner if it is not already running."""
-        if settings.WORKER_MODE != "kaggle":
-            print("[KaggleOrchestrator] Not in 'kaggle' mode. Queue runner skipped.")
+        if settings.WORKER_MODE != "kaggle" or os.environ.get("APP_ENV") == "testing":
+            print("[KaggleOrchestrator] Not in 'kaggle' mode or in testing env. Queue runner skipped.")
             return
 
         if cls._runner_thread and cls._runner_thread.is_alive():
@@ -175,6 +279,8 @@ class KaggleOrchestrator:
         """Stops the background queue runner."""
         if cls._runner_stop_event:
             cls._runner_stop_event.set()
+        if cls._wake_event:
+            cls._wake_event.set()
         if cls._runner_thread:
             cls._runner_thread.join(timeout=5)
             print("[KaggleOrchestrator] Queue runner background thread stopped.")
@@ -226,9 +332,13 @@ class KaggleOrchestrator:
                     TTSJob.status.in_(["starting_worker", "queued_kaggle"])
                 ).all()
 
-                # Poll status for each booting job
+                # Poll status for each booting job (throttled to ~6s per job so rapid wakeups don't spam Kaggle API)
+                now_mono = time.monotonic()
                 for b_job in booting_jobs:
-                    cls._poll_booting_worker(db, b_job)
+                    last_p = cls._last_poll_at.get(b_job.id, 0.0)
+                    if now_mono - last_p >= 6.0:
+                        cls._last_poll_at[b_job.id] = now_mono
+                        cls._poll_booting_worker(db, b_job)
 
                 # Clean up any tracking for jobs that have left the booting states
                 booting_job_ids = {j.id for j in booting_jobs}
@@ -247,12 +357,8 @@ class KaggleOrchestrator:
                     ).order_by(TTSJob.created_at.asc()).first()
 
                     if next_job:
-                        # Decide which worker slot to assign
-                        assigned_worker_id = "worker_1"
-                        if "worker_1" in total_active_or_booting:
-                            assigned_worker_id = "worker_2"
-                        elif "worker_2" in total_active_or_booting:
-                            assigned_worker_id = "worker_1"
+                        # Smart slot selection: prefers longest-idle slot to avoid Kaggle teardown queue
+                        assigned_worker_id = cls._select_best_worker_slot(db, total_active_or_booting)
                         
                         print(f"[KaggleOrchestrator] Queued job {next_job.id} found. Active/booting workers: {total_active_or_booting}. Triggering slot {assigned_worker_id}...")
                         next_job.worker_id = assigned_worker_id
@@ -265,8 +371,12 @@ class KaggleOrchestrator:
             finally:
                 db.close()
 
-            # Wait 10 seconds before next check
-            time.sleep(10)
+            # Event-driven wait: wakes immediately (<1ms) on new job, or polls every 3s
+            if cls._wake_event:
+                cls._wake_event.wait(timeout=3.0)
+                cls._wake_event.clear()
+            else:
+                time.sleep(3.0)
 
     @classmethod
     def _trigger_daemon_worker(cls, db, job):

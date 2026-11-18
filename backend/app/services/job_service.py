@@ -165,6 +165,11 @@ class JobService:
         db.refresh(db_preview)
         db.refresh(db_job)
 
+        try:
+            KaggleOrchestrator.ensure_worker_running(db)
+        except Exception as e:
+            print(f"[JobService] Warning waking orchestrator: {e}")
+
         return db_preview, db_job
 
     @staticmethod
@@ -264,6 +269,11 @@ class JobService:
         db.add(db_job)
         db.commit()
         db.refresh(db_job)
+
+        try:
+            KaggleOrchestrator.ensure_worker_running(db)
+        except Exception as e:
+            print(f"[JobService] Warning waking orchestrator: {e}")
 
         return db_job
 

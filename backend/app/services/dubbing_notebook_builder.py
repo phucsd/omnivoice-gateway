@@ -79,17 +79,13 @@ class DubbingNotebookBuilder:
         abs_dir = DubbingNotebookBuilder.ensure_worker_dir(worker_dir)
         req_path = os.path.join(abs_dir, "requirements.txt")
         reqs = [
-            "torch",
-            "torchaudio",
             "requests",
             "soundfile",
             "numpy",
             "demucs",
-            "openai-whisper",
-            "omnivoice @ git+https://github.com/k2-fsa/OmniVoice.git",
-            "num2words",
+            "faster-whisper",
+            "omnivoice",
             "huggingface_hub",
-            "modelscope"
         ]
         with open(req_path, "w", encoding="utf-8") as f:
             f.write("\n".join(reqs) + "\n")
@@ -118,6 +114,15 @@ import json
 import shutil
 import zipfile
 import subprocess
+
+os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+os.environ["SAFETENSORS_FAST_GPU"] = "1"
+os.environ["USE_TF"] = "0"
+os.environ["USE_JAX"] = "0"
+os.environ["HF_HUB_DISABLE_XET"] = "0"
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
 import requests
 import soundfile as sf
 import numpy as np

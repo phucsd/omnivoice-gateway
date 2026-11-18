@@ -333,3 +333,62 @@ def test_any_ready_worker_claims_booting_job_and_syncs_dubbing_failure(db):
     db.refresh(dub)
     assert dub.status == "failed"
     assert "CUDA OOM" in (dub.error_message or "")
+
+
+def test_smart_worker_slot_selection_avoids_recently_stopped_slot(db):
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow()
+    # worker_1 stopped 10s ago (likely still in Kaggle CANCEL_ACKNOWLEDGED teardown), worker_2 stopped 10 mins ago
+    s1 = WorkerSession(id="ws_1", worker_id="worker_1", status="stopped", stopped_at=now - timedelta(seconds=10), last_heartbeat_at=now - timedelta(seconds=10))
+    s2 = WorkerSession(id="ws_2", worker_id="worker_2", status="stopped", stopped_at=now - timedelta(minutes=10), last_heartbeat_at=now - timedelta(minutes=10))
+    db.add_all([s1, s2])
+    db.commit()
+
+    chosen = KaggleOrchestrator._select_best_worker_slot(db, set())
+    assert chosen == "worker_2"
+
+
+def test_notify_new_job_wakes_queue_event():
+    KaggleOrchestrator._wake_event.clear()
+    assert not KaggleOrchestrator._wake_event.is_set()
+    KaggleOrchestrator.notify_new_job()
+    assert KaggleOrchestrator._wake_event.is_set()
+    KaggleOrchestrator._wake_event.clear()
+
+
+def test_turbo_worker_code_ast_and_optimizations_present(tmp_path):
+    import ast
+    from app.services.kaggle_notebook_builder import KaggleNotebookBuilder
+
+    wdir = str(tmp_path / "turbo_worker_check")
+    KaggleNotebookBuilder.ensure_worker_dir(wdir)
+
+    daemon_path = KaggleNotebookBuilder.generate_worker_code(
+        wdir,
+        job={"worker_id": "worker_1"},
+        public_api_url="https://example.hf.space",
+        worker_token="tok_turbo_123",
+        is_daemon=True,
+    )
+    daemon_src = open(daemon_path, encoding="utf-8").read()
+    ast.parse(daemon_src)
+    assert 'os.environ["SAFETENSORS_FAST_GPU"] = "1"' in daemon_src
+    assert 'os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"' in daemon_src
+    assert 'load_asr=False' in daemon_src
+    assert '_attach_fast_asr_bridge(model)' in daemon_src
+    assert '_preload_cuda_runtime_libs()' in daemon_src
+    assert 'model.llm.config.use_cache = False' in daemon_src
+    assert '"/dev/shm"' in daemon_src
+
+    batch_path = KaggleNotebookBuilder.generate_worker_code(
+        wdir,
+        job={"id": "job_b1", "job_type": "auto_voice", "text": "Xin chào"},
+        public_api_url="https://example.hf.space",
+        worker_token="tok_turbo_123",
+        is_daemon=False,
+    )
+    batch_src = open(batch_path, encoding="utf-8").read()
+    ast.parse(batch_src)
+    assert 'os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"' in batch_src
+
