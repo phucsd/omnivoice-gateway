@@ -132,7 +132,7 @@ def restore_corrupt_db(db: Session = Depends(get_db), current_user: User = Depen
         
     tables_to_restore = [
         "users", "api_keys", "voice_samples", "llm_profiles",
-        "system_settings", "user_settings", "voice_design_previews", "tts_jobs", "worker_sessions", "api_usage_logs"
+        "system_settings", "user_settings", "voice_design_previews", "tts_jobs", "worker_sessions", "api_usage_logs", "video_dubbing_jobs"
     ]
     
     summary = {}
@@ -212,13 +212,14 @@ def restore_corrupt_db(db: Session = Depends(get_db), current_user: User = Depen
         
     # Re-align ownership of legacy user_id usr_ca3dd83a51d3 to admin user_id usr_62f1747adb99
     try:
-        admin_user = db.query(User).filter(User.username == "admin").first()
+        admin_user = db.query(User).filter(User.username == "admin").first() or current_user
         if admin_user:
             admin_id = admin_user.id
             target_cursor.execute("UPDATE voice_samples SET user_id = ? WHERE user_id = 'usr_ca3dd83a51d3'", (admin_id,))
             target_cursor.execute("UPDATE api_keys SET user_id = ? WHERE user_id = 'usr_ca3dd83a51d3'", (admin_id,))
             target_cursor.execute("UPDATE tts_jobs SET user_id = ? WHERE user_id = 'usr_ca3dd83a51d3'", (admin_id,))
             target_cursor.execute("UPDATE user_settings SET user_id = ? WHERE user_id = 'usr_ca3dd83a51d3'", (admin_id,))
+            target_cursor.execute("UPDATE video_dubbing_jobs SET user_id = ? WHERE user_id = 'usr_ca3dd83a51d3' OR user_id IS NULL OR user_id = ''", (admin_id,))
             target_conn.commit()
             summary["ownership_realignment"] = f"Re-aligned legacy user data to admin ID {admin_id}"
     except Exception as re_err:
@@ -232,14 +233,15 @@ def align_all_data_to_admin(db: Session = Depends(get_db), current_user: User = 
     from sqlalchemy import text
     admin_id = current_user.id
     
-    # 1. Update user_id for all voice_samples, api_keys, tts_jobs, user_settings to current admin_id
-    r1 = db.execute(text("UPDATE voice_samples SET user_id = :aid"), {"aid": admin_id})
-    r2 = db.execute(text("UPDATE api_keys SET user_id = :aid"), {"aid": admin_id})
-    r3 = db.execute(text("UPDATE tts_jobs SET user_id = :aid"), {"aid": admin_id})
-    r4 = db.execute(text("UPDATE user_settings SET user_id = :aid"), {"aid": admin_id})
+    # 1. Update user_id for all voice_samples, api_keys, tts_jobs, user_settings, video_dubbing_jobs to current admin_id
+    db.execute(text("UPDATE voice_samples SET user_id = :aid"), {"aid": admin_id})
+    db.execute(text("UPDATE api_keys SET user_id = :aid"), {"aid": admin_id})
+    db.execute(text("UPDATE tts_jobs SET user_id = :aid"), {"aid": admin_id})
+    db.execute(text("UPDATE user_settings SET user_id = :aid"), {"aid": admin_id})
+    db.execute(text("UPDATE video_dubbing_jobs SET user_id = :aid"), {"aid": admin_id})
     db.commit()
     
-    from app.models import VoiceSample, ApiKey, TTSJob
+    from app.models import VoiceSample, ApiKey, TTSJob, VideoDubbingJob
     return {
         "status": "ok",
         "admin_id": admin_id,
@@ -247,6 +249,7 @@ def align_all_data_to_admin(db: Session = Depends(get_db), current_user: User = 
             "voice_samples": db.query(VoiceSample).count(),
             "api_keys": db.query(ApiKey).count(),
             "tts_jobs": db.query(TTSJob).count(),
+            "video_dubbing_jobs": db.query(VideoDubbingJob).count(),
         }
     }
 

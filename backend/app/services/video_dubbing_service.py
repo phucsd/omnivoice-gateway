@@ -830,6 +830,7 @@ class VideoDubbingService:
     def _build_format_selector(preferred_quality: str = "1080p") -> str:
         max_h = _QUALITY_HEIGHT_MAP.get((preferred_quality or "1080p").strip().lower(), 1080)
         return (
+            f"bestvideo[height<={max_h}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height<={max_h}][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height<={max_h}]+bestaudio/"
             f"best[height<={max_h}][ext=mp4]/best[height<={max_h}]/18/best"
@@ -864,8 +865,181 @@ class VideoDubbingService:
             return {"probed": False, "has_audio": True, "has_video": True}
 
     @staticmethod
+    def probe_video_stream_info(file_path: str) -> Dict[str, Any]:
+        """Returns video stream codec_name and pix_fmt using ffprobe."""
+        if not file_path or not os.path.exists(file_path) or not shutil.which("ffprobe"):
+            return {"has_video": False, "codec_name": "", "pix_fmt": ""}
+        try:
+            res = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name,pix_fmt",
+                    "-of", "json",
+                    file_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            data = json.loads(res.stdout or "{}")
+            streams = data.get("streams") or []
+            if not streams:
+                return {"has_video": False, "codec_name": "", "pix_fmt": ""}
+            s0 = streams[0]
+            return {
+                "has_video": True,
+                "codec_name": str(s0.get("codec_name") or "").lower(),
+                "pix_fmt": str(s0.get("pix_fmt") or "").lower(),
+            }
+        except Exception:
+            return {"has_video": False, "codec_name": "", "pix_fmt": ""}
+
+    @staticmethod
+    def _mp4_has_faststart_moov(file_path: str) -> bool:
+        """Checks whether MP4 moov atom appears before mdat near the start of the file."""
+        try:
+            with open(file_path, "rb") as f:
+                head = f.read(65536)
+            moov_pos = head.find(b"moov")
+            mdat_pos = head.find(b"mdat")
+            if moov_pos != -1 and (mdat_pos == -1 or moov_pos < mdat_pos):
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _write_web_ok_marker(file_path: str) -> None:
+        try:
+            st = os.stat(file_path)
+            marker = f"{file_path}.web_ok"
+            with open(marker, "w", encoding="utf-8") as mf:
+                mf.write(f"{st.st_size}:{int(st.st_mtime)}")
+        except Exception:
+            pass
+
+    @staticmethod
+    def ensure_playable_mp4_inplace(file_path: str, transcode_non_h264: bool = True) -> str:
+        """
+        Ensures an MP4 file on disk has +faststart (moov atom at front) and optionally H.264 video
+        so HTML5 <video> browsers can stream and download it reliably.
+        Idempotent via a lightweight .web_ok sidecar stamp.
+        """
+        if not file_path or not os.path.exists(file_path) or not shutil.which("ffmpeg"):
+            return file_path
+
+        marker = f"{file_path}.web_ok"
+        try:
+            st = os.stat(file_path)
+            sig = f"{st.st_size}:{int(st.st_mtime)}"
+            if os.path.exists(marker):
+                with open(marker, "r", encoding="utf-8") as mf:
+                    if mf.read().strip() == sig:
+                        return file_path
+        except Exception:
+            pass
+
+        info = VideoDubbingService.probe_video_stream_info(file_path)
+        if not info["has_video"]:
+            VideoDubbingService._write_web_ok_marker(file_path)
+            return file_path
+
+        is_h264 = info["codec_name"] == "h264" and info["pix_fmt"] in ("yuv420p", "yuvj420p", "")
+        has_faststart = VideoDubbingService._mp4_has_faststart_moov(file_path)
+
+        if (is_h264 or not transcode_non_h264) and has_faststart:
+            VideoDubbingService._write_web_ok_marker(file_path)
+            return file_path
+
+        tmp_out = f"{file_path}.faststart_tmp.mp4"
+        try:
+            if is_h264 or not transcode_non_h264:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", file_path,
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    tmp_out,
+                ]
+                timeout_sec = 90
+            else:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", file_path,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    tmp_out,
+                ]
+                timeout_sec = 300
+
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            if res.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 1024:
+                os.replace(tmp_out, file_path)
+                VideoDubbingService._write_web_ok_marker(file_path)
+        except Exception as e:
+            print(f"[VideoDubbingService] Faststart optimization skipped for {file_path}: {e}")
+        finally:
+            if os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except Exception:
+                    pass
+
+        return file_path
+
+    @staticmethod
+    def ensure_preview_audio(wav_path: str) -> Tuple[str, str]:
+        """
+        Generates and caches a lightweight 128kbps M4A preview file (~15x smaller than raw WAV)
+        for instant browser loading during subtitle review, keeping lossless WAV intact on disk.
+        """
+        if not wav_path or not os.path.exists(wav_path):
+            return wav_path, "audio/wav"
+        if not shutil.which("ffmpeg"):
+            return wav_path, "audio/wav"
+
+        base, _ = os.path.splitext(wav_path)
+        preview_m4a = f"{base}_preview.m4a"
+        try:
+            wav_mtime = os.path.getmtime(wav_path)
+            if (
+                os.path.exists(preview_m4a)
+                and os.path.getsize(preview_m4a) > 512
+                and os.path.getmtime(preview_m4a) >= wav_mtime
+            ):
+                return preview_m4a, "audio/mp4"
+
+            tmp_m4a = f"{preview_m4a}.tmp.m4a"
+            res = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", wav_path,
+                    "-vn",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    tmp_m4a,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if res.returncode == 0 and os.path.exists(tmp_m4a) and os.path.getsize(tmp_m4a) > 512:
+                os.replace(tmp_m4a, preview_m4a)
+                return preview_m4a, "audio/mp4"
+            if os.path.exists(tmp_m4a):
+                os.remove(tmp_m4a)
+        except Exception as e:
+            print(f"[VideoDubbingService] Preview M4A transcode fallback for {wav_path}: {e}")
+
+        return wav_path, "audio/wav"
+
+    @staticmethod
     def _finalize_downloaded_media(output_dir: str) -> str:
-        """Normalizes downloaded candidate into input_video.mp4 and verifies it contains audio."""
+        """Normalizes downloaded candidate into faststart input_video.mp4 and verifies it contains audio."""
         mp4_target = os.path.join(output_dir, "input_video.mp4")
         candidate = None
         for ext in [".mp4", ".mkv", ".webm", ".mov", ".m4a"]:
@@ -880,19 +1054,41 @@ class VideoDubbingService:
         if candidate != mp4_target:
             try:
                 subprocess.run(
-                    ["ffmpeg", "-y", "-i", candidate, "-c", "copy", mp4_target],
+                    ["ffmpeg", "-y", "-i", candidate, "-c", "copy", "-movflags", "+faststart", mp4_target],
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=120,
                 )
             except Exception:
-                shutil.move(candidate, mp4_target)
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-i", candidate,
+                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p",
+                            "-c:a", "aac", "-b:a", "160k",
+                            "-movflags", "+faststart",
+                            mp4_target,
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=240,
+                    )
+                except Exception:
+                    shutil.move(candidate, mp4_target)
+                else:
+                    try:
+                        os.remove(candidate)
+                    except Exception:
+                        pass
             else:
                 try:
                     os.remove(candidate)
                 except Exception:
                     pass
+        else:
+            VideoDubbingService.ensure_playable_mp4_inplace(mp4_target, transcode_non_h264=False)
 
         if not os.path.exists(mp4_target) or os.path.getsize(mp4_target) <= 1024:
             raise RuntimeError("Tệp video sau khi đóng gói MP4 bị rỗng hoặc lỗi.")
@@ -2115,18 +2311,18 @@ class VideoDubbingService:
                 print(f"[FFmpeg Mix Error] {res_fb.stderr}")
                 raise RuntimeError(f"FFmpeg audio mixing failed: {res_fb.stderr[:300]}")
         
-        # Check if video_path has a video stream
-        has_video = False
-        try:
-            probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_path]
-            probe_res = subprocess.run(probe_cmd, capture_output=True, text=True)
-            if "video" in probe_res.stdout.lower():
-                has_video = True
-        except Exception:
-            pass
+        # Check video stream codec so output_dubbed.mp4 is guaranteed browser-playable (H.264 + AAC + faststart)
+        v_info = VideoDubbingService.probe_video_stream_info(video_path)
+        has_video = v_info["has_video"]
+        can_copy_h264 = (
+            has_video
+            and v_info["codec_name"] == "h264"
+            and v_info["pix_fmt"] in ("yuv420p", "yuvj420p", "")
+        )
 
-        if has_video:
-            mux_cmd = [
+        res_mux = None
+        if has_video and can_copy_h264:
+            copy_mux_cmd = [
                 "ffmpeg", "-y",
                 "-i", video_path,
                 "-i", temp_mixed_audio,
@@ -2135,29 +2331,52 @@ class VideoDubbingService:
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-b:a", "192k",
+                "-movflags", "+faststart",
                 "-shortest",
-                output_path
+                output_path,
             ]
-        else:
-            # Fallback for audio-only / test dummy inputs
-            mux_cmd = [
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", "color=c=black:s=640x360:r=24",
-                "-i", temp_mixed_audio,
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-shortest",
-                output_path
-            ]
-        
-        res_mux = subprocess.run(mux_cmd, capture_output=True, text=True)
-        if res_mux.returncode != 0:
-            print(f"[FFmpeg Mux Error] {res_mux.stderr}")
-            raise RuntimeError(f"FFmpeg video remuxing failed: {res_mux.stderr[:300]}")
-        
+            res_mux = subprocess.run(copy_mux_cmd, capture_output=True, text=True)
+
+        if res_mux is None or res_mux.returncode != 0:
+            if has_video:
+                mux_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", video_path,
+                    "-i", temp_mixed_audio,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-shortest",
+                    output_path,
+                ]
+            else:
+                # Fallback for audio-only / test dummy inputs
+                mux_cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i", "color=c=black:s=640x360:r=24",
+                    "-i", temp_mixed_audio,
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-shortest",
+                    output_path,
+                ]
+
+            res_mux = subprocess.run(mux_cmd, capture_output=True, text=True)
+            if res_mux.returncode != 0:
+                if os.path.exists(temp_mixed_audio):
+                    os.remove(temp_mixed_audio)
+                print(f"[FFmpeg Mux Error] {res_mux.stderr}")
+                raise RuntimeError(f"FFmpeg video remuxing failed: {res_mux.stderr[:300]}")
+
+        VideoDubbingService._write_web_ok_marker(output_path)
+
         # Clean up temporary mixed audio track
         if os.path.exists(temp_mixed_audio):
             os.remove(temp_mixed_audio)

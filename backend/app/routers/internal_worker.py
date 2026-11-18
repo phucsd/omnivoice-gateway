@@ -201,7 +201,8 @@ async def upload_job_output(
 
         is_sep = job.job_type == "separate_audio"
         prefix = "sep_" if is_sep else "dub_"
-        dub_job_id = os.path.basename(job_id.replace(prefix, ""))
+        raw_rest = job_id[len(prefix):] if job_id.startswith(prefix) else job_id
+        dub_job_id = os.path.basename(raw_rest)
 
         dub_job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == dub_job_id).first()
         if not dub_job:
@@ -241,8 +242,17 @@ async def upload_job_output(
                 dub_job.bgm_audio_path = bgm_path
                 db.commit()
 
-                # Set job as complete
-                JobService.complete_job_output(db, job_id, zip_path)
+                # Pre-generate lightweight compressed M4A previews so awaiting_review loads instantaneously
+                try:
+                    if vocals_path and os.path.exists(vocals_path):
+                        VideoDubbingService.ensure_preview_audio(vocals_path)
+                    if bgm_path and os.path.exists(bgm_path):
+                        VideoDubbingService.ensure_preview_audio(bgm_path)
+                except Exception as prev_err:
+                    print(f"[InternalWorker] Stem preview pre-generation skipped: {prev_err}")
+
+                # Persist real WAV path (never temporary zip_path which is deleted below!)
+                JobService.complete_job_output(db, job_id, vocals_path)
                 
                 # Trigger next stage (ASR/Transcription)
                 from app.routers.video_dubbing import trigger_transcription_stage
@@ -326,8 +336,8 @@ async def upload_job_output(
                 db.commit()
                 VideoDubbingService.log_to_job(dub_job_id, f"[KAGGLE] Đóng gói video thành công. File: {output_video_path}. Quy trình hoàn tất!")
 
-                # Set job as complete
-                JobService.complete_job_output(db, job_id, zip_path)
+                # Persist real dubbed_vocals.wav path (never temporary zip_path which is deleted below!)
+                JobService.complete_job_output(db, job_id, dubbed_vocals_path)
 
             if os.path.exists(zip_path):
                 os.remove(zip_path)
@@ -398,7 +408,7 @@ def upload_asr_result(
 
         # Video Dubbing ASR callback integration
         if job_id.startswith("asr_"):
-            dub_job_id = job_id.replace("asr_", "")
+            dub_job_id = job_id[4:]
             from app.routers.video_dubbing import trigger_translation_stage
             trigger_translation_stage(dub_job_id, payload.text, alignment_str, db)
 

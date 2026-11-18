@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Clock, RefreshCw, Layers, Heart, Lock, Globe, X, ChevronDown, ChevronUp, AlertCircle, CheckCircle, Play, Pause, Zap, Copy, Check, Terminal, Settings, Tag, Trash2, Search, Filter, ChevronLeft, ChevronRight } from "lucide-react";
+import { Clock, RefreshCw, Layers, Heart, Lock, Globe, X, ChevronDown, ChevronUp, AlertCircle, CheckCircle, Play, Pause, Zap, Copy, Check, Terminal, Settings, Tag, Trash2, Search, Filter, ChevronLeft, ChevronRight, Film, Download, ExternalLink } from "lucide-react";
 import { api, getErrorMessage, type JobStatusResponse } from "../api/client";
 
 interface JobHistoryPanelProps {
@@ -9,6 +9,7 @@ interface JobHistoryPanelProps {
   globalPlayerPlaying: boolean;
   onPlayAudio: (url: string, title: string) => void;
   onTogglePlay: () => void;
+  onOpenDubbingJob?: (dubJobId: string) => void;
 }
 
 export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
@@ -17,6 +18,7 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
   globalPlayerPlaying,
   onPlayAudio,
   onTogglePlay,
+  onOpenDubbingJob,
 }) => {
   const [jobs, setJobs] = useState<JobStatusResponse[]>([]);
   const [loading, setLoading] = useState(false);
@@ -56,6 +58,7 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
 
   // Expanded configs and tabs state
   const [expandedDetails, setExpandedDetails] = useState<Record<string, boolean>>({});
+  const [expandedVideos, setExpandedVideos] = useState<Record<string, boolean>>({});
   const [activeTabs, setActiveTabs] = useState<Record<string, "params" | "json">>({});
   const [copiedJobId, setCopiedJobId] = useState<string | null>(null);
 
@@ -220,6 +223,7 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
         return { label: "Voice Preview", color: "text-violet-600 dark:text-violet-400 border-violet-500/20 bg-violet-500/5" };
       case "asr":
         return { label: "Speech-to-Text (ASR)", color: "text-emerald-600 dark:text-emerald-400 border-emerald-500/20 bg-emerald-500/5" };
+      case "video_dubbing":
       case "separate_audio":
       case "dub_segments":
         return { label: "Video Dubbing", color: "text-amber-600 dark:text-amber-400 border-amber-500/20 bg-amber-500/5" };
@@ -401,6 +405,25 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
               : fullText;
 
             const audioUrl = job.audio_url ? `${api.getApiBaseUrl()}${job.audio_url}` : "";
+            const isDubbingItem =
+              job.job_type === "video_dubbing" ||
+              job.job_type === "separate_audio" ||
+              job.job_type === "dub_segments" ||
+              safeJobId.startsWith("vd_");
+            const dubbingJobId = isDubbingItem
+              ? String(
+                  job.params?.dubbing_job_id ||
+                    (safeJobId.startsWith("vd_")
+                      ? safeJobId
+                      : safeJobId.includes("_")
+                      ? safeJobId.split("_").slice(1).join("_")
+                      : "")
+                )
+              : "";
+            const hasOutputVideo = Boolean(job.params?.has_output_video) || (safeJobId.startsWith("vd_") && isCompleted);
+            const hasSourceVideo = Boolean(job.params?.has_source_video);
+            const hasPlayableVideo = Boolean(dubbingJobId && (hasOutputVideo || hasSourceVideo));
+            const isVideoOpen = expandedVideos[safeJobId] ?? (selectedCategory === "video_dubbing" && hasOutputVideo);
              return (
                <div 
                  key={safeJobId} 
@@ -596,39 +619,109 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
                 )}
 
 
+                {/* Inline Video Player for Video Dubbing items */}
+                {hasPlayableVideo && isVideoOpen && (
+                  <div className="aspect-video w-full max-w-xl rounded-2xl overflow-hidden bg-black border border-border shadow-md">
+                    <video
+                      src={api.getDubbingFileUrl(dubbingJobId, hasOutputVideo ? "output" : "video")}
+                      controls
+                      playsInline
+                      preload="metadata"
+                      className="w-full h-full object-contain"
+                    />
+                  </div>
+                )}
+
                 {/* Job Output / Actions */}
-                {isCompleted && (job.cdn_audio_url || job.audio_url) && (
-                  <div className="flex gap-2 bg-card/20 p-2 rounded-2xl border border-border/50 mt-1 items-center select-none">
-                    <button
-                      onClick={() => {
-                        const audioUrl = job.cdn_audio_url || `${api.getApiBaseUrl()}${job.audio_url}`;
-                        if (currentPlayUrl === audioUrl) {
-                          onTogglePlay();
-                        } else {
-                          onPlayAudio(audioUrl, `Job ${job.job_id.substring(0, 8)}`);
+                {(isCompleted || isDubbingItem) && (job.cdn_audio_url || job.audio_url || hasPlayableVideo || dubbingJobId) && (
+                  <div className="flex flex-wrap gap-2 bg-card/20 p-2 rounded-2xl border border-border/50 mt-1 items-center select-none">
+                    {(job.cdn_audio_url || job.audio_url) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const targetAudio = job.cdn_audio_url || `${api.getApiBaseUrl()}${job.audio_url}`;
+                          if (currentPlayUrl === targetAudio) {
+                            onTogglePlay();
+                          } else {
+                            onPlayAudio(
+                              targetAudio,
+                              String(job.params?.video_title || `Job ${safeJobId.substring(0, 8)}`)
+                            );
+                          }
+                        }}
+                        className={`p-2.5 border rounded-full transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+                          currentPlayUrl === (job.cdn_audio_url || `${api.getApiBaseUrl()}${job.audio_url}`) && globalPlayerPlaying
+                            ? "bg-primary text-white border-primary shadow-lg shadow-primary/20"
+                            : "border-border hover:border-primary/40 hover:bg-muted text-foreground"
+                        }`}
+                        title={
+                          currentPlayUrl === (job.cdn_audio_url || `${api.getApiBaseUrl()}${job.audio_url}`) && globalPlayerPlaying
+                            ? "Tạm dừng âm thanh"
+                            : "Phát âm thanh"
                         }
-                      }}
-                      className={`p-2.5 border rounded-full transition-all cursor-pointer flex items-center justify-center shrink-0 ${
-                        currentPlayUrl === (job.cdn_audio_url || `${api.getApiBaseUrl()}${job.audio_url}`) && globalPlayerPlaying
-                          ? "bg-primary text-white border-primary shadow-lg shadow-primary/20"
-                          : "border-border hover:border-primary/40 hover:bg-muted text-foreground"
-                      }`}
-                      title={currentPlayUrl === (job.cdn_audio_url || `${api.getApiBaseUrl()}${job.audio_url}`) && globalPlayerPlaying ? "Tạm dừng" : "Nghe kết quả"}
-                    >
-                      {currentPlayUrl === (job.cdn_audio_url || `${api.getApiBaseUrl()}${job.audio_url}`) && globalPlayerPlaying ? (
-                        <Pause className="w-4 h-4 fill-current" />
-                      ) : (
-                        <Play className="w-4 h-4 fill-current ml-0.5" />
-                      )}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleOpenSaveModal(job.job_id, fullText)}
-                      className="flex-grow py-2.5 px-4 bg-card/60 hover:bg-card border border-border text-foreground hover:text-foreground rounded-full font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm active:scale-[0.98]"
-                    >
-                      <Heart className="w-3.5 h-3.5 fill-slate-450 text-muted-foreground" />
-                      <span>Lưu giọng vào Thư viện</span>
-                    </button>
+                      >
+                        {currentPlayUrl === (job.cdn_audio_url || `${api.getApiBaseUrl()}${job.audio_url}`) && globalPlayerPlaying ? (
+                          <Pause className="w-4 h-4 fill-current" />
+                        ) : (
+                          <Play className="w-4 h-4 fill-current ml-0.5" />
+                        )}
+                      </button>
+                    )}
+
+                    {isDubbingItem ? (
+                      <>
+                        {hasPlayableVideo && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExpandedVideos((prev) => ({
+                                ...prev,
+                                [safeJobId]: !isVideoOpen,
+                              }))
+                            }
+                            className="py-2 px-3.5 bg-card/60 hover:bg-card border border-border text-foreground rounded-full font-bold text-xs flex items-center gap-1.5 transition-all cursor-pointer shadow-sm"
+                          >
+                            <Film className="w-3.5 h-3.5 text-primary" />
+                            <span>{isVideoOpen ? "Ẩn Video" : hasOutputVideo ? "Xem Video Lồng Tiếng" : "Xem Video Gốc"}</span>
+                          </button>
+                        )}
+
+                        {hasPlayableVideo && (
+                          <a
+                            href={api.getDubbingFileUrl(dubbingJobId, hasOutputVideo ? "output" : "video", true)}
+                            download={hasOutputVideo ? `dubbed_${dubbingJobId}.mp4` : `youtube_${dubbingJobId}.mp4`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="py-2 px-3.5 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 rounded-full font-bold text-xs flex items-center gap-1.5 transition-all cursor-pointer"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>{hasOutputVideo ? "Tải Video MP4" : "Tải MP4 Gốc"}</span>
+                          </a>
+                        )}
+
+                        {dubbingJobId && onOpenDubbingJob && (
+                          <button
+                            type="button"
+                            onClick={() => onOpenDubbingJob(dubbingJobId)}
+                            className="py-2 px-3.5 bg-primary/10 hover:bg-primary/20 border border-primary/25 text-primary rounded-full font-bold text-xs flex items-center gap-1.5 transition-all cursor-pointer ml-auto"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                            <span>Mở Studio</span>
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      isCompleted && (
+                        <button
+                          type="button"
+                          onClick={() => handleOpenSaveModal(job.job_id, fullText)}
+                          className="flex-grow py-2.5 px-4 bg-card/60 hover:bg-card border border-border text-foreground hover:text-foreground rounded-full font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm active:scale-[0.98]"
+                        >
+                          <Heart className="w-3.5 h-3.5 fill-slate-450 text-muted-foreground" />
+                          <span>Lưu giọng vào Thư viện</span>
+                        </button>
+                      )
+                    )}
                   </div>
                 )}
 

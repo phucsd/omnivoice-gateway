@@ -781,49 +781,239 @@ def trigger_translation_stage(dub_job_id: str, text: str, alignment_str: str, db
     job.message = "Đang chờ người dùng kiểm tra và xác nhận phụ đề dịch."
     db.commit()
 
+def _sanitize_subtitle_segments(raw: Optional[str]) -> list[dict]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    cleaned: list[dict] = []
+    for idx, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            continue
+        try:
+            seg_id = int(item.get("id", idx + 1))
+        except (ValueError, TypeError):
+            seg_id = idx + 1
+        try:
+            start_v = float(item.get("start", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            start_v = 0.0
+        try:
+            end_v = float(item.get("end", start_v + 1.0) or (start_v + 1.0))
+        except (ValueError, TypeError):
+            end_v = start_v + 1.0
+        if end_v < start_v:
+            end_v = start_v + 0.5
+        text_v = "" if item.get("text") is None else str(item.get("text"))
+        cleaned.append(
+            {
+                "id": seg_id,
+                "start": round(start_v, 3),
+                "end": round(end_v, 3),
+                "text": text_v,
+            }
+        )
+    return cleaned
+
+
+def reconcile_dubbing_jobs_from_disk(db: Session, fallback_user_id: Optional[str] = None) -> int:
+    """
+    Scans settings.dubbing_dir for any vd_* project directories whose DB rows were lost
+    or orphaned across container restarts, reconstructing them cleanly.
+    """
+    dubbing_root = settings.dubbing_dir
+    if not dubbing_root or not os.path.isdir(dubbing_root):
+        return 0
+
+    owner_id = fallback_user_id
+    if not owner_id:
+        admin_u = db.query(User).filter(User.is_admin == True).first()
+        owner_id = admin_u.id if admin_u else None
+    if not owner_id:
+        return 0
+
+    existing_ids = {row[0] for row in db.query(VideoDubbingJob.id).all()}
+    recovered = 0
+    import re
+
+    for entry in os.listdir(dubbing_root):
+        if not entry.startswith("vd_") or entry in existing_ids:
+            continue
+        job_dir = os.path.join(dubbing_root, entry)
+        if not os.path.isdir(job_dir):
+            continue
+
+        output_mp4 = os.path.join(job_dir, "output_dubbed.mp4")
+        input_mp4 = os.path.join(job_dir, "input_video.mp4")
+        orig_wav = os.path.join(job_dir, "original_audio.wav")
+        vocals_wav = os.path.join(job_dir, "vocals.wav")
+        bgm_wav = os.path.join(job_dir, "bgm.wav")
+        log_path = os.path.join(job_dir, "process.log")
+
+        has_output = os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 1024
+        has_vocals = os.path.exists(vocals_wav) and os.path.getsize(vocals_wav) > 512
+        has_input = os.path.exists(input_mp4) and os.path.getsize(input_mp4) > 512
+        has_log = os.path.exists(log_path)
+
+        if not (has_output or has_vocals or has_input or has_log):
+            continue
+
+        title = None
+        src_url = None
+        source_type = "upload"
+        if has_log:
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as lf:
+                    log_txt = lf.read()
+                m_title = re.search(r"Tải video thành công:\s*'([^']+)'", log_txt)
+                if m_title:
+                    title = m_title.group(1).strip()
+                    source_type = "youtube"
+                m_url = re.search(r"(https?://(?:www\.)?(?:youtube\.com/watch\?v=[0-9A-Za-z_-]{11}|youtu\.be/[0-9A-Za-z_-]{11}))", log_txt)
+                if m_url:
+                    src_url = m_url.group(1)
+                    source_type = "youtube"
+            except Exception:
+                pass
+
+        # Recover subtitles from linked TTS sub-jobs if present
+        trans_json = None
+        orig_json = None
+        dub_sub = db.query(TTSJob).filter(TTSJob.id == f"dub_{entry}").first()
+        if dub_sub and dub_sub.text and dub_sub.text.strip().startswith("["):
+            trans_json = dub_sub.text
+        asr_sub = db.query(TTSJob).filter(TTSJob.id == f"asr_{entry}").first()
+        if asr_sub and asr_sub.text:
+            if trans_json and not orig_json:
+                orig_json = trans_json
+
+        if has_output:
+            st_val, prog_val, msg_val = "completed", 100, "Lồng tiếng video thành công!"
+        elif has_vocals:
+            st_val, prog_val, msg_val = "awaiting_review", 100, "Đang chờ kiểm tra và xác nhận phụ đề."
+        elif has_input:
+            st_val, prog_val, msg_val = "uploaded", 100, "Video gốc đã sẵn sàng trên máy chủ."
+        else:
+            continue
+
+        try:
+            dir_mtime = datetime.utcfromtimestamp(os.path.getmtime(job_dir))
+        except Exception:
+            dir_mtime = datetime.utcnow()
+
+        rec_job = VideoDubbingJob(
+            id=entry,
+            user_id=owner_id,
+            status=st_val,
+            progress=prog_val,
+            message=msg_val,
+            source_type=source_type,
+            source_url=src_url,
+            video_title=title or f"Dự án khôi phục #{entry[:8]}",
+            target_language="Vietnamese",
+            input_file_path=input_mp4 if has_input else None,
+            original_audio_path=orig_wav if os.path.exists(orig_wav) else None,
+            vocals_audio_path=vocals_wav if has_vocals else None,
+            bgm_audio_path=bgm_wav if os.path.exists(bgm_wav) else None,
+            original_subtitles=orig_json or trans_json,
+            translated_subtitles=trans_json or orig_json,
+            output_video_path=output_mp4 if has_output else None,
+            created_at=dir_mtime,
+            updated_at=dir_mtime,
+        )
+        db.add(rec_job)
+        recovered += 1
+
+    if recovered > 0:
+        try:
+            db.commit()
+            print(f"[DubbingReconcile] Reconstructed {recovered} dubbing job(s) from disk.")
+        except Exception as e:
+            db.rollback()
+            print(f"[DubbingReconcile] Failed to commit reconstructed jobs: {e}")
+            return 0
+    return recovered
+
+
+def _get_accessible_dubbing_job(db: Session, job_id: str, current_user: User) -> VideoDubbingJob:
+    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
+    if not job and current_user.is_admin:
+        reconcile_dubbing_jobs_from_disk(db, fallback_user_id=current_user.id)
+        job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    if job.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    return job
+
+
 def _format_dubbing_job_response(job: VideoDubbingJob) -> VideoDubbingJobResponse:
-    orig_subs = []
-    if job.original_subtitles:
-        try:
-            orig_subs = json.loads(job.original_subtitles)
-        except Exception:
-            pass
+    orig_subs = _sanitize_subtitle_segments(job.original_subtitles)
+    trans_subs = _sanitize_subtitle_segments(job.translated_subtitles)
 
-    trans_subs = []
-    if job.translated_subtitles:
-        try:
-            trans_subs = json.loads(job.translated_subtitles)
-        except Exception:
-            pass
+    job_dir = os.path.join(settings.dubbing_dir, job.id)
+    disk_output = os.path.join(job_dir, "output_dubbed.mp4")
+    resolved_output = job.output_video_path
+    if (not resolved_output or not os.path.exists(resolved_output)) and os.path.exists(disk_output):
+        resolved_output = disk_output
 
-    has_output = bool(job.status == "completed" or (job.output_video_path and os.path.exists(job.output_video_path)))
+    disk_input = os.path.join(job_dir, "input_video.mp4")
+    resolved_input = job.input_file_path
+    if (not resolved_input or not os.path.exists(resolved_input)) and os.path.exists(disk_input):
+        resolved_input = disk_input
+
+    disk_vocals = os.path.join(job_dir, "vocals.wav")
+    resolved_vocals = job.vocals_audio_path
+    if (not resolved_vocals or not os.path.exists(resolved_vocals)) and os.path.exists(disk_vocals):
+        resolved_vocals = disk_vocals
+
+    disk_bgm = os.path.join(job_dir, "bgm.wav")
+    resolved_bgm = job.bgm_audio_path
+    if (not resolved_bgm or not os.path.exists(resolved_bgm)) and os.path.exists(disk_bgm):
+        resolved_bgm = disk_bgm
+
+    has_output = bool(
+        (resolved_output and os.path.exists(resolved_output) and os.path.getsize(resolved_output) > 0)
+        or job.status == "completed"
+    )
     output_video_url = f"/v1/video-dubbing/jobs/{job.id}/output" if has_output else None
-    has_source_video = bool(job.input_file_path and os.path.exists(job.input_file_path) and os.path.getsize(job.input_file_path) > 0)
+    has_source_video = bool(resolved_input and os.path.exists(resolved_input) and os.path.getsize(resolved_input) > 0)
+
+    raw_vocal_vol = getattr(job, "vocals_volume", None)
+    raw_bgm_vol = getattr(job, "bgm_volume", None)
+    now_utc = datetime.utcnow()
+    created_dt = job.created_at or now_utc
+    updated_dt = job.updated_at or created_dt
 
     return VideoDubbingJobResponse(
         id=job.id,
-        status=job.status,
-        progress=job.progress,
+        status=job.status or "queued",
+        progress=int(job.progress or 0),
         message=job.message,
-        source_type=job.source_type,
+        source_type=job.source_type or "upload",
         source_url=job.source_url,
         video_title=getattr(job, "video_title", None),
         video_thumbnail=getattr(job, "video_thumbnail", None),
         video_duration=getattr(job, "video_duration", None),
         preferred_quality=getattr(job, "preferred_quality", None) or "1080p",
         has_source_video=has_source_video,
-        target_language=job.target_language,
+        target_language=job.target_language or "Vietnamese",
         llm_profile_id=getattr(job, "llm_profile_id", None),
         original_subtitles=orig_subs,
         translated_subtitles=trans_subs,
-        vocals_audio_path=job.vocals_audio_path,
-        bgm_audio_path=job.bgm_audio_path,
-        vocals_volume=getattr(job, "vocals_volume", 1.0) or 1.0,
-        bgm_volume=getattr(job, "bgm_volume", 0.4) or 0.4,
+        vocals_audio_path=resolved_vocals,
+        bgm_audio_path=resolved_bgm,
+        vocals_volume=float(raw_vocal_vol) if raw_vocal_vol is not None else 1.0,
+        bgm_volume=float(raw_bgm_vol) if raw_bgm_vol is not None else 0.4,
         output_video_url=output_video_url,
         error_message=job.error_message,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
+        created_at=created_dt,
+        updated_at=updated_dt,
     )
 
 
@@ -950,9 +1140,7 @@ def retry_dubbing_job(
     current_user: User = Depends(get_user_or_api_key),
 ):
     """Thử lại tải video YouTube hoặc khởi chạy lại pipeline cho tác vụ bị lỗi/gián đoạn."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
 
     if job.status not in ["failed", "downloading", "queued", "separating_audio", "transcribing"]:
         raise HTTPException(status_code=400, detail="Chỉ có thể thử lại tác vụ đang lỗi hoặc bị kẹt ở bước tải/tách âm thanh/nhận diện.")
@@ -1027,9 +1215,7 @@ def get_dubbing_log(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Retrieve the consolidated process/diagnostic log for a video dubbing job."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
     
     log_path = os.path.join(settings.dubbing_dir, job_id, "process.log")
     if not os.path.exists(log_path):
@@ -1084,12 +1270,7 @@ async def create_dubbing_job(
             )
 
     if uploaded_job_id:
-        job = db.query(VideoDubbingJob).filter(
-            VideoDubbingJob.id == uploaded_job_id,
-            VideoDubbingJob.user_id == current_user.id
-        ).first()
-        if not job:
-            raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ tải lên trước đó.")
+        job = _get_accessible_dubbing_job(db, uploaded_job_id, current_user)
         
         job.target_language = target_language
         if llm_profile_id:
@@ -1168,7 +1349,11 @@ def list_dubbing_jobs(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Lấy danh sách tất cả các tác vụ lồng tiếng của người dùng."""
-    query = db.query(VideoDubbingJob).filter(VideoDubbingJob.user_id == current_user.id)
+    if current_user.is_admin:
+        reconcile_dubbing_jobs_from_disk(db, fallback_user_id=current_user.id)
+        query = db.query(VideoDubbingJob)
+    else:
+        query = db.query(VideoDubbingJob).filter(VideoDubbingJob.user_id == current_user.id)
     if status and status != "all":
         query = query.filter(VideoDubbingJob.status == status)
         
@@ -1189,9 +1374,7 @@ def get_dubbing_job(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Lấy thông tin tiến độ và phụ đề của tác vụ lồng tiếng."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
     
     # Auto-recovery: If job is stuck in 'translating' for more than 60 seconds and original_subtitles is already available,
     # auto-advance it to awaiting_review so the user can immediately review and edit!
@@ -1219,9 +1402,7 @@ def retry_dubbing_translation(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Dịch lại phụ đề cho tác vụ lồng tiếng với profile LLM chỉ định hoặc dùng bản fallback."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
 
     if not job.original_subtitles:
         raise HTTPException(status_code=400, detail="Chưa có dữ liệu phụ đề gốc từ bước nhận diện Whisper ASR.")
@@ -1272,9 +1453,7 @@ def reseparate_audio_job(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Tách lại âm thanh Vocals và BGM cho tác vụ hiện tại."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
 
     job_dir = os.path.join(settings.dubbing_dir, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -1310,9 +1489,7 @@ def delete_dubbing_job(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Xóa một tác vụ lồng tiếng và dọn dẹp các tệp liên quan."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
         
     # Dọn dẹp thư mục lưu trữ cục bộ nếu có
     try:
@@ -1334,9 +1511,7 @@ def update_dubbing_subtitles(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Cập nhật bản dịch hoặc phụ đề gốc sau khi người dùng chỉnh sửa."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
 
     if payload.original_subtitles is not None:
         job.original_subtitles = json.dumps([s.model_dump() for s in payload.original_subtitles])
@@ -1356,9 +1531,7 @@ def finalize_dubbing_job(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Xác nhận phụ đề và tiến hành lồng tiếng TTS, trộn nhạc nền và xuất video."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
 
     if job.status not in ["awaiting_review", "failed"]:
         raise HTTPException(status_code=400, detail="Trạng thái tác vụ không hợp lệ để hoàn tất.")
@@ -1516,9 +1689,7 @@ def re_edit_dubbing_job(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Mở khóa tác vụ lồng tiếng để quay lại Step 3 (Biên tập phụ đề và bộ trộn)."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
     
     job.status = "awaiting_review"
     job.error_message = None
@@ -1536,9 +1707,7 @@ def shorten_subtitle_segment(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Rút gọn một phân đoạn phụ đề bằng AI để vừa khít thời lượng chỉ định."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
 
     profile_id = payload.llm_profile_id or job.llm_profile_id
     target_lang = payload.target_language or job.target_language or "Vietnamese"
@@ -1574,9 +1743,7 @@ def remix_dubbed_video(
     Trộn lại âm thanh và đóng gói lại video siêu tốc (2-3 giây) bằng FFmpeg
     sử dụng track dubbed_vocals.wav đã sinh và áp dụng Auto-Ducking mới.
     """
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
 
     job_dir = os.path.join(settings.dubbing_dir, job_id)
     dubbed_vocal_path = os.path.join(job_dir, "dubbed_vocals.wav")
@@ -1609,17 +1776,24 @@ def remix_dubbed_video(
         raise HTTPException(status_code=400, detail="Không tìm thấy tệp vocal lồng tiếng để hòa âm lại. Vui lòng bấm 'Lồng Tiếng Lại' để tổng hợp giọng đọc.")
 
     output_video_path = os.path.join(job_dir, "output_dubbed.mp4")
-    vocal_v = payload.vocals_volume if payload.vocals_volume is not None else (job.vocals_volume or 1.0)
-    bgm_v = payload.bgm_volume if payload.bgm_volume is not None else (job.bgm_volume or 0.35)
+    vocal_v = payload.vocals_volume if payload.vocals_volume is not None else (job.vocals_volume if job.vocals_volume is not None else 1.0)
+    bgm_v = payload.bgm_volume if payload.bgm_volume is not None else (job.bgm_volume if job.bgm_volume is not None else 0.35)
 
     job.vocals_volume = vocal_v
     job.bgm_volume = bgm_v
     db.commit()
 
+    src_video = job.input_file_path
+    if not src_video or not os.path.exists(src_video):
+        src_video = os.path.join(job_dir, "input_video.mp4")
+    src_bgm = job.bgm_audio_path
+    if (not src_bgm or not os.path.exists(src_bgm)) and os.path.exists(os.path.join(job_dir, "bgm.wav")):
+        src_bgm = os.path.join(job_dir, "bgm.wav")
+
     VideoDubbingService.log_to_job(job_id, f"[REMIX] Hòa âm lại siêu tốc: Vocals={vocal_v}, BGM={bgm_v} với Auto-Ducking...")
     VideoDubbingService.mix_and_mux_video(
-        video_path=job.input_file_path,
-        bgm_path=job.bgm_audio_path,
+        video_path=src_video,
+        bgm_path=src_bgm,
         vocal_path=dubbed_vocal_path,
         output_path=output_video_path,
         vocal_vol=vocal_v,
@@ -1641,6 +1815,13 @@ def remix_dubbed_video(
         "output_video_url": f"/v1/video-dubbing/jobs/{job.id}/output?t={int(time.time())}"
     }
 
+_ASSET_FALLBACK_FILENAMES = {
+    "input_file_path": "input_video.mp4",
+    "vocals_audio_path": "vocals.wav",
+    "bgm_audio_path": "bgm.wav",
+    "output_video_path": "output_dubbed.mp4",
+}
+
 def _resolve_owned_dubbing_asset(
     job_id: str,
     path_attr: str,
@@ -1650,11 +1831,23 @@ def _resolve_owned_dubbing_asset(
 ) -> str:
     """Verify job existence, caller ownership/admin role, and dubbing directory containment."""
     job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
+    if not job and current_user.is_admin:
+        reconcile_dubbing_jobs_from_disk(db, fallback_user_id=current_user.id)
+        job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
     if job.user_id != current_user.id and not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Bạn không có quyền truy cập tài nguyên lồng tiếng này.")
     file_path = getattr(job, path_attr, None)
+    if (not file_path or not os.path.exists(file_path)) and path_attr in _ASSET_FALLBACK_FILENAMES:
+        candidate = os.path.join(settings.dubbing_dir, job_id, _ASSET_FALLBACK_FILENAMES[path_attr])
+        if os.path.exists(candidate):
+            file_path = candidate
+            setattr(job, path_attr, candidate)
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail=not_found_msg)
     try:
@@ -1671,41 +1864,128 @@ def get_original_video(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key),
 ):
-    """Tải xuống hoặc stream video gốc."""
+    """Tải xuống hoặc stream video gốc (tự động đảm bảo MP4 faststart để load tức thì)."""
     safe_path = _resolve_owned_dubbing_asset(job_id, "input_file_path", "Không tìm thấy video gốc.", db, current_user)
+    safe_path = VideoDubbingService.ensure_playable_mp4_inplace(safe_path, transcode_non_h264=False)
     if download:
-        return FileResponse(safe_path, media_type="video/mp4", filename=f"youtube_{job_id}.mp4", content_disposition_type="attachment")
-    return FileResponse(safe_path, media_type="video/mp4", content_disposition_type="inline")
+        return FileResponse(
+            safe_path,
+            media_type="video/mp4",
+            filename=f"youtube_{job_id}.mp4",
+            content_disposition_type="attachment",
+            headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
+        )
+    return FileResponse(
+        safe_path,
+        media_type="video/mp4",
+        content_disposition_type="inline",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"},
+    )
 
 
 @router.get("/jobs/{job_id}/vocals")
 def get_separated_vocals(
     job_id: str,
+    preview: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key),
 ):
     """Tải xuống hoặc nghe track giọng nói gốc sau khi tách."""
     safe_path = _resolve_owned_dubbing_asset(job_id, "vocals_audio_path", "Không tìm thấy tệp giọng nói gốc.", db, current_user)
-    return FileResponse(safe_path, media_type="audio/wav", content_disposition_type="inline")
+    if preview:
+        prev_path, prev_mime = VideoDubbingService.ensure_preview_audio(safe_path)
+        prev_safe = ensure_within_directory(settings.dubbing_dir, prev_path)
+        return FileResponse(
+            prev_safe,
+            media_type=prev_mime,
+            content_disposition_type="inline",
+            headers={"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"},
+        )
+    return FileResponse(
+        safe_path,
+        media_type="audio/wav",
+        content_disposition_type="inline",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"},
+    )
 
 
 @router.get("/jobs/{job_id}/bgm")
 def get_separated_bgm(
     job_id: str,
+    preview: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key),
 ):
     """Tải xuống hoặc nghe track nhạc nền gốc sau khi tách."""
     safe_path = _resolve_owned_dubbing_asset(job_id, "bgm_audio_path", "Không tìm thấy tệp nhạc nền gốc.", db, current_user)
-    return FileResponse(safe_path, media_type="audio/wav", content_disposition_type="inline")
+    if preview:
+        prev_path, prev_mime = VideoDubbingService.ensure_preview_audio(safe_path)
+        prev_safe = ensure_within_directory(settings.dubbing_dir, prev_path)
+        return FileResponse(
+            prev_safe,
+            media_type=prev_mime,
+            content_disposition_type="inline",
+            headers={"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"},
+        )
+    return FileResponse(
+        safe_path,
+        media_type="audio/wav",
+        content_disposition_type="inline",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.get("/jobs/{job_id}/dubbed-audio")
+def get_dubbed_audio_track(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
+):
+    """Phát track âm thanh lồng tiếng thành phẩm (dubbed_vocals.wav) hoặc vocals gốc cho trình phát Lịch sử."""
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
+    job_dir = ensure_within_directory(settings.dubbing_dir, os.path.join(settings.dubbing_dir, job.id))
+    candidates = [
+        os.path.join(job_dir, "dubbed_vocals.wav"),
+        job.vocals_audio_path or "",
+        os.path.join(job_dir, "vocals.wav"),
+        job.original_audio_path or "",
+        os.path.join(job_dir, "original_audio.wav"),
+    ]
+    for cand in candidates:
+        if cand and os.path.exists(cand) and os.path.getsize(cand) > 128:
+            safe_cand = ensure_within_directory(settings.dubbing_dir, cand)
+            return FileResponse(
+                safe_cand,
+                media_type="audio/wav",
+                filename=f"dubbing_audio_{job_id}.wav",
+                content_disposition_type="inline",
+                headers={"Accept-Ranges": "bytes", "Cache-Control": "no-cache"},
+            )
+    raise HTTPException(status_code=404, detail="Chưa có tệp âm thanh cho dự án lồng tiếng này.")
 
 
 @router.get("/jobs/{job_id}/output")
 def get_dubbed_video(
     job_id: str,
+    download: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key),
 ):
-    """Tải xuống hoặc stream video lồng tiếng thành phẩm."""
+    """Tải xuống hoặc stream video lồng tiếng thành phẩm (tự động chuẩn hóa H.264 + faststart)."""
     safe_path = _resolve_owned_dubbing_asset(job_id, "output_video_path", "Không tìm thấy video lồng tiếng thành phẩm.", db, current_user)
-    return FileResponse(safe_path, media_type="video/mp4", filename=f"dubbed_{job_id}.mp4", content_disposition_type="inline")
+    safe_path = VideoDubbingService.ensure_playable_mp4_inplace(safe_path, transcode_non_h264=True)
+    if download:
+        return FileResponse(
+            safe_path,
+            media_type="video/mp4",
+            filename=f"dubbed_{job_id}.mp4",
+            content_disposition_type="attachment",
+            headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
+        )
+    return FileResponse(
+        safe_path,
+        media_type="video/mp4",
+        filename=f"dubbed_{job_id}.mp4",
+        content_disposition_type="inline",
+        headers={"Accept-Ranges": "bytes", "Cache-Control": "no-cache"},
+    )

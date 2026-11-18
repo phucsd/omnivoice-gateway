@@ -98,33 +98,70 @@ def get_tts_job(job_id: str, db: Session = Depends(get_db), current_user: User =
 
 @router.get("/{job_id}/audio")
 def get_tts_audio(job_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_user_or_api_key)):
-    """Serves the completed TTS generated WAV file using FileResponse."""
-    job = db.query(TTSJob).filter(TTSJob.id == job_id, TTSJob.user_id == current_user.id).first()
-    if not job:
+    """Serves the completed TTS generated WAV file using FileResponse (with self-healing fallback for dubbing sub-jobs)."""
+    job = db.query(TTSJob).filter(TTSJob.id == job_id).first()
+    if not job or (job.user_id != current_user.id and not current_user.is_admin):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Không tìm thấy TTS Job {job_id}"
         )
-        
-    if job.status != "completed" or not job.output_audio_path:
+
+    audio_path = job.output_audio_path
+    needs_dubbing_recovery = (
+        not audio_path
+        or audio_path.lower().endswith(".zip")
+        or not os.path.exists(audio_path)
+    )
+    if needs_dubbing_recovery and job_id.startswith(("dub_", "sep_", "asr_")):
+        dub_id = os.path.basename(job_id.split("_", 1)[1])
+        dub_dir = os.path.join(settings.dubbing_dir, dub_id)
+        candidates = []
+        if job_id.startswith("dub_"):
+            candidates = [
+                os.path.join(dub_dir, "dubbed_vocals.wav"),
+                os.path.join(dub_dir, "vocals.wav"),
+            ]
+        elif job_id.startswith("sep_"):
+            candidates = [
+                os.path.join(dub_dir, "vocals.wav"),
+                os.path.join(dub_dir, "original_audio.wav"),
+            ]
+        else:
+            candidates = [
+                job.ref_audio_path or "",
+                os.path.join(dub_dir, "vocals.wav"),
+            ]
+        for cand in candidates:
+            if cand and os.path.exists(cand) and os.path.getsize(cand) > 128:
+                audio_path = cand
+                job.output_audio_path = cand
+                if getattr(job, "cdn_audio_url", None):
+                    job.cdn_audio_url = None
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                break
+
+    if job.status != "completed" and not (audio_path and os.path.exists(audio_path)):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Tệp âm thanh TTS chưa hoàn tất hoặc không tồn tại."
         )
-        
-    if not os.path.exists(job.output_audio_path):
+
+    if not audio_path or not os.path.exists(audio_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Tệp âm thanh không tồn tại trên máy chủ."
         )
-        
+
     return FileResponse(
-        job.output_audio_path,
+        audio_path,
         media_type="audio/wav",
         filename=f"tts_{job_id}.wav",
         content_disposition_type="inline",
         headers={
-            "Cache-Control": "public, max-age=86400",
+            "Cache-Control": "private, max-age=3600",
             "Accept-Ranges": "bytes"
         }
     )

@@ -130,17 +130,26 @@ if resolved_db_url.startswith("sqlite"):
         # Override the setting globally so all routes and services use the working database path
         settings.DATABASE_URL = resolved_db_url
 
-# Cleanup stale SQLite WAL/SHM lock files on start to prevent disk I/O errors on network drives
+# Safely checkpoint any existing WAL frames into main DB before switching to DELETE journal mode
 if settings.DATABASE_URL.startswith("sqlite"):
     db_path = get_sqlite_path(settings.DATABASE_URL)
-    for suffix in ["-shm", "-wal"]:
-        lock_file = db_path + suffix
-        if os.path.exists(lock_file):
-            try:
-                os.remove(lock_file)
-                print(f"[Database] Removed stale lock file: {lock_file}")
-            except Exception as e:
-                print(f"[Database Error] Failed to remove lock file {lock_file}: {e}")
+    if os.path.exists(db_path) and (os.path.exists(db_path + "-wal") or os.path.exists(db_path + "-shm")):
+        try:
+            _ckpt_conn = sqlite3.connect(db_path, timeout=15)
+            _ckpt_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            _ckpt_conn.execute("PRAGMA journal_mode=DELETE")
+            _ckpt_conn.commit()
+            _ckpt_conn.close()
+            print(f"[Database] Checkpointed WAL cleanly for: {db_path}")
+        except Exception as e:
+            print(f"[Database Warning] WAL checkpoint fallback for {db_path}: {e}")
+            for suffix in ["-shm", "-wal"]:
+                lock_file = db_path + suffix
+                if os.path.exists(lock_file):
+                    try:
+                        os.remove(lock_file)
+                    except Exception:
+                        pass
 
 # For SQLite, we set timeout=60 and check_same_thread=False
 connect_args = {}
@@ -288,10 +297,10 @@ def auto_align_legacy_user_ids(db_url: str):
         if row:
             admin_id = row[0]
             orphan_cond = "user_id IS NULL OR user_id = '' OR user_id NOT IN (SELECT id FROM users)"
-            cursor.execute(f"UPDATE voice_samples SET user_id = ? WHERE {orphan_cond}", (admin_id,))
-            cursor.execute(f"UPDATE api_keys SET user_id = ? WHERE {orphan_cond}", (admin_id,))
-            cursor.execute(f"UPDATE tts_jobs SET user_id = ? WHERE {orphan_cond}", (admin_id,))
-            cursor.execute(f"UPDATE user_settings SET user_id = ? WHERE {orphan_cond}", (admin_id,))
+            for tbl in ("voice_samples", "api_keys", "tts_jobs", "user_settings", "video_dubbing_jobs", "voice_design_previews"):
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (tbl,))
+                if cursor.fetchone():
+                    cursor.execute(f"UPDATE {tbl} SET user_id = ? WHERE {orphan_cond}", (admin_id,))
             conn.commit()
             print(f"[Database Auto-Align] Aligned orphaned legacy records to admin ID: {admin_id}")
     except Exception as e:

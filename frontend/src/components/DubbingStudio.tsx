@@ -45,6 +45,8 @@ import { SectionCard } from "./ui/SectionCard";
 
 interface DubbingStudioProps {
   currentUser?: { id: string; username: string; is_admin: boolean } | null;
+  initialJobIdProp?: string | null;
+  onInitialJobConsumed?: () => void;
 }
 
 interface ProxyTestResult {
@@ -90,7 +92,11 @@ function formatDuration(seconds?: number | null): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
+export default function DubbingStudio({
+  currentUser,
+  initialJobIdProp,
+  onInitialJobConsumed,
+}: DubbingStudioProps) {
   const isAdmin = Boolean(currentUser?.is_admin);
   // Navigation / Multi-project states: 'create' | 'workspace' | 'list'
   const [viewMode, setViewMode] = useState<"create" | "workspace" | "list">(() => {
@@ -147,6 +153,7 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
     return localStorage.getItem("active_dubbing_job_id") || null;
   });
   const [job, setJob] = useState<VideoDubbingJobResponse | null>(null);
+  const [loadingJobDetails, setLoadingJobDetails] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -232,20 +239,68 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
   const [proxyTestResults, setProxyTestResults] = useState<Record<string, ProxyTestResult>>({});
   const [proxyPoolMsg, setProxyPoolMsg] = useState<string | null>(null);
 
+  const applyJobState = useCallback((data: VideoDubbingJobResponse) => {
+    setJob(data);
+    if (data.preferred_quality) setRetryQuality(data.preferred_quality);
+    if (typeof data.vocals_volume === "number") setVocalsVolume(Math.min(1, Math.max(0, data.vocals_volume)));
+    if (typeof data.bgm_volume === "number") setBgmVolume(Math.min(1, Math.max(0, data.bgm_volume)));
+    setOriginalSubs(Array.isArray(data.original_subtitles) ? data.original_subtitles : []);
+    setTranslatedSubs(Array.isArray(data.translated_subtitles) ? data.translated_subtitles : []);
+  }, []);
+
   const fetchAllJobs = useCallback(async (showLoading = false) => {
     if (showLoading) setLoadingAllJobs(true);
     try {
       const res = await api.listDubbingJobs(1, 100);
-      setAllJobs(res.jobs || []);
+      const jobsList = Array.isArray(res.jobs) ? res.jobs : [];
+      setAllJobs(jobsList);
 
-      // Auto-populate openJobTabs with actively running jobs (exclude uploaded drafts)
+      const validIds = new Set(jobsList.map(j => j.id));
+
+      // Prune deleted/stale tabs and auto-populate active + newest project tabs
       setOpenJobTabs(prev => {
-        const runningIds = (res.jobs || [])
+        const surviving = prev.filter(id => validIds.has(id));
+        const activeIds = jobsList
           .filter(j => j.status !== "completed" && j.status !== "failed" && j.status !== "uploaded")
           .map(j => j.id);
-        const merged = Array.from(new Set([...prev, ...runningIds]));
+        let merged = Array.from(new Set([...surviving, ...activeIds]));
+        if (merged.length === 0 && jobsList.length > 0) {
+          merged = [jobsList[0].id];
+        }
         localStorage.setItem("open_dubbing_job_tabs", JSON.stringify(merged));
         return merged;
+      });
+
+      // Keep active workspace job hydrated or recover from stale localStorage ID
+      setJobId(currId => {
+        if (currId && validIds.has(currId)) {
+          const matched = jobsList.find(j => j.id === currId);
+          if (matched) {
+            setJob(prevJob => {
+              if (!prevJob || prevJob.id !== currId) {
+                setOriginalSubs(Array.isArray(matched.original_subtitles) ? matched.original_subtitles : []);
+                setTranslatedSubs(Array.isArray(matched.translated_subtitles) ? matched.translated_subtitles : []);
+                return matched;
+              }
+              return prevJob;
+            });
+          }
+          return currId;
+        }
+        if (currId && !validIds.has(currId)) {
+          if (jobsList.length > 0) {
+            const fallback = jobsList[0];
+            localStorage.setItem("active_dubbing_job_id", fallback.id);
+            setJob(fallback);
+            setOriginalSubs(Array.isArray(fallback.original_subtitles) ? fallback.original_subtitles : []);
+            setTranslatedSubs(Array.isArray(fallback.translated_subtitles) ? fallback.translated_subtitles : []);
+            return fallback.id;
+          }
+          localStorage.removeItem("active_dubbing_job_id");
+          setJob(null);
+          return null;
+        }
+        return currId;
       });
     } catch (err: unknown) {
       console.error("Lỗi lấy danh sách dự án:", err);
@@ -317,12 +372,15 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
   }, []);
 
   const fetchJobDetails = useCallback(async (id: string) => {
+    setLoadingJobDetails(true);
     try {
       const data = await api.getDubbingJob(id);
-      setJob(data);
-      if (data.preferred_quality) setRetryQuality(data.preferred_quality);
-      if (data.original_subtitles) setOriginalSubs(data.original_subtitles);
-      if (data.translated_subtitles) setTranslatedSubs(data.translated_subtitles);
+      setError(null);
+      applyJobState(data);
+      setAllJobs(prev => {
+        const exists = prev.some(item => item.id === data.id);
+        return exists ? prev.map(item => (item.id === data.id ? data : item)) : [data, ...prev];
+      });
 
       // Fetch logs
       try {
@@ -333,8 +391,45 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
       }
     } catch (err: unknown) {
       console.error("Lỗi lấy thông tin Job:", err);
+      const msg = getErrorMessage(err, "Không thể tải chi tiết dự án lồng tiếng.");
+      setError(`Không thể mở dự án #${id.slice(0, 8)}: ${msg}`);
+    } finally {
+      setLoadingJobDetails(false);
     }
-  }, []);
+  }, [applyJobState]);
+
+  const openProjectInWorkspace = useCallback((targetId: string, cached?: VideoDubbingJobResponse | null) => {
+    if (!targetId) return;
+    setError(null);
+    setSelectedSegId(null);
+    setOpenJobTabs(prev => {
+      const next = prev.includes(targetId) ? prev : [targetId, ...prev];
+      localStorage.setItem("open_dubbing_job_tabs", JSON.stringify(next));
+      return next;
+    });
+    setJobId(targetId);
+    setViewMode("workspace");
+    localStorage.setItem("active_dubbing_job_id", targetId);
+
+    const seed = cached || allJobs.find(j => j.id === targetId) || null;
+    if (seed) {
+      applyJobState(seed);
+    } else {
+      setJob(prev => (prev?.id === targetId ? prev : null));
+      setOriginalSubs([]);
+      setTranslatedSubs([]);
+      setJobLogs("");
+    }
+    setOutputVideoTimestamp(Date.now());
+    setPollRevision(r => r + 1);
+    void fetchJobDetails(targetId);
+  }, [allJobs, applyJobState, fetchJobDetails]);
+
+  useEffect(() => {
+    if (!initialJobIdProp) return;
+    openProjectInWorkspace(initialJobIdProp);
+    onInitialJobConsumed?.();
+  }, [initialJobIdProp, openProjectInWorkspace, onInitialJobConsumed]);
 
   // Restore active job from localStorage on mount & fetch settings & auth statuses
   useEffect(() => {
@@ -1033,9 +1128,7 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
     if (jobId === tabId) {
       if (nextTabs.length > 0) {
         const nextId = nextTabs[0];
-        setJobId(nextId);
-        localStorage.setItem("active_dubbing_job_id", nextId);
-        fetchJobDetails(nextId);
+        openProjectInWorkspace(nextId);
       } else {
         resetState();
       }
@@ -1246,8 +1339,8 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
       const q = jobsSearch.toLowerCase();
       const matchTitle = j.video_title?.toLowerCase().includes(q);
       const matchUrl = j.source_url?.toLowerCase().includes(q);
-      const matchId = j.id.toLowerCase().includes(q);
-      const matchLang = j.target_language.toLowerCase().includes(q);
+      const matchId = (j.id || "").toLowerCase().includes(q);
+      const matchLang = (j.target_language || "").toLowerCase().includes(q);
       return matchTitle || matchUrl || matchId || matchLang;
     }
     return true;
@@ -1378,12 +1471,7 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
                   ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/20"
                   : "bg-secondary/30 text-muted-foreground border-border/50 hover:text-foreground hover:bg-secondary"
               }`}
-              onClick={() => {
-                setJobId(tid);
-                setViewMode("workspace");
-                localStorage.setItem("active_dubbing_job_id", tid);
-                fetchJobDetails(tid);
-              }}
+              onClick={() => openProjectInWorkspace(tid, tabJob)}
             >
               {isRunning && <Loader2 className="w-3 h-3 animate-spin text-primary shrink-0" />}
               {isReview && <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse shrink-0" />}
@@ -1447,8 +1535,8 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
       )}
 
       {/* --- VIEW MODE 2: WORKSPACE (Tiến trình realtime) --- */}
-      {viewMode === "workspace" && jobId && job && (
-        <div className="flex flex-col gap-4">
+      {viewMode === "workspace" && jobId && job && job.id === jobId && (
+        <>
           {/* Workspace Job Top Bar */}
           <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 p-4 bg-card border border-border rounded-2xl shadow-sm">
             <div className="flex items-center gap-3">
@@ -1497,10 +1585,26 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
             </div>
 
             <div className="flex items-center gap-2 w-full sm:w-auto justify-end flex-wrap">
+              {job.status === "completed" && (
+                <a
+                  href={api.getDubbingFileUrl(job.id, "output", true)}
+                  download={`dubbed_${job.id}.mp4`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3.5 py-1.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white text-xs font-bold rounded-xl shadow transition-all flex items-center gap-1.5 cursor-pointer"
+                  title="Tải video MP4 đã lồng tiếng về máy"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Tải Video Lồng Tiếng (MP4)</span>
+                </a>
+              )}
+
               {job.has_source_video && (
                 <a
                   href={api.getDubbingFileUrl(job.id, "video", true)}
                   download={`youtube_${job.id}.mp4`}
+                  target="_blank"
+                  rel="noopener noreferrer"
                   className="px-3 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 text-xs font-bold rounded-xl border border-emerald-500/30 transition-colors flex items-center gap-1.5 cursor-pointer"
                   title="Tải tệp MP4 gốc đã tải về máy"
                 >
@@ -1542,6 +1646,7 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
             </div>
           </div>
 
+          <div className={job.status === "completed" || job.status === "awaiting_review" ? "order-last" : ""}>
           <SectionCard title="Tiến Trình Xử Lý Realtime">
           <div className="flex flex-col gap-4">
             <div className="flex items-center justify-between">
@@ -1805,11 +1910,23 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
             </div>
           </div>
         </SectionCard>
+          </div>
+        </>
+      )}
+
+      {/* Workspace Loading State */}
+      {viewMode === "workspace" && jobId && (!job || job.id !== jobId) && loadingJobDetails && (
+        <div className="p-12 bg-card border border-border rounded-2xl flex flex-col items-center justify-center text-center gap-3 shadow-sm">
+          <Loader2 className="w-8 h-8 text-primary animate-spin" />
+          <div>
+            <h4 className="text-sm font-bold text-foreground">Đang tải nội dung dự án #{jobId.slice(0, 8)}...</h4>
+            <p className="text-xs text-muted-foreground mt-1">Đồng bộ phụ đề, âm thanh và trạng thái mới nhất từ máy chủ.</p>
+          </div>
         </div>
       )}
 
       {/* Workspace Empty State */}
-      {viewMode === "workspace" && (!jobId || !job) && (
+      {viewMode === "workspace" && (!jobId || ((!job || job.id !== jobId) && !loadingJobDetails)) && (
         <div className="p-12 bg-secondary/10 border border-dashed border-border rounded-2xl flex flex-col items-center justify-center text-center gap-3">
           <Film className="w-10 h-10 text-muted-foreground/50" />
           <div>
@@ -1936,7 +2053,8 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
                 return (
                   <div
                     key={j.id}
-                    className="flex flex-col justify-between p-4 bg-card hover:border-primary/50 border border-border rounded-2xl transition-all shadow-sm group"
+                    onClick={() => openProjectInWorkspace(j.id, j)}
+                    className="flex flex-col justify-between p-4 bg-card hover:border-primary/50 border border-border rounded-2xl transition-all shadow-sm group cursor-pointer"
                   >
                     <div className="flex flex-col gap-3">
                       {/* Card Top: Source Icon, ID & Timestamp */}
@@ -1948,7 +2066,7 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
                           <div>
                             <span className="text-[10px] font-mono text-muted-foreground">ID: #{j.id.slice(0, 8)}</span>
                             <span className="block text-[10px] text-muted-foreground">
-                              {new Date(j.created_at).toLocaleString("vi-VN", { dateStyle: "short", timeStyle: "short" })}
+                              {j.created_at ? new Date(j.created_at).toLocaleString("vi-VN", { dateStyle: "short", timeStyle: "short" }) : ""}
                             </span>
                           </div>
                         </div>
@@ -2002,6 +2120,7 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
                             href={j.source_url || ""}
                             target="_blank"
                             rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
                             className="inline-flex items-center gap-1 text-[10px] text-muted-foreground hover:text-red-500 mt-1"
                           >
                             <span>Xem YouTube gốc</span>
@@ -2034,12 +2153,9 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
                     <div className="flex items-center justify-between gap-2 pt-3 mt-3 border-t border-border">
                       <button
                         type="button"
-                        onClick={() => {
-                          setOpenJobTabs(prev => Array.from(new Set([j.id, ...prev])));
-                          setJobId(j.id);
-                          setViewMode("workspace");
-                          localStorage.setItem("active_dubbing_job_id", j.id);
-                          fetchJobDetails(j.id);
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openProjectInWorkspace(j.id, j);
                         }}
                         className="flex-1 py-1.5 px-3 bg-secondary hover:bg-secondary/80 text-foreground font-bold text-xs rounded-xl border border-border transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
                       >
@@ -2049,8 +2165,11 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
 
                       {isCompleted ? (
                         <a
-                          href={api.getDubbingFileUrl(j.id, "output")}
+                          href={api.getDubbingFileUrl(j.id, "output", true)}
                           download={`dubbed_${j.id}.mp4`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={(e) => e.stopPropagation()}
                           className="p-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-xl border border-emerald-500/30 transition-colors"
                           title="Tải video MP4 lồng tiếng"
                         >
@@ -2060,6 +2179,9 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
                         <a
                           href={api.getDubbingFileUrl(j.id, "video", true)}
                           download={`youtube_${j.id}.mp4`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={(e) => e.stopPropagation()}
                           className="p-2 bg-blue-500/10 hover:bg-blue-500/20 text-blue-600 dark:text-blue-400 rounded-xl border border-blue-500/30 transition-colors"
                           title="Tải video gốc MP4"
                         >
@@ -2069,7 +2191,10 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
 
                       <button
                         type="button"
-                        onClick={() => handleDeleteJob(j.id)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleDeleteJob(j.id);
+                        }}
                         className="p-2 hover:bg-destructive/10 text-muted-foreground hover:text-destructive rounded-xl transition-colors cursor-pointer"
                         title="Xóa dự án này"
                       >
@@ -2105,13 +2230,7 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
                       <button
                         key={rj.id}
                         type="button"
-                        onClick={() => {
-                          setOpenJobTabs(prev => Array.from(new Set([rj.id, ...prev])));
-                          setJobId(rj.id);
-                          setViewMode("workspace");
-                          localStorage.setItem("active_dubbing_job_id", rj.id);
-                          fetchJobDetails(rj.id);
-                        }}
+                        onClick={() => openProjectInWorkspace(rj.id, rj)}
                         className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all flex items-center gap-1.5 cursor-pointer ${
                           isRev
                             ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/20 animate-pulse"
@@ -2551,7 +2670,7 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
       )}
 
       {/* --- STEP 3: SUBTITLE REVIEW & EDIT STUDIO --- */}
-      {viewMode === "workspace" && jobId && job && job.status === "awaiting_review" && (
+      {viewMode === "workspace" && jobId && job && job.id === jobId && job.status === "awaiting_review" && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           
           {/* Left: Video Player & Audio Controls */}
@@ -2562,6 +2681,8 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
                   ref={videoPlayerRef}
                   src={api.getDubbingFileUrl(jobId, "video")}
                   controls
+                  playsInline
+                  preload="metadata"
                   muted={Boolean(job.vocals_audio_path || job.bgm_audio_path)}
                   onPlay={handleVideoPlay}
                   onPause={handleVideoPause}
@@ -2575,10 +2696,10 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
                 />
                 
                 {job.vocals_audio_path && (
-                  <audio ref={vocalsPlayerRef} src={api.getDubbingFileUrl(jobId, "vocals")} preload="auto" />
+                  <audio ref={vocalsPlayerRef} src={api.getDubbingFileUrl(jobId, "vocals", false, true)} preload="metadata" />
                 )}
                 {job.bgm_audio_path && (
-                  <audio ref={bgmPlayerRef} src={api.getDubbingFileUrl(jobId, "bgm")} preload="auto" />
+                  <audio ref={bgmPlayerRef} src={api.getDubbingFileUrl(jobId, "bgm", false, true)} preload="metadata" />
                 )}
               </div>
 
@@ -2925,7 +3046,7 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
       )}
 
       {/* --- STEP 5: FINAL OUTPUT PREVIEW & DOWNLOAD --- */}
-      {viewMode === "workspace" && jobId && job && job.status === "completed" && (
+      {viewMode === "workspace" && jobId && job && job.id === jobId && job.status === "completed" && (
         <SectionCard title="Hoàn Tất Lồng Tiếng Video!">
           <div className="flex flex-col items-center gap-6 text-center max-w-3xl mx-auto py-4">
             <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-500">
@@ -2941,17 +3062,21 @@ export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
 
             <div className="aspect-video w-full max-w-2xl rounded-2xl overflow-hidden bg-black border border-border shadow-xl">
               <video
-                key={`dubbed_video_${outputVideoTimestamp}`}
-                src={`${api.getDubbingFileUrl(jobId, "output")}&v=${outputVideoTimestamp}`}
+                key={`dubbed_video_${jobId}_${outputVideoTimestamp}`}
+                src={api.getDubbingFileUrl(jobId, "output", false, false, outputVideoTimestamp)}
                 controls
+                playsInline
+                preload="metadata"
                 className="w-full h-full object-contain"
               />
             </div>
 
             <div className="flex flex-wrap gap-3 justify-center">
               <a
-                href={api.getDubbingFileUrl(jobId, "output")}
+                href={api.getDubbingFileUrl(jobId, "output", true)}
                 download={`dubbed_video_${jobId}.mp4`}
+                target="_blank"
+                rel="noopener noreferrer"
                 className="px-4 py-2.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs rounded-xl transition-all shadow-md flex items-center gap-2 cursor-pointer"
               >
                 <Download className="w-4 h-4" />

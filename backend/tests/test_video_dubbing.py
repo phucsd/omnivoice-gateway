@@ -705,3 +705,130 @@ def test_remote_bridge_r2_cache_and_anti_recursion(tmp_path, monkeypatch):
     assert poll_state["count"] == 2
 
 
+def test_dubbing_output_download_preview_stems_disk_reconcile_and_history_playback(tmp_path, monkeypatch):
+    import secrets
+    from app.config import settings
+    from app.database import SessionLocal
+    from app.models import TTSJob, User, VideoDubbingJob
+    from app.services.audio_service import AudioService
+    from app.utils.auth import create_access_token, get_password_hash
+
+    monkeypatch.setattr(settings, "STORAGE_DIR", str(tmp_path))
+
+    db = SessionLocal()
+    try:
+        admin = db.query(User).filter(User.username == "dub_reg_admin").first()
+        if not admin:
+            admin = User(
+                id="usr_dub_reg_admin",
+                username="dub_reg_admin",
+                email="dub_reg_admin@example.com",
+                hashed_password=get_password_hash("TestPass123!"),
+                is_verified=True,
+                is_approved=True,
+                is_admin=True,
+                api_key=f"ovg_live_{secrets.token_hex(16)}",
+            )
+            db.add(admin)
+            db.commit()
+    finally:
+        db.close()
+
+    admin_headers = {"Authorization": f"Bearer {create_access_token(data={'sub': 'dub_reg_admin'})}"}
+
+    # 1. Create an orphaned vd_* folder on disk (no DB row yet) + legacy sep_/dub_ rows pointing to deleted .zip
+    orphan_id = "vd_a1b2c3d4"
+    job_dir = os.path.join(settings.dubbing_dir, orphan_id)
+    os.makedirs(job_dir, exist_ok=True)
+    vocals_wav = os.path.join(job_dir, "vocals.wav")
+    bgm_wav = os.path.join(job_dir, "bgm.wav")
+    dubbed_wav = os.path.join(job_dir, "dubbed_vocals.wav")
+    output_mp4 = os.path.join(job_dir, "output_dubbed.mp4")
+
+    AudioService.generate_mock_wav(vocals_wav, duration=1.0, freq=440.0)
+    AudioService.generate_mock_wav(bgm_wav, duration=1.0, freq=220.0)
+    AudioService.generate_mock_wav(dubbed_wav, duration=1.0, freq=520.0)
+    with open(output_mp4, "wb") as f:
+        f.write(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 4096)
+    with open(os.path.join(job_dir, "process.log"), "w", encoding="utf-8") as lf:
+        lf.write("[2026-11-18 06:21:09] Tải video thành công: 'Recovered Dental Video'.\n")
+
+    db = SessionLocal()
+    try:
+        db.add(
+            TTSJob(
+                id=f"dub_{orphan_id}",
+                user_id="usr_dub_reg_admin",
+                job_type="dub_segments",
+                text=json.dumps([{"id": 1, "start": 0.0, "end": 1.0, "text": "Xin chào các bạn"}]),
+                status="completed",
+                progress=100,
+                output_audio_path=os.path.join(job_dir, f"dub_{orphan_id}.zip"),  # deleted zip!
+                cdn_audio_url="https://broken-cdn.example/dub_zip_disguised.wav",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    # 2. Admin listing automatically reconstructs the missing VideoDubbingJob from disk
+    list_res = client.get("/v1/video-dubbing/jobs", headers=admin_headers)
+    assert list_res.status_code == 200, list_res.text
+    found = [j for j in list_res.json()["jobs"] if j["id"] == orphan_id]
+    assert len(found) == 1
+    assert found[0]["status"] == "completed"
+    assert found[0]["video_title"] == "Recovered Dental Video"
+
+    # 3. Malformed subtitle entries or null timestamps must never crash GET /jobs/{id}
+    db = SessionLocal()
+    try:
+        vd_row = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == orphan_id).first()
+        vd_row.translated_subtitles = json.dumps([{"id": "1", "start": None, "end": "2.5", "text": None}, "bad_item"])
+        vd_row.bgm_volume = 0.0
+        db.commit()
+    finally:
+        db.close()
+
+    detail_res = client.get(f"/v1/video-dubbing/jobs/{orphan_id}", headers=admin_headers)
+    assert detail_res.status_code == 200, detail_res.text
+    detail_json = detail_res.json()
+    assert detail_json["bgm_volume"] == 0.0
+    assert len(detail_json["translated_subtitles"]) == 1
+    assert detail_json["translated_subtitles"][0]["text"] == ""
+
+    # 4. Output video supports both inline playback and attachment download
+    out_inline = client.get(f"/v1/video-dubbing/jobs/{orphan_id}/output", headers=admin_headers)
+    assert out_inline.status_code == 200
+    assert "inline" in out_inline.headers.get("content-disposition", "").lower()
+    assert out_inline.headers.get("accept-ranges") == "bytes"
+
+    out_dl = client.get(f"/v1/video-dubbing/jobs/{orphan_id}/output?download=1", headers=admin_headers)
+    assert out_dl.status_code == 200
+    assert "attachment" in out_dl.headers.get("content-disposition", "").lower()
+
+    # 5. Preview stem endpoint returns valid audio (compressed M4A when ffmpeg present, WAV fallback otherwise)
+    voc_prev = client.get(f"/v1/video-dubbing/jobs/{orphan_id}/vocals?preview=1", headers=admin_headers)
+    assert voc_prev.status_code == 200
+    assert len(voc_prev.content) > 100
+
+    # 6. History -> Video Dubbing tab returns clean project item & working audio playback (self-healed!)
+    hist_res = client.get("/v1/jobs?page=1&page_size=20&job_type=video_dubbing", headers=admin_headers)
+    assert hist_res.status_code == 200, hist_res.text
+    hist_items = hist_res.json()["items"]
+    vd_hist = [it for it in hist_items if it["job_id"] == orphan_id]
+    assert len(vd_hist) == 1
+    assert vd_hist[0]["cdn_audio_url"] is None
+    assert vd_hist[0]["audio_url"] == f"/v1/video-dubbing/jobs/{orphan_id}/dubbed-audio"
+    assert vd_hist[0]["params"]["has_output_video"] is True
+
+    dub_audio_res = client.get(vd_hist[0]["audio_url"], headers=admin_headers)
+    assert dub_audio_res.status_code == 200
+    assert len(dub_audio_res.content) > 500
+
+    # Legacy /v1/tts/jobs/dub_<id>/audio also self-heals from deleted .zip to dubbed_vocals.wav
+    legacy_tts_audio = client.get(f"/v1/tts/jobs/dub_{orphan_id}/audio", headers=admin_headers)
+    assert legacy_tts_audio.status_code == 200
+    assert len(legacy_tts_audio.content) > 500
+
+
+

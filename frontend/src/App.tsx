@@ -60,6 +60,7 @@ function App() {
   const [activeTab, setActiveTab] = useState<"workspace" | "voice-lab" | "library" | "history" | "docs" | "admin" | "playground" | "asr" | "dubbing">(() => {
     return window.location.hash === "#/docs" ? "docs" : "workspace";
   });
+  const [pendingDubbingJobId, setPendingDubbingJobId] = useState<string | null>(null);
   
   const [theme, setTheme] = useState<"light" | "dark" | "system">(() => {
     return (localStorage.getItem("theme") as "light" | "dark" | "system") || "dark";
@@ -659,6 +660,11 @@ function App() {
                   globalPlayerPlaying={globalPlayerPlaying}
                   onPlayAudio={handlePlayAudio}
                   onTogglePlay={handleTogglePlay}
+                  onOpenDubbingJob={(dubId) => {
+                    localStorage.setItem("active_dubbing_job_id", dubId);
+                    setPendingDubbingJobId(dubId);
+                    navigateToTab("dubbing");
+                  }}
                 />
               </ErrorBoundary>
             </div>
@@ -699,7 +705,11 @@ function App() {
           {activeTab === "dubbing" && (
             <div className="w-full animate-fadeIn">
               <ErrorBoundary fallbackTitle="Lỗi hiển thị Video Dubbing">
-                <DubbingStudio currentUser={effectiveUser} />
+                <DubbingStudio
+                  currentUser={effectiveUser}
+                  initialJobIdProp={pendingDubbingJobId}
+                  onInitialJobConsumed={() => setPendingDubbingJobId(null)}
+                />
               </ErrorBoundary>
             </div>
           )}

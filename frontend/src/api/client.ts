@@ -1144,11 +1144,24 @@ export const api = {
     });
   },
 
-  getDubbingFileUrl: (jobId: string, type: 'video' | 'vocals' | 'bgm' | 'output', download = false): string => {
+  getDubbingFileUrl: (
+    jobId: string,
+    type: 'video' | 'vocals' | 'bgm' | 'output' | 'dubbed-audio',
+    download = false,
+    preview = false,
+    cacheBust?: number | string
+  ): string => {
     const token = localStorage.getItem("VITE_JWT_TOKEN");
     const baseUrl = getApiBaseUrl();
-    const dlSuffix = download ? "&download=1" : "";
-    return `${baseUrl}/v1/video-dubbing/jobs/${jobId}/${type}?token=${token || ""}${dlSuffix}`;
+    const params = new URLSearchParams();
+    if (token) params.set("token", token);
+    if (download) params.set("download", "1");
+    if (preview) params.set("preview", "1");
+    if (cacheBust !== undefined && cacheBust !== null && cacheBust !== "") {
+      params.set("v", String(cacheBust));
+    }
+    const qs = params.toString();
+    return `${baseUrl}/v1/video-dubbing/jobs/${encodeURIComponent(jobId)}/${type}${qs ? `?${qs}` : ""}`;
   },
 };
 

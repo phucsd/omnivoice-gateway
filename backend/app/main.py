@@ -118,6 +118,8 @@ async def lifespan(app: FastAPI):
                     db.execute(text("UPDATE voice_samples SET user_id = :new_id WHERE user_id = :old_id"), {"new_id": existing_phucsd.id, "old_id": legacy_admin.id})
                     db.execute(text("UPDATE api_keys SET user_id = :new_id WHERE user_id = :old_id"), {"new_id": existing_phucsd.id, "old_id": legacy_admin.id})
                     db.execute(text("UPDATE tts_jobs SET user_id = :new_id WHERE user_id = :old_id"), {"new_id": existing_phucsd.id, "old_id": legacy_admin.id})
+                    db.execute(text("UPDATE video_dubbing_jobs SET user_id = :new_id WHERE user_id = :old_id"), {"new_id": existing_phucsd.id, "old_id": legacy_admin.id})
+                    db.execute(text("UPDATE voice_design_previews SET user_id = :new_id WHERE user_id = :old_id"), {"new_id": existing_phucsd.id, "old_id": legacy_admin.id})
                     db.delete(legacy_admin)
                     existing_phucsd.is_admin = True
                     existing_phucsd.is_approved = True
