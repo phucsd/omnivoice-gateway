@@ -1687,6 +1687,12 @@ def run_finalization_pipeline(job_id: str):
             tgt_lang_key = (job.target_language or "Vietnamese").strip().lower()
             ov_lang = lang_map.get(tgt_lang_key, "vi" if "việt" in tgt_lang_key or "viet" in tgt_lang_key else None)
             should_norm_vi = (ov_lang == "vi")
+            if should_norm_vi:
+                # Replace decimal commas (4,2 -> 4.2) in TTS payload so Qwen3/OmniVoice speaks 'bốn chấm hai' clearly
+                # instead of interpreting 'phẩy' as a mid-sentence comma pause ('4, 2').
+                for item in enriched_segments:
+                    if isinstance(item, dict) and item.get("text"):
+                        item["text"] = re.sub(r'(\d),(\d)', r'\1.\2', str(item["text"]))
             dub_payload_json = json.dumps(enriched_segments, ensure_ascii=False)
 
             # Resolve dubbing voice source:
@@ -1747,6 +1753,8 @@ def run_finalization_pipeline(job_id: str):
                 if chosen_vs:
                     resolved_vs_id = chosen_vs.id
                     resolved_ref_text = (chosen_vs.ref_text or "").strip() or None
+                    job.voice_sample_id = resolved_vs_id
+                    db.commit()
                     VideoDubbingService.log_to_job(
                         job_id,
                         f"[VOICE] Tự động khớp giới tính ({gender}) sang giọng Việt chuẩn bản xứ: '{chosen_vs.name or chosen_vs.id}' ({chosen_vs.id}) — loại bỏ hoàn toàn giọng Tây lơ lớ."

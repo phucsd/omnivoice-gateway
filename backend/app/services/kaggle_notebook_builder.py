@@ -1372,6 +1372,8 @@ def main():
                         is_vi_seg = (job_lang == "vi") or any(ch in vi_diacritics for ch in seg_text.lower())
                         seg_lang = job_lang or ("vi" if is_vi_seg else None)
                         if seg_text and (is_vi_seg or job.get("normalize_text", True)):
+                            if is_vi_seg:
+                                seg_text = re.sub(r'(\d),(\d)', r'\1.\2', seg_text)
                             seg_text = normalize_vietnamese_text(seg_text)
 
                         log(f"Dubbing segment {{seg_id}} ({{idx+1}}/{{total_segs}}, lang={{seg_lang}}): '{{seg_text[:75]}}' (target: {{target_dur:.2f}}s)")
