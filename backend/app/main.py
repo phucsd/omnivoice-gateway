@@ -68,10 +68,12 @@ async def auto_shutdown_monitor():
 
 def run_startup_data_recovery():
     """Runs database salvage and alignment routines after table creation."""
-    from app.database import salvage_corrupted_databases, auto_align_legacy_user_ids
+    from app.database import salvage_corrupted_databases, auto_align_legacy_user_ids, verify_and_heal_database
     try:
         salvage_corrupted_databases(settings.DATABASE_URL)
         auto_align_legacy_user_ids(settings.DATABASE_URL)
+        verify_and_heal_database(settings.DATABASE_URL, force_rebuild=False)
+        engine.dispose()
     except Exception as ex:
         print(f"[Startup Recovery Error] {ex}")
 

@@ -368,8 +368,22 @@ class KaggleOrchestrator:
                         cls._trigger_daemon_worker(db, next_job)
             except Exception as e:
                 print(f"[KaggleOrchestrator] Exception in queue loop: {e}")
+                err_low = str(e).lower()
+                if "malformed" in err_low or "corrupt" in err_low or "disk image" in err_low:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+                    try:
+                        from app.database import verify_and_heal_database
+                        verify_and_heal_database(settings.DATABASE_URL, force_rebuild=True)
+                    except Exception as heal_e:
+                        print(f"[KaggleOrchestrator] Self-heal error: {heal_e}")
             finally:
-                db.close()
+                try:
+                    db.close()
+                except Exception:
+                    pass
 
             # Event-driven wait: wakes immediately (<1ms) on new job, or polls every 3s
             if cls._wake_event:
