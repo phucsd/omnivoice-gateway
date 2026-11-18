@@ -1,4 +1,6 @@
 import os
+os.environ.setdefault("APP_ENV", "testing")
+os.environ.setdefault("WORKER_MODE", "mock")
 import unittest.mock as mock
 import pytest
 from unittest.mock import MagicMock, patch
@@ -22,6 +24,8 @@ def setup_test_db():
     KaggleOrchestrator._complete_grace_count.clear()
     KaggleOrchestrator._unknown_status_count.clear()
     KaggleOrchestrator._consecutive_poll_failures.clear()
+    KaggleOrchestrator._quota_wait_cycles.clear()
+    KaggleOrchestrator._push_cooldown_until = 0.0
     yield
     Base.metadata.drop_all(bind=engine)
 
@@ -391,4 +395,73 @@ def test_turbo_worker_code_ast_and_optimizations_present(tmp_path):
     batch_src = open(batch_path, encoding="utf-8").read()
     ast.parse(batch_src)
     assert 'os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"' in batch_src
+
+
+@patch.object(KaggleOrchestrator, "get_credentials")
+def test_batch_gpu_cap_parks_job_in_queued_and_terminal_boot_failure_syncs_dubbing_job(mock_creds, db):
+    from app.models import VideoDubbingJob
+
+    mock_creds.return_value = ("testuser", "testkey", "testuser/omnivoice-worker-1", "/tmp/worker")
+
+    dub = VideoDubbingJob(
+        id="vd_capcheck",
+        user_id="test_user",
+        status="separating_audio",
+        progress=30,
+        message="Waiting for GPU...",
+        source_type="youtube",
+        target_language="Vietnamese",
+    )
+    db.add(dub)
+    sub = TTSJob(
+        id="sep_vd_capcheck",
+        user_id="test_user",
+        job_type="separate_audio",
+        status="queued",
+        worker_id="worker_1",
+        message="Queued...",
+    )
+    db.add(sub)
+    db.commit()
+
+    # 1. Both worker_1 and worker_2 return "Maximum batch GPU session count of 2 reached."
+    # Job must NOT be marked failed! It must be parked back in "queued" with worker_id=None and cooldown > 0
+    with patch("subprocess.Popen") as mock_popen, \
+         patch("app.services.kaggle_notebook_builder.KaggleNotebookBuilder.prepare_all"):
+        p_cap1 = MagicMock()
+        p_cap1.communicate.return_value = ("Kernel push error: Maximum batch GPU session count of 2 reached.", "")
+        p_cap1.returncode = 0
+        p_cap2 = MagicMock()
+        p_cap2.communicate.return_value = ("Kernel push error: Maximum batch GPU session count of 2 reached.", "")
+        p_cap2.returncode = 0
+        mock_popen.side_effect = [p_cap1, p_cap2]
+
+        KaggleOrchestrator._trigger_daemon_worker(db, sub)
+        db.refresh(sub)
+        db.refresh(dub)
+
+        assert sub.status == "queued"
+        assert sub.worker_id is None
+        assert dub.status == "separating_audio"
+        assert KaggleOrchestrator._quota_wait_cycles.get(sub.id) == 1
+        assert KaggleOrchestrator._push_cooldown_until > 0.0
+
+    # 2. If a non-quota hard boot error genuinely exhausts all 4 attempts, BOTH TTSJob and parent VideoDubbingJob mark failed
+    sub.status = "starting_worker"
+    sub.worker_id = "worker_1"
+    db.commit()
+    KaggleOrchestrator._boot_attempts[sub.id] = 4
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='testuser/omnivoice-worker-1 has status "KernelWorkerStatus.ERROR"',
+        )
+        KaggleOrchestrator._poll_booting_worker(db, sub)
+        db.refresh(sub)
+        db.refresh(dub)
+
+        assert sub.status == "failed"
+        assert dub.status == "failed"
+        assert "Kaggle boot error" in (dub.error_message or "")
+
 

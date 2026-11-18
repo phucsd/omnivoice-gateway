@@ -101,6 +101,8 @@ class KaggleOrchestrator:
     _boot_attempts = {}
     _boot_started_at = {}
     _last_poll_at = {}
+    _quota_wait_cycles = {}
+    _push_cooldown_until = 0.0
     _prewarm_lock = threading.Lock()
     _last_prewarm_at = 0.0
 
@@ -113,6 +115,7 @@ class KaggleOrchestrator:
         cls._boot_attempts.pop(job_id, None)
         cls._boot_started_at.pop(job_id, None)
         cls._last_poll_at.pop(job_id, None)
+        cls._quota_wait_cycles.pop(job_id, None)
 
     @classmethod
     def notify_new_job(cls):
@@ -163,7 +166,7 @@ class KaggleOrchestrator:
         Proactively boots an idle Kaggle GPU worker slot in the background (e.g. during YouTube download)
         so the GPU container is already warm or booting by the time audio tasks are queued.
         """
-        if settings.WORKER_MODE != "kaggle":
+        if settings.WORKER_MODE != "kaggle" or os.environ.get("APP_ENV") == "testing":
             return
         import time as _time
         with cls._prewarm_lock:
@@ -210,7 +213,16 @@ class KaggleOrchestrator:
                 ]
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, shell=False)
                 out, err = proc.communicate()
-                print(f"[KaggleOrchestrator] Pre-warm push on {slot} exited {proc.returncode}: {(out or err or '').strip()}")
+                out_str = (out or err or "").strip()
+                out_low = out_str.lower()
+                print(f"[KaggleOrchestrator] Pre-warm push on {slot} exited {proc.returncode}: {out_str}")
+                if (
+                    proc.returncode != 0
+                    or "kernel push error" in out_low
+                    or "maximum batch gpu session count" in out_low
+                    or out_low.startswith("error:")
+                ):
+                    WorkerSessionService.shutdown_worker(db, slot, f"Pre-warm skipped: {out_str[:160]}")
             except Exception as pw_err:
                 print(f"[KaggleOrchestrator] Pre-warm notice: {pw_err}")
             finally:
@@ -222,13 +234,27 @@ class KaggleOrchestrator:
     def _failover_or_retry_worker(cls, db, job, status_output: str, reason_label: str):
         """
         Handles worker failures (COMPLETE after grace, ERROR, CANCELLED, push failure)
-        by shutting down the failed worker session, failing over to the alternate worker slot,
-        and re-triggering the daemon worker without marking the client job as failed.
+        by shutting down the failed worker session (unless actively heartbeating),
+        failing over or deferring when Kaggle's 2-GPU batch session cap is active,
+        and syncing terminal failures to parent VideoDubbingJob via JobService.
         """
+        import time as _time
+        from datetime import datetime, timedelta
+        from app.models import WorkerSession
         from app.services.worker_session_service import WorkerSessionService
+        from app.services.job_service import JobService
 
         old_worker_id = job.worker_id or "worker_1"
-        WorkerSessionService.shutdown_worker(db, old_worker_id, f"{reason_label}: {status_output}")
+        cutoff = datetime.utcnow() - timedelta(seconds=180)
+        old_sess = db.query(WorkerSession).filter(WorkerSession.worker_id == old_worker_id).first()
+        is_old_actively_serving = (
+            old_sess is not None
+            and old_sess.status in ("ready", "busy", "idle")
+            and old_sess.last_heartbeat_at is not None
+            and old_sess.last_heartbeat_at >= cutoff
+        )
+        if not is_old_actively_serving:
+            WorkerSessionService.shutdown_worker(db, old_worker_id, f"{reason_label}: {status_output}")
 
         cls._complete_grace_count.pop(job.id, None)
         cls._unknown_status_count.pop(job.id, None)
@@ -236,25 +262,59 @@ class KaggleOrchestrator:
 
         attempts = cls._boot_attempts.get(job.id, 0)
         max_attempts = 4  # Allows alternating worker_1 <-> worker_2 up to 2 rounds
+        status_lower = (status_output or "").lower()
+        is_batch_cap_reached = "maximum batch gpu session count" in status_lower
+
+        # If Kaggle reports 2 batch GPU sessions are already active:
+        # - Allow 1 alternate-slot probe only when no live worker is registered yet
+        # - Otherwise park the job in 'queued' with a 15s push cooldown so the already-running
+        #   Kaggle GPU worker(s) can claim it or finish teardown without killing the job in 7s!
+        if is_batch_cap_reached and (cls.has_live_worker(db) or attempts >= 2):
+            wait_cycles = cls._quota_wait_cycles.get(job.id, 0)
+            if wait_cycles < 15:
+                cls._quota_wait_cycles[job.id] = wait_cycles + 1
+                cls._boot_attempts[job.id] = 0
+                cls._push_cooldown_until = _time.monotonic() + 15.0
+                print(
+                    f"[KaggleOrchestrator] Kaggle GPU session limit (2) active for job {job.id} "
+                    f"(wait cycle {wait_cycles + 1}/15). Parking job in 'queued' for running GPU workers to claim."
+                )
+                JobService.update_job_status(
+                    db=db,
+                    job_id=job.id,
+                    status="queued",
+                    message="Đang chờ máy chủ GPU Kaggle đang chạy nhận tác vụ hoặc giải phóng slot...",
+                    progress=12,
+                )
+                job.worker_id = None
+                db.commit()
+                return
 
         if attempts < max_attempts:
             new_worker_id = "worker_2" if old_worker_id == "worker_1" else "worker_1"
             print(f"[KaggleOrchestrator] Worker {old_worker_id} {reason_label} ('{status_output}'). Failing over to {new_worker_id} for job {job.id} (attempt {attempts + 1}/{max_attempts})...")
 
             job.worker_id = new_worker_id
-            job.status = "starting_worker"
-            job.message = f"Máy chủ {old_worker_id} ({reason_label}). Đang tự động chuyển sang máy chủ dự phòng ({new_worker_id}) và tạo GPU mới..."
-            job.progress = 10
-            db.commit()
+            JobService.update_job_status(
+                db=db,
+                job_id=job.id,
+                status="starting_worker",
+                message=f"Máy chủ {old_worker_id} ({reason_label}). Đang tự động chuyển sang máy chủ dự phòng ({new_worker_id}) và tạo GPU mới...",
+                progress=10,
+            )
             db.refresh(job)
 
             cls._trigger_daemon_worker(db, job)
         else:
             print(f"[KaggleOrchestrator] Job {job.id} exceeded max boot attempts ({max_attempts}). Failing job.")
-            job.status = "failed"
-            job.message = "Không thể khởi động Kaggle Worker sau nhiều lần thử lại trên cả worker-1 và worker-2."
-            job.error_message = f"Kaggle boot error after {max_attempts} attempts: {status_output}"
-            db.commit()
+            JobService.update_job_status(
+                db=db,
+                job_id=job.id,
+                status="failed",
+                message="Không thể khởi động Kaggle Worker sau nhiều lần thử lại trên cả worker-1 và worker-2.",
+                progress=100,
+                error_message=f"Kaggle boot error after {max_attempts} attempts: {status_output}",
+            )
             cls._cleanup_job_tracking(job.id)
 
     @classmethod
@@ -340,32 +400,60 @@ class KaggleOrchestrator:
                         cls._last_poll_at[b_job.id] = now_mono
                         cls._poll_booting_worker(db, b_job)
 
-                # Clean up any tracking for jobs that have left the booting states
+                # Clean up boot-attempt tracking for jobs that have left the booting states
                 booting_job_ids = {j.id for j in booting_jobs}
-                tracked_job_ids = set(cls._boot_attempts.keys()) | set(cls._complete_grace_count.keys()) | set(cls._consecutive_poll_failures.keys()) | set(cls._unknown_status_count.keys())
-                for j_id in (tracked_job_ids - booting_job_ids):
-                    cls._cleanup_job_tracking(j_id)
+                queued_jobs = db.query(TTSJob).filter(
+                    TTSJob.status == "queued"
+                ).order_by(TTSJob.created_at.asc()).all()
+                queued_job_ids = {j.id for j in queued_jobs}
+
+                tracked_boot_ids = (
+                    set(cls._boot_attempts.keys())
+                    | set(cls._complete_grace_count.keys())
+                    | set(cls._consecutive_poll_failures.keys())
+                    | set(cls._unknown_status_count.keys())
+                )
+                for j_id in (tracked_boot_ids - booting_job_ids):
+                    cls._consecutive_poll_failures.pop(j_id, None)
+                    cls._unknown_status_count.pop(j_id, None)
+                    cls._complete_grace_count.pop(j_id, None)
+                    cls._boot_attempts.pop(j_id, None)
+                    cls._boot_started_at.pop(j_id, None)
+                    cls._last_poll_at.pop(j_id, None)
+
+                for q_id in (set(cls._quota_wait_cycles.keys()) - booting_job_ids - queued_job_ids):
+                    cls._quota_wait_cycles.pop(q_id, None)
 
                 # Determine active or booting worker IDs
                 booting_worker_ids = {j.worker_id for j in booting_jobs if j.worker_id}
                 total_active_or_booting = active_worker_ids.union(booting_worker_ids)
+                free_or_warming_workers = {
+                    s.worker_id
+                    for s in active_sessions
+                    if s.status in ("starting", "loading_model", "ready", "idle")
+                }
 
-                # If we have less than 2 active/booting workers, trigger a new one if there are queued jobs
-                if len(total_active_or_booting) < 2:
-                    next_job = db.query(TTSJob).filter(
-                        TTSJob.status == "queued"
-                    ).order_by(TTSJob.created_at.asc()).first()
+                # Trigger a new worker slot only when needed:
+                # - Never push during a quota cooldown window
+                # - Do NOT redundantly push a 2nd GPU container for 1 queued job when a ready/idle/pre-warming worker is already available
+                should_boot_another = (
+                    len(total_active_or_booting) < 2
+                    and now_mono >= cls._push_cooldown_until
+                    and len(queued_jobs) > 0
+                    and (len(total_active_or_booting) == 0 or len(queued_jobs) > len(free_or_warming_workers))
+                )
+                if should_boot_another:
+                    # Pick a queued job beyond those already covered by free/warming workers
+                    target_idx = min(len(free_or_warming_workers), len(queued_jobs) - 1)
+                    next_job = queued_jobs[target_idx]
+                    assigned_worker_id = cls._select_best_worker_slot(db, total_active_or_booting)
 
-                    if next_job:
-                        # Smart slot selection: prefers longest-idle slot to avoid Kaggle teardown queue
-                        assigned_worker_id = cls._select_best_worker_slot(db, total_active_or_booting)
-                        
-                        print(f"[KaggleOrchestrator] Queued job {next_job.id} found. Active/booting workers: {total_active_or_booting}. Triggering slot {assigned_worker_id}...")
-                        next_job.worker_id = assigned_worker_id
-                        db.commit()
-                        db.refresh(next_job)
-                        
-                        cls._trigger_daemon_worker(db, next_job)
+                    print(f"[KaggleOrchestrator] Queued job {next_job.id} needs worker. Active/booting: {total_active_or_booting} (free/warming={free_or_warming_workers}). Triggering slot {assigned_worker_id}...")
+                    next_job.worker_id = assigned_worker_id
+                    db.commit()
+                    db.refresh(next_job)
+
+                    cls._trigger_daemon_worker(db, next_job)
             except Exception as e:
                 print(f"[KaggleOrchestrator] Exception in queue loop: {e}")
                 err_low = str(e).lower()
