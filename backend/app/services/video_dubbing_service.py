@@ -2479,12 +2479,63 @@ class VideoDubbingService:
         """
         def pitch_neutral_stretch(audio_data: np.ndarray, sr: int, speed_factor: float) -> np.ndarray:
             """
-            Performs 100% pitch-preserving time stretch using librosa phase vocoder.
-            Does NOT alter audio pitch/frequency, eliminating Chipmunk distortion.
+            Performs pitch-preserving time stretch via FFmpeg WSOLA `atempo` filter
+            (falling back to librosa if FFmpeg is unavailable).
             """
-            speed_factor = max(0.6, min(1.8, speed_factor))
+            speed_factor = max(0.65, min(1.75, float(speed_factor)))
+            if abs(speed_factor - 1.0) < 0.02 or len(audio_data) == 0:
+                return audio_data
+
+            if shutil.which("ffmpeg"):
+                in_fd, in_wav = tempfile.mkstemp(suffix="_in.wav")
+                out_fd, out_wav = tempfile.mkstemp(suffix="_out.wav")
+                os.close(in_fd)
+                os.close(out_fd)
+                try:
+                    sf.write(in_wav, audio_data, sr, format="WAV", subtype="PCM_16")
+                    # Chain atempo filters if outside single-stage [0.5, 2.0] range
+                    rem = speed_factor
+                    stages = []
+                    while rem > 2.0:
+                        stages.append("atempo=2.0")
+                        rem /= 2.0
+                    while rem < 0.5:
+                        stages.append("atempo=0.5")
+                        rem /= 0.5
+                    stages.append(f"atempo={rem:.4f}")
+                    af_str = ",".join(stages)
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y",
+                            "-i", in_wav,
+                            "-af", af_str,
+                            "-vn", "-acodec", "pcm_s16le", "-ar", str(sr), "-ac", "1",
+                            out_wav,
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=20,
+                        check=True,
+                    )
+                    stretched, _ = sf.read(out_wav, dtype="float32")
+                    if stretched.ndim > 1:
+                        stretched = stretched.mean(axis=1)
+                    if len(stretched) > 0:
+                        return stretched
+                except Exception as ff_err:
+                    print(f"[VideoDubbingService Warning] FFmpeg atempo stretch failed: {ff_err}")
+                finally:
+                    for tmp_p in (in_wav, out_wav):
+                        if tmp_p and os.path.exists(tmp_p):
+                            try:
+                                os.remove(tmp_p)
+                            except Exception:
+                                pass
+
             try:
                 import librosa
+                if librosa is None:
+                    raise ImportError("librosa is unavailable")
                 return librosa.effects.time_stretch(audio_data, rate=speed_factor)
             except Exception as e:
                 print(f"[VideoDubbingService Warning] librosa stretch failed: {e}")
@@ -2532,9 +2583,9 @@ class VideoDubbingService:
 
                 actual_sec = len(data) / 24000.0
 
-                # 3. Dynamic pitch-neutral speed scaling (up to 1.50x without pitch distortion)
+                # 3. Dynamic pitch-neutral speed scaling (up to 1.65x via WSOLA without pitch distortion)
                 if actual_sec > target_sec * 1.03 and target_sec > 0.3:
-                    speed_factor = min(1.50, actual_sec / target_sec)
+                    speed_factor = min(1.65, actual_sec / target_sec)
                     data = pitch_neutral_stretch(data, 24000, speed_factor)
                     actual_sec = len(data) / 24000.0
 
@@ -2597,20 +2648,20 @@ class VideoDubbingService:
             mix_cmd = [
                 "ffmpeg", "-y",
                 "-i", vocal_path,
-                "-filter_complex", f"[0:a]volume={vocal_vol}[out]",
+                "-filter_complex", f"[0:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume={vocal_vol}[out]",
                 "-map", "[out]",
-                "-acodec", "pcm_s16le", "-ar", "44100",
+                "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
                 temp_mixed_audio
             ]
         else:
             # Studio-grade Audio Ducking with Sidechain Compression:
-            # Automatically attenuates BGM by ~14dB whenever dubbed vocal has speech, and recovers smoothly during pauses.
-            # normalize=0 preserves 100% vocal punchiness without dividing amplitude by 2!
+            # Force both stems to 44.1kHz Stereo before sidechain/amix so stereo BGM never collapses to mono,
+            # and keep duration=longest so full BGM / video outro is preserved.
             ducking_filter = (
-                f"[0:a]volume={vocal_vol},asplit=2[vocal_main][vocal_sc];"
-                f"[1:a]volume={bgm_vol}[bgm_raw];"
+                f"[0:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume={vocal_vol},asplit=2[vocal_main][vocal_sc];"
+                f"[1:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume={bgm_vol}[bgm_raw];"
                 f"[bgm_raw][vocal_sc]sidechaincompress=threshold=0.025:ratio=5:attack=35:release=350:makeup=1[bgm_ducked];"
-                f"[vocal_main][bgm_ducked]amix=inputs=2:normalize=0:duration=first:dropout_transition=0[out]"
+                f"[vocal_main][bgm_ducked]amix=inputs=2:normalize=0:duration=longest:dropout_transition=0[out]"
             )
             mix_cmd = [
                 "ffmpeg", "-y",
@@ -2618,7 +2669,7 @@ class VideoDubbingService:
                 "-i", bgm_path,
                 "-filter_complex", ducking_filter,
                 "-map", "[out]",
-                "-acodec", "pcm_s16le", "-ar", "44100",
+                "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
                 temp_mixed_audio
             ]
         
@@ -2629,9 +2680,13 @@ class VideoDubbingService:
                 "ffmpeg", "-y",
                 "-i", vocal_path,
                 "-i", bgm_path,
-                "-filter_complex", f"[0:a]volume={vocal_vol}[vocal];[1:a]volume={bgm_vol}[bgm];[vocal][bgm]amix=inputs=2:normalize=0:duration=first:dropout_transition=0[out]",
+                "-filter_complex", (
+                    f"[0:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume={vocal_vol}[vocal];"
+                    f"[1:a]aresample=44100,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume={bgm_vol}[bgm];"
+                    f"[vocal][bgm]amix=inputs=2:normalize=0:duration=longest:dropout_transition=0[out]"
+                ),
                 "-map", "[out]",
-                "-acodec", "pcm_s16le", "-ar", "44100",
+                "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
                 temp_mixed_audio
             ]
             res_fb = subprocess.run(fallback_cmd, capture_output=True, text=True)

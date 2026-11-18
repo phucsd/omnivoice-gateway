@@ -891,5 +891,126 @@ def test_asr_hallucination_filtering_and_sentence_boundary_preservation():
     assert norm_trans[1]["text"] == "MIS. Giữ mọi việc đơn giản."
 
 
+def test_wsola_atempo_stretch_without_librosa_and_stereo_bgm_preservation(tmp_path, monkeypatch):
+    import sys
+    import subprocess
+    import numpy as np
+    import soundfile as sf
+    from app.services.video_dubbing_service import VideoDubbingService
+
+    # Simulate production container where librosa is NOT installed
+    monkeypatch.setitem(sys.modules, "librosa", None)
+
+    sr24 = 24000
+    seg1_wav = str(tmp_path / "seg1.wav")
+    seg2_wav = str(tmp_path / "seg2.wav")
+    dubbed_vocal_wav = str(tmp_path / "dubbed_vocals.wav")
+
+    # Segment 1: 3.0s total -> 2.5s @ 220Hz followed by distinct 0.5s @ 1760Hz tail
+    t_body = np.linspace(0, 2.5, int(sr24 * 2.5), endpoint=False, dtype=np.float32)
+    t_tail = np.linspace(0, 0.5, int(sr24 * 0.5), endpoint=False, dtype=np.float32)
+    seg1_arr = np.concatenate([
+        0.35 * np.sin(2 * np.pi * 220 * t_body),
+        0.45 * np.sin(2 * np.pi * 1760 * t_tail),
+    ])
+    sf.write(seg1_wav, seg1_arr, sr24, format="WAV", subtype="PCM_16")
+
+    # Segment 2: 1.0s @ 330Hz
+    t_seg2 = np.linspace(0, 1.0, sr24, endpoint=False, dtype=np.float32)
+    sf.write(seg2_wav, 0.35 * np.sin(2 * np.pi * 330 * t_seg2), sr24, format="WAV", subtype="PCM_16")
+
+    segments = [
+        {"start": 0.0, "end": 2.0, "file_path": seg1_wav},
+        {"start": 2.1, "end": 3.1, "file_path": seg2_wav},
+    ]
+    VideoDubbingService.assemble_dubbed_vocal(segments, dubbed_vocal_wav, total_duration=5.0)
+
+    out_vox, out_sr = sf.read(dubbed_vocal_wav, dtype="float32")
+    assert out_sr == 24000
+
+    # Verify the stretched 1760Hz tail arrived before 2.04s instead of being truncated at 2.0s!
+    pre_gap_slice = out_vox[int(1.65 * sr24):int(2.00 * sr24)]
+    pre_gap_rms = float(np.sqrt(np.mean(np.square(pre_gap_slice))))
+    assert pre_gap_rms > 0.05
+    # Spectral energy around 1760Hz must be strong in 1.65s..2.00s (stretched from 2.5s..3.0s at ~1.5x)
+    freqs = np.fft.rfftfreq(len(pre_gap_slice), 1.0 / sr24)
+    mag = np.abs(np.fft.rfft(pre_gap_slice))
+    peak_freq = float(freqs[int(np.argmax(mag))])
+    assert 1500.0 <= peak_freq <= 2000.0, f"Expected stretched 1760Hz tail, got peak {peak_freq}Hz"
+
+    # Breathing gap 2.05s..2.09s before Segment 2 starts at 2.1s must stay silent
+    gap_slice = out_vox[int(2.05 * sr24):int(2.09 * sr24)]
+    gap_rms = float(np.sqrt(np.mean(np.square(gap_slice))))
+    assert gap_rms < 0.01, f"Expected silent breathing gap, got rms={gap_rms}"
+
+    # Create a 5.0s H.264 MP4 and a 5.0s 44.1kHz Stereo BGM with distinct L (440Hz) and R (660Hz) channels
+    src_mp4 = str(tmp_path / "src.mp4")
+    bgm_wav = str(tmp_path / "bgm.wav")
+    out_mp4 = str(tmp_path / "output_dubbed.mp4")
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=320x240:r=24:d=5",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            src_mp4,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    sr44 = 44100
+    t_bgm = np.linspace(0, 5.0, sr44 * 5, endpoint=False, dtype=np.float32)
+    bgm_stereo = np.stack([
+        0.30 * np.sin(2 * np.pi * 440 * t_bgm),
+        0.30 * np.sin(2 * np.pi * 660 * t_bgm),
+    ], axis=1)
+    sf.write(bgm_wav, bgm_stereo, sr44, format="WAV", subtype="PCM_16")
+
+    VideoDubbingService.mix_and_mux_video(
+        video_path=src_mp4,
+        bgm_path=bgm_wav,
+        vocal_path=dubbed_vocal_wav,
+        output_path=out_mp4,
+        vocal_vol=1.0,
+        bgm_vol=0.4,
+    )
+
+    probe_res = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name,sample_rate,channels,duration",
+            "-of", "json",
+            out_mp4,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    streams = json.loads(probe_res.stdout).get("streams", [])
+    assert len(streams) == 1
+    a_stream = streams[0]
+    assert int(a_stream["channels"]) == 2, f"Expected 2-channel stereo, got {a_stream}"
+    assert str(a_stream["sample_rate"]) == "44100", f"Expected 44100Hz, got {a_stream}"
+    assert float(a_stream["duration"]) >= 4.8, f"Expected full >=4.8s duration, got {a_stream}"
+
+    # Verify stereo L/R difference is preserved in output outro (3.5s..4.8s)
+    extracted_wav = str(tmp_path / "extracted_out.wav")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", out_mp4, "-vn", "-acodec", "pcm_s16le", extracted_wav],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    mix_arr, mix_sr = sf.read(extracted_wav, dtype="float32")
+    assert mix_arr.ndim == 2 and mix_arr.shape[1] == 2
+    outro_slice = mix_arr[int(3.5 * mix_sr):int(4.8 * mix_sr)]
+    side_rms = float(np.sqrt(np.mean(np.square(outro_slice[:, 0] - outro_slice[:, 1]))))
+    assert side_rms > 0.02, f"Expected preserved stereo L-R difference in BGM outro, got side_rms={side_rms}"
+
+
+
 
 

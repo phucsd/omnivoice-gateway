@@ -1213,7 +1213,9 @@ def main():
                                         rms = float(np.sqrt(np.mean(np.square(mono_vox[i0:i1]))))
                                         if rms > best_rms:
                                             best_rms = rms
-                                            best_slice = full_vox[i0:i1]
+                                            cand_mono = mono_vox[i0:i1]
+                                            peak_v = float(np.max(np.abs(cand_mono)))
+                                            best_slice = cand_mono * min(2.5, 0.90 / peak_v) if peak_v > 1e-4 else cand_mono
                             if best_slice is not None and best_rms > 0.005:
                                 clean_ref_clip_path = "clean_voice_ref.wav"
                                 sf.write(clean_ref_clip_path, best_slice, full_sr, format="WAV", subtype="PCM_16")
