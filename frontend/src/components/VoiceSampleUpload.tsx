@@ -1,6 +1,6 @@
 import React, { useState, useRef } from "react";
 import { Upload, FileAudio, Check, AlertCircle } from "lucide-react";
-import { api } from "../api/client";
+import { api, getErrorMessage } from "../api/client";
 
 interface VoiceSampleUploadProps {
   onUploadSuccess: (voiceSampleId: string) => void;
@@ -67,10 +67,10 @@ export const VoiceSampleUpload: React.FC<VoiceSampleUploadProps> = ({ onUploadSu
       setVoiceName("");
       setCustomId("");
       if (fileInputRef.current) fileInputRef.current.value = "";
-    } catch (err: any) {
+    } catch (err: unknown) {
       setStatusMsg({
         type: "error",
-        text: err.message || "Đã xảy ra lỗi trong quá trình tải lên.",
+        text: getErrorMessage(err, "Đã xảy ra lỗi trong quá trình tải lên."),
       });
     } finally {
       setIsUploading(false);
@@ -216,9 +216,9 @@ export const VoiceSampleUpload: React.FC<VoiceSampleUploadProps> = ({ onUploadSu
         <button
           type="submit"
           disabled={!file || isUploading}
-          className={`w-full py-2.5 px-4 rounded-full font-bold text-xs transition-all duration-150 active:scale-[0.99] flex items-center justify-center gap-1.5 cursor-pointer shadow-md border ${
+          className={`w-full min-h-[44px] py-2.5 px-4 rounded-xl font-bold text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer border ${
             file && !isUploading
-              ? "bg-gradient-to-r from-primary to-accent text-white border-none shadow-lg shadow-primary/15 hover:brightness-105"
+              ? "bg-primary hover:bg-primary-hover text-primary-foreground border-transparent"
               : "bg-muted text-muted-foreground border-transparent cursor-not-allowed"
           }`}
         >

@@ -74,6 +74,7 @@ def _build_job_response(job: TTSJob) -> JobStatusResponse:
         message=job.message,
         progress=job.progress,
         audio_url=audio_url,
+        cdn_audio_url=getattr(job, "cdn_audio_url", None) if job.status == "completed" else None,
         error_message=job.error_message,
         worker_id=job.worker_id,
         job_type=job.job_type,
@@ -117,6 +118,8 @@ def list_jobs(
             query = query.filter(TTSJob.job_type == "auto_voice")
         elif job_type == "voice_design":
             query = query.filter(TTSJob.job_type.in_(["voice_design_preview", "voice_design_tts"]))
+        elif job_type == "asr":
+            query = query.filter(TTSJob.job_type == "asr")
         elif job_type == "video_dubbing":
             query = query.filter(TTSJob.job_type.in_(["separate_audio", "dub_segments"]))
             

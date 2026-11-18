@@ -12,7 +12,7 @@ from datetime import datetime
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models import User, VideoDubbingJob, TTSJob, SystemSetting
+from app.models import User, VideoDubbingJob, TTSJob, SystemSetting, LLMProfile
 from app.schemas import (
     VideoDubbingJobResponse,
     SubtitleSegment,
@@ -22,8 +22,12 @@ from app.schemas import (
     ShortenSubtitleRequest,
     ShortenSubtitleResponse,
     RemixDubbingRequest,
+    LLMProfilePublicResponse,
 )
 from app.utils.auth import get_user_or_api_key
+from app.routers.admin import get_admin_user
+from app.utils.files import save_upload_with_limit
+from app.utils.url_security import ensure_within_directory, validate_safe_external_url
 from app.config import settings
 from app.services.video_dubbing_service import VideoDubbingService
 from app.services.job_service import JobService
@@ -33,19 +37,46 @@ from app.database import get_db, SessionLocal
 
 router = APIRouter(prefix="/v1/video-dubbing", tags=["Video Dubbing"])
 
+MAX_VIDEO_UPLOAD_BYTES = 300 * 1024 * 1024  # 300 MB
+MAX_COOKIE_UPLOAD_BYTES = 1024 * 1024  # 1 MB
+
+
+@router.get("/llm-profiles", response_model=List[LLMProfilePublicResponse])
+def list_dubbing_llm_profiles(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
+):
+    """Returns non-secret LLM profile metadata so authenticated users can pick a translation engine."""
+    _ = current_user
+    return (
+        db.query(LLMProfile)
+        .order_by(LLMProfile.is_active.desc(), LLMProfile.created_at.desc())
+        .all()
+    )
+
+
 @router.get("/test-cffi")
-def test_cffi(url: str = "https://www.youtube.com/embed/uWr3SXVIROA"):
+def test_cffi(
+    url: str = "https://www.youtube.com/embed/uWr3SXVIROA",
+    admin: User = Depends(get_admin_user),
+):
+    _ = admin
+    try:
+        safe_url = validate_safe_external_url(url)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
     import traceback
     results = {}
     try:
         from curl_cffi import requests as curl_requests
-        r = curl_requests.get(url, impersonate="chrome", verify=False, timeout=10)
+        r = curl_requests.get(safe_url, impersonate="chrome", timeout=10)
         results["cffi_embed"] = {"status": r.status_code, "len": len(r.content)}
     except Exception as e:
         results["cffi_embed"] = {"error": str(e), "trace": traceback.format_exc()}
     try:
         import urllib.request
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(safe_url, headers={"User-Agent": "Mozilla/5.0"})
         r = urllib.request.urlopen(req, timeout=10)
         results["urllib_embed"] = {"status": r.status, "len": len(r.read())}
     except Exception as e:
@@ -53,7 +84,16 @@ def test_cffi(url: str = "https://www.youtube.com/embed/uWr3SXVIROA"):
     return results
 
 @router.get("/debug-yt")
-def debug_yt(url: str = "https://www.youtube.com/watch?v=_HA6-A8itVY"):
+def debug_yt(
+    url: str = "https://www.youtube.com/watch?v=_HA6-A8itVY",
+    admin: User = Depends(get_admin_user),
+):
+    _ = admin
+    try:
+        safe_url = validate_safe_external_url(url)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
     import threading, time, traceback
     def bg_debug():
         log_path = "/tmp/debug_log.txt"
@@ -63,13 +103,13 @@ def debug_yt(url: str = "https://www.youtube.com/watch?v=_HA6-A8itVY"):
                 f.write(f"[{time.strftime('%H:%M:%S')}] {line}\n")
 
         with open(log_path, "w", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] Bắt đầu debug download cho URL: {url}\n")
+            f.write(f"[{time.strftime('%H:%M:%S')}] Bắt đầu debug download cho URL: {safe_url}\n")
 
         try:
             tmp_dir = "/tmp/debug_yt"
             os.makedirs(tmp_dir, exist_ok=True)
             write_log("Đang gọi VideoDubbingService.download_youtube_video...")
-            path, title = VideoDubbingService.download_youtube_video(url, tmp_dir, log_file=log_path)
+            path, title = VideoDubbingService.download_youtube_video(safe_url, tmp_dir, log_file=log_path)
             size = os.path.getsize(path) if os.path.exists(path) else 0
             elapsed = time.time() - t0
             write_log(f"SUCCESS: Title='{title}', Path={path}, Size={size} bytes ({size/(1024*1024):.2f} MB), Time={elapsed:.2f}s")
@@ -82,7 +122,8 @@ def debug_yt(url: str = "https://www.youtube.com/watch?v=_HA6-A8itVY"):
     return {"status": "started", "message": "Check /v1/video-dubbing/debug-log for live status"}
 
 @router.get("/debug-log")
-def debug_log():
+def debug_log(admin: User = Depends(get_admin_user)):
+    _ = admin
     log_path = "/tmp/debug_log.txt"
     if os.path.exists(log_path):
         with open(log_path, "r", encoding="utf-8") as f:
@@ -90,31 +131,40 @@ def debug_log():
     return {"log": "No log file found"}
 
 @router.get("/cookie-status")
-def get_cookie_status():
-    bundled_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cookies.txt"))
-    storage_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "cookies.txt"))
-    
-    for ck in [storage_cookies, bundled_cookies]:
+def get_cookie_status(admin: User = Depends(get_admin_user)):
+    _ = admin
+    storage_cookies = os.path.join(os.path.abspath(settings.STORAGE_DIR), "cookies.txt")
+    legacy_storage_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "cookies.txt"))
+
+    for ck in [storage_cookies, legacy_storage_cookies]:
         if os.path.exists(ck) and os.path.getsize(ck) > 0:
             return {
                 "has_cookies": True,
-                "path": ck,
                 "size_bytes": os.path.getsize(ck),
                 "modified_at": os.path.getmtime(ck)
             }
     return {"has_cookies": False, "size_bytes": 0}
 
 @router.post("/upload-cookies")
-async def upload_cookies(file: Optional[UploadFile] = File(None), cookie_text: Optional[str] = Form(None)):
-    storage_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage"))
+async def upload_cookies(
+    file: Optional[UploadFile] = File(None),
+    cookie_text: Optional[str] = Form(None),
+    admin: User = Depends(get_admin_user),
+):
+    _ = admin
+    storage_dir = os.path.abspath(settings.STORAGE_DIR)
     os.makedirs(storage_dir, exist_ok=True)
     target_path = os.path.join(storage_dir, "cookies.txt")
-    
+
     content = ""
     if file:
-        content_bytes = await file.read()
+        content_bytes = await file.read(MAX_COOKIE_UPLOAD_BYTES + 1)
+        if len(content_bytes) > MAX_COOKIE_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Tệp cookie vượt quá giới hạn tối đa 1 MB.")
         content = content_bytes.decode("utf-8", errors="ignore")
     elif cookie_text:
+        if len(cookie_text.encode("utf-8")) > MAX_COOKIE_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Nội dung cookie vượt quá giới hạn tối đa 1 MB.")
         content = cookie_text
     else:
         raise HTTPException(status_code=400, detail="Cần cung cấp file cookies.txt hoặc nội dung cookie.")
@@ -123,11 +173,10 @@ async def upload_cookies(file: Optional[UploadFile] = File(None), cookie_text: O
     if content and "# Netscape" not in content and "\t" not in content:
         import re
         raw = content.strip()
-        # Extract cookie from curl or header string if needed
         cookie_match = re.search(r'(?:[-–]H\s+[\'"][Cc]ookie:\s*|[Cc]ookie:\s*)([^\r\n\'"]+)', raw)
         if cookie_match:
             raw = cookie_match.group(1)
-        
+
         lines = [
             "# Netscape HTTP Cookie File",
             "# http://curl.haxx.se/rfc/cookie_spec.html",
@@ -145,25 +194,18 @@ async def upload_cookies(file: Optional[UploadFile] = File(None), cookie_text: O
                     count += 1
         if count > 0:
             content = "\n".join(lines) + "\n"
-        
+
     with open(target_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    # Also mirror to bundled cookies path for fallback persistence
-    bundled_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cookies.txt"))
-    try:
-        with open(bundled_cookies, "w", encoding="utf-8") as f:
-            f.write(content)
-    except Exception:
-        pass
-        
     return {"status": "success", "message": f"Đã lưu cookies.txt thành công ({len(content)} ký tự)", "size_bytes": len(content)}
 
 @router.delete("/delete-cookies")
-def delete_cookies():
-    storage_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "cookies.txt"))
-    bundled_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cookies.txt"))
-    for ck in [storage_cookies, bundled_cookies]:
+def delete_cookies(admin: User = Depends(get_admin_user)):
+    _ = admin
+    storage_cookies = os.path.join(os.path.abspath(settings.STORAGE_DIR), "cookies.txt")
+    legacy_storage_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "cookies.txt"))
+    for ck in [storage_cookies, legacy_storage_cookies]:
         if os.path.exists(ck):
             try:
                 os.remove(ck)
@@ -175,7 +217,8 @@ class OAuthPollRequest(BaseModel):
     device_code: str
 
 @router.get("/oauth/status")
-def get_youtube_oauth_status():
+def get_youtube_oauth_status(admin: User = Depends(get_admin_user)):
+    _ = admin
     token_data = VideoDubbingService.refresh_oauth_token_if_needed()
     if token_data:
         return {
@@ -186,7 +229,8 @@ def get_youtube_oauth_status():
     return {"connected": False}
 
 @router.post("/oauth/start")
-def start_youtube_oauth():
+def start_youtube_oauth(admin: User = Depends(get_admin_user)):
+    _ = admin
     try:
         data = VideoDubbingService.start_oauth_device_flow()
         return data
@@ -194,7 +238,8 @@ def start_youtube_oauth():
         raise HTTPException(status_code=500, detail=f"Không thể khởi tạo phiên đăng nhập Google: {e}")
 
 @router.post("/oauth/poll")
-def poll_youtube_oauth(req: OAuthPollRequest):
+def poll_youtube_oauth(req: OAuthPollRequest, admin: User = Depends(get_admin_user)):
+    _ = admin
     try:
         res = VideoDubbingService.poll_oauth_device_flow(req.device_code)
         return res
@@ -202,7 +247,8 @@ def poll_youtube_oauth(req: OAuthPollRequest):
         raise HTTPException(status_code=500, detail=f"Lỗi kiểm tra trạng thái xác thực: {e}")
 
 @router.delete("/oauth/disconnect")
-def disconnect_youtube_oauth():
+def disconnect_youtube_oauth(admin: User = Depends(get_admin_user)):
+    _ = admin
     VideoDubbingService.delete_oauth_token()
     return {"status": "success", "message": "Đã ngắt kết nối tài khoản YouTube thành công."}
 
@@ -210,7 +256,8 @@ class OAuthSyncRequest(BaseModel):
     token_data: dict
 
 @router.post("/oauth/sync")
-def sync_youtube_oauth(req: OAuthSyncRequest):
+def sync_youtube_oauth(req: OAuthSyncRequest, admin: User = Depends(get_admin_user)):
+    _ = admin
     if req.token_data and all(k in req.token_data for k in ('access_token', 'refresh_token')):
         VideoDubbingService.save_oauth_token(req.token_data)
         return {"status": "success", "connected": True}
@@ -223,7 +270,8 @@ class ProxyPoolAddPayload(BaseModel):
     raw_text: str
 
 @router.get("/proxy-pool")
-def get_proxy_pool():
+def get_proxy_pool(admin: User = Depends(get_admin_user)):
+    _ = admin
     info = VideoDubbingService.get_proxy_pool_info()
     return {
         "count": len(info),
@@ -232,7 +280,8 @@ def get_proxy_pool():
     }
 
 @router.post("/proxy-pool/add")
-def add_proxy_pool(payload: ProxyPoolAddPayload):
+def add_proxy_pool(payload: ProxyPoolAddPayload, admin: User = Depends(get_admin_user)):
+    _ = admin
     text = payload.raw_text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Vui lòng cung cấp ít nhất một proxy.")
@@ -245,7 +294,8 @@ def add_proxy_pool(payload: ProxyPoolAddPayload):
     }
 
 @router.post("/proxy-pool/test-all")
-def test_all_proxy_pool():
+def test_all_proxy_pool(admin: User = Depends(get_admin_user)):
+    _ = admin
     raw_proxies = VideoDubbingService.get_youtube_proxies()
     if not raw_proxies:
         return {"count": 0, "results": []}
@@ -260,7 +310,8 @@ def test_all_proxy_pool():
     }
 
 @router.delete("/proxy-pool/{proxy_hash}")
-def delete_proxy_item(proxy_hash: str):
+def delete_proxy_item(proxy_hash: str, admin: User = Depends(get_admin_user)):
+    _ = admin
     info = VideoDubbingService.delete_from_proxy_pool(proxy_hash)
     return {
         "status": "success",
@@ -270,7 +321,8 @@ def delete_proxy_item(proxy_hash: str):
     }
 
 @router.delete("/proxy-pool")
-def clear_proxy_pool():
+def clear_proxy_pool(admin: User = Depends(get_admin_user)):
+    _ = admin
     VideoDubbingService.clear_proxy_pool()
     return {
         "status": "success",
@@ -281,14 +333,16 @@ def clear_proxy_pool():
 
 # Backward compatible endpoints
 @router.get("/proxy-status")
-def get_proxy_status():
+def get_proxy_status(admin: User = Depends(get_admin_user)):
+    _ = admin
     info = VideoDubbingService.get_proxy_pool_info()
     if info:
         return {"is_configured": True, "proxy": info[0]["masked"], "count": len(info)}
     return {"is_configured": False, "proxy": None, "count": 0}
 
 @router.post("/set-proxy")
-def set_proxy(payload: ProxyConfigPayload):
+def set_proxy(payload: ProxyConfigPayload, admin: User = Depends(get_admin_user)):
+    _ = admin
     p = payload.proxy_url.strip()
     if not p:
         VideoDubbingService.delete_youtube_proxy()
@@ -298,7 +352,8 @@ def set_proxy(payload: ProxyConfigPayload):
     return {"status": "success", "message": f"Đã lưu proxy thành công: {info[0]['masked'] if info else p}", "proxy": info[0]["masked"] if info else p}
 
 @router.post("/test-proxy")
-def test_proxy(payload: ProxyConfigPayload):
+def test_proxy(payload: ProxyConfigPayload, admin: User = Depends(get_admin_user)):
+    _ = admin
     p = payload.proxy_url.strip()
     if not p:
         raise HTTPException(status_code=400, detail="Vui lòng cung cấp URL proxy để kiểm tra.")
@@ -321,7 +376,8 @@ def test_proxy(payload: ProxyConfigPayload):
         }
 
 @router.delete("/delete-proxy")
-def delete_proxy():
+def delete_proxy(admin: User = Depends(get_admin_user)):
+    _ = admin
     VideoDubbingService.delete_youtube_proxy()
     return {"status": "success", "message": "Đã xóa cấu hình Proxy."}
 
@@ -629,26 +685,16 @@ async def upload_dubbing_video(
 ):
     """Uploads a raw video file and creates a draft VideoDubbingJob."""
     job_id = f"vd_{uuid.uuid4().hex[:8]}"
-    job_dir = os.path.join(settings.dubbing_dir, job_id)
+    job_dir = ensure_within_directory(settings.dubbing_dir, os.path.join(settings.dubbing_dir, job_id))
     os.makedirs(job_dir, exist_ok=True)
 
-    filename = file.filename or "uploaded_video.mp4"
+    filename = os.path.basename(file.filename or "uploaded_video.mp4")
     ext = os.path.splitext(filename)[1] or ".mp4"
-    input_file_path = os.path.join(job_dir, f"input_video{ext}")
+    input_file_path = ensure_within_directory(job_dir, os.path.join(job_dir, f"input_video{ext}"))
 
-    # Set initial log
     VideoDubbingService.log_to_job(job_id, f"Khởi tạo upload video local: {filename}")
-
-    try:
-        with open(input_file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        VideoDubbingService.log_to_job(job_id, f"Upload video thành công. File lưu tại: {input_file_path}")
-    except Exception as e:
-        VideoDubbingService.log_to_job(job_id, f"Upload video thất bại: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi lưu file video: {e}"
-        )
+    await save_upload_with_limit(file, input_file_path, max_bytes=MAX_VIDEO_UPLOAD_BYTES)
+    VideoDubbingService.log_to_job(job_id, f"Upload video thành công. File lưu tại: {input_file_path}")
 
     job = VideoDubbingJob(
         id=job_id,
@@ -701,7 +747,7 @@ async def create_dubbing_job(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Tải lên video hoặc dán link YouTube để bắt đầu quy trình lồng tiếng tự động."""
-    if oauth_token:
+    if oauth_token and current_user.is_admin:
         try:
             t_data = json.loads(oauth_token)
             if all(k in t_data for k in ('access_token', 'refresh_token')):
@@ -714,6 +760,15 @@ async def create_dubbing_job(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Bạn cần cung cấp video tải lên, link YouTube hoặc ID video đã tải lên trước."
         )
+
+    if youtube_url:
+        try:
+            youtube_url = validate_safe_external_url(youtube_url)
+        except ValueError as ve:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"URL video không hợp lệ hoặc không được phép: {ve}",
+            )
 
     if uploaded_job_id:
         job = db.query(VideoDubbingJob).filter(
@@ -742,7 +797,7 @@ async def create_dubbing_job(
         return job
 
     job_id = f"vd_{uuid.uuid4().hex[:8]}"
-    job_dir = os.path.join(settings.dubbing_dir, job_id)
+    job_dir = ensure_within_directory(settings.dubbing_dir, os.path.join(settings.dubbing_dir, job_id))
     os.makedirs(job_dir, exist_ok=True)
 
     input_file_path = None
@@ -751,21 +806,11 @@ async def create_dubbing_job(
     VideoDubbingService.log_to_job(job_id, f"Khởi tạo tác vụ lồng tiếng mới. Nguồn: {source_type}. Ngôn ngữ đích: {target_language}. Profile LLM ID: {llm_profile_id or 'Default'}")
 
     if file:
-        # Save file directly
-        filename = file.filename or f"uploaded_video"
+        filename = os.path.basename(file.filename or "uploaded_video")
         ext = os.path.splitext(filename)[1] or ".mp4"
-        input_file_path = os.path.join(job_dir, f"input_video{ext}")
-        
-        try:
-            with open(input_file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            VideoDubbingService.log_to_job(job_id, f"Upload video thành công. File lưu tại: {input_file_path}")
-        except Exception as e:
-            VideoDubbingService.log_to_job(job_id, f"Upload video thất bại: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Lỗi lưu file video: {e}"
-            )
+        input_file_path = ensure_within_directory(job_dir, os.path.join(job_dir, f"input_video{ext}"))
+        await save_upload_with_limit(file, input_file_path, max_bytes=MAX_VIDEO_UPLOAD_BYTES)
+        VideoDubbingService.log_to_job(job_id, f"Upload video thành công. File lưu tại: {input_file_path}")
 
     job = VideoDubbingJob(
         id=job_id,
@@ -1009,9 +1054,9 @@ def update_dubbing_subtitles(
         raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
 
     if payload.original_subtitles is not None:
-        job.original_subtitles = json.dumps([s.dict() for s in payload.original_subtitles])
+        job.original_subtitles = json.dumps([s.model_dump() for s in payload.original_subtitles])
     if payload.translated_subtitles is not None:
-        job.translated_subtitles = json.dumps([s.dict() for s in payload.translated_subtitles])
+        job.translated_subtitles = json.dumps([s.model_dump() for s in payload.translated_subtitles])
 
     db.commit()
     return {"status": "success", "message": "Cập nhật phụ đề thành công."}
@@ -1330,47 +1375,68 @@ def remix_dubbed_video(
         "output_video_url": f"/v1/video-dubbing/jobs/{job.id}/output?t={int(time.time())}"
     }
 
+def _resolve_owned_dubbing_asset(
+    job_id: str,
+    path_attr: str,
+    not_found_msg: str,
+    db: Session,
+    current_user: User,
+) -> str:
+    """Verify job existence, caller ownership/admin role, and dubbing directory containment."""
+    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+    if job.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Bạn không có quyền truy cập tài nguyên lồng tiếng này.")
+    file_path = getattr(job, path_attr, None)
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=not_found_msg)
+    try:
+        return ensure_within_directory(settings.dubbing_dir, file_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Đường dẫn tài nguyên không hợp lệ.") from exc
+
+
 # Endpoints to download assets
 @router.get("/jobs/{job_id}/video")
 def get_original_video(
     job_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
 ):
     """Tải xuống hoặc stream video gốc."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
-    if not job or not job.input_file_path or not os.path.exists(job.input_file_path):
-        raise HTTPException(status_code=404, detail="Không tìm thấy video gốc.")
-    return FileResponse(job.input_file_path, media_type="video/mp4", content_disposition_type="inline")
+    safe_path = _resolve_owned_dubbing_asset(job_id, "input_file_path", "Không tìm thấy video gốc.", db, current_user)
+    return FileResponse(safe_path, media_type="video/mp4", content_disposition_type="inline")
+
 
 @router.get("/jobs/{job_id}/vocals")
 def get_separated_vocals(
     job_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
 ):
     """Tải xuống hoặc nghe track giọng nói gốc sau khi tách."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
-    if not job or not job.vocals_audio_path or not os.path.exists(job.vocals_audio_path):
-        raise HTTPException(status_code=404, detail="Không tìm thấy tệp giọng nói gốc.")
-    return FileResponse(job.vocals_audio_path, media_type="audio/wav", content_disposition_type="inline")
+    safe_path = _resolve_owned_dubbing_asset(job_id, "vocals_audio_path", "Không tìm thấy tệp giọng nói gốc.", db, current_user)
+    return FileResponse(safe_path, media_type="audio/wav", content_disposition_type="inline")
+
 
 @router.get("/jobs/{job_id}/bgm")
 def get_separated_bgm(
     job_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
 ):
     """Tải xuống hoặc nghe track nhạc nền gốc sau khi tách."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
-    if not job or not job.bgm_audio_path or not os.path.exists(job.bgm_audio_path):
-        raise HTTPException(status_code=404, detail="Không tìm thấy tệp nhạc nền gốc.")
-    return FileResponse(job.bgm_audio_path, media_type="audio/wav", content_disposition_type="inline")
+    safe_path = _resolve_owned_dubbing_asset(job_id, "bgm_audio_path", "Không tìm thấy tệp nhạc nền gốc.", db, current_user)
+    return FileResponse(safe_path, media_type="audio/wav", content_disposition_type="inline")
+
 
 @router.get("/jobs/{job_id}/output")
 def get_dubbed_video(
     job_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
 ):
     """Tải xuống hoặc stream video lồng tiếng thành phẩm."""
-    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
-    if not job or not job.output_video_path or not os.path.exists(job.output_video_path):
-        raise HTTPException(status_code=404, detail="Không tìm thấy video lồng tiếng thành phẩm.")
-    return FileResponse(job.output_video_path, media_type="video/mp4", filename=f"dubbed_{job_id}.mp4", content_disposition_type="inline")
+    safe_path = _resolve_owned_dubbing_asset(job_id, "output_video_path", "Không tìm thấy video lồng tiếng thành phẩm.", db, current_user)
+    return FileResponse(safe_path, media_type="video/mp4", filename=f"dubbed_{job_id}.mp4", content_disposition_type="inline")

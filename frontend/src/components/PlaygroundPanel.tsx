@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { audioEngine } from "../services/audioEngine";
 import { 
   Play, 
@@ -20,8 +20,23 @@ import {
   Loader2,
   AlignLeft
 } from "lucide-react";
-import { api } from "../api/client";
+import { api, getErrorMessage } from "../api/client";
 import type { JobStatusResponse, VoiceSampleResponse, OmniVoiceParams } from "../api/client";
+
+interface RawAlignmentItem {
+  word?: string;
+  text?: string;
+  start?: number;
+  start_time?: number;
+  end?: number;
+  end_time?: number;
+  timestamp?: [number?, number?] | { start?: number; end?: number } | null;
+}
+
+interface AlignmentContainer {
+  words?: RawAlignmentItem[];
+  chunks?: RawAlignmentItem[];
+}
 
 export const PlaygroundPanel: React.FC = () => {
   // TTS State
@@ -55,12 +70,13 @@ export const PlaygroundPanel: React.FC = () => {
   const [fadeDuration, setFadeDuration] = useState<string>("");
 
   // Job Polling States
-  const [loading, setLoading] = useState(false);
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobId, setJobId] = useState<string | null>(() => localStorage.getItem("VITE_PLAYGROUND_JOB_ID"));
+  const [loading, setLoading] = useState<boolean>(() => Boolean(localStorage.getItem("VITE_PLAYGROUND_JOB_ID")));
   const [jobStatus, setJobStatus] = useState<JobStatusResponse | null>(null);
   const [isPolling, setIsPolling] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [voiceSamples, setVoiceSamples] = useState<VoiceSampleResponse[]>([]);
+  const [audioBlobUrl, setAudioBlobUrl] = useState<string>("");
 
   // Karaoke Player States
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -80,26 +96,28 @@ export const PlaygroundPanel: React.FC = () => {
   const animationFrameRef = useRef<number | null>(null);
 
   // Fetch voice samples on mount
-  const fetchVoiceSamples = async () => {
+  const fetchVoiceSamples = useCallback(async () => {
     try {
       const samples = await api.listVoiceSamples();
       setVoiceSamples(samples);
-      if (samples.length > 0 && !customVoiceSampleId) {
-        // Default to first private sample if available, or first public
+      if (samples.length > 0) {
         const defaultSample = samples.find(s => !s.is_public) || samples[0];
-        setCustomVoiceSampleId(defaultSample.id);
-        if (defaultSample.ref_text) {
-          setRefText(defaultSample.ref_text);
-        }
+        setCustomVoiceSampleId((prev) => {
+          if (prev) return prev;
+          if (defaultSample.ref_text) {
+            setRefText(defaultSample.ref_text);
+          }
+          return defaultSample.id;
+        });
       }
-    } catch (err) {
+    } catch (err: unknown) {
       console.error("Lỗi lấy danh sách mẫu giọng:", err);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchVoiceSamples();
-  }, []);
+    void Promise.resolve().then(() => fetchVoiceSamples());
+  }, [fetchVoiceSamples]);
 
   // Sync reference text when voice sample selection changes
   const handleVoiceChange = (sampleId: string) => {
@@ -173,8 +191,8 @@ export const PlaygroundPanel: React.FC = () => {
         error_message: null
       });
       setIsPolling(true);
-    } catch (err: any) {
-      setErrorMsg(err.message || "Không thể khởi tạo tiến trình TTS.");
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, "Không thể khởi tạo tiến trình TTS."));
       setLoading(false);
     }
   };
@@ -205,8 +223,8 @@ export const PlaygroundPanel: React.FC = () => {
         error_message: null
       });
       setIsPolling(true);
-    } catch (err: any) {
-      setErrorMsg(err.message || "Không thể khởi tạo tiến trình ASR.");
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, "Không thể khởi tạo tiến trình ASR."));
       setLoading(false);
     }
   };
@@ -220,22 +238,40 @@ export const PlaygroundPanel: React.FC = () => {
 
   useEffect(() => {
     const savedJobId = localStorage.getItem("VITE_PLAYGROUND_JOB_ID");
-    if (savedJobId) {
-      setJobId(savedJobId);
-      setLoading(true);
-      api.getJobStatus(savedJobId)
-        .then((status) => {
-          setJobStatus(status);
-          setLoading(false);
-          if (status.status !== "completed" && status.status !== "failed") {
-            setIsPolling(true);
-          }
-        })
-        .catch((err) => {
-          console.error("Lỗi khôi phục Playground job status:", err);
-          setLoading(false);
-        });
+    if (!savedJobId) return;
+
+    let cancelled = false;
+    api.getJobStatus(savedJobId)
+      .then((status) => {
+        if (cancelled) return;
+        setJobStatus(status);
+        setLoading(false);
+        if (status.status !== "completed" && status.status !== "failed") {
+          setIsPolling(true);
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        console.error("Lỗi khôi phục Playground job status:", err);
+        setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const stopPolling = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
     }
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    setIsPolling(false);
+    setLoading(false);
   }, []);
 
   // Job Polling Loop
@@ -249,8 +285,8 @@ export const PlaygroundPanel: React.FC = () => {
           if (status.status === "completed" || status.status === "failed") {
             stopPolling();
           }
-        } catch (err: any) {
-          setErrorMsg(`Lỗi khi thăm dò trạng thái: ${err.message}`);
+        } catch (err: unknown) {
+          setErrorMsg(`Lỗi khi thăm dò trạng thái: ${getErrorMessage(err, "Lỗi kết nối")}`);
           stopPolling();
         }
       }, 2000);
@@ -272,20 +308,7 @@ export const PlaygroundPanel: React.FC = () => {
         timeoutRef.current = null;
       }
     };
-  }, [isPolling, jobId]);
-
-  const stopPolling = () => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
-    }
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-    setIsPolling(false);
-    setLoading(false);
-  };
+  }, [isPolling, jobId, stopPolling]);
 
   const startPreciseTracking = () => {
     const audio = audioRef.current;
@@ -323,27 +346,45 @@ export const PlaygroundPanel: React.FC = () => {
     }
   };
 
-  // Audio playback authenticated URL
-  const token = localStorage.getItem("VITE_JWT_TOKEN");
-  const authenticatedUrl = React.useMemo(() => {
-    if (!jobStatus) return "";
+  // Audio playback authenticated URL (fetched with Bearer header into Blob URL)
+  const protectedAudioUrl = React.useMemo(() => {
+    if (!jobStatus || jobStatus.status !== "completed") return "";
     if (jobStatus.cdn_audio_url) {
       return jobStatus.cdn_audio_url;
     }
     if (jobStatus.job_type === "asr") {
       return api.getASRAudioUrl(jobStatus.job_id);
     }
-    return jobStatus.audio_url 
-      ? `${api.getApiBaseUrl()}${jobStatus.audio_url}${jobStatus.audio_url.includes("?") ? "&" : "?"}token=${token || ""}`
-      : "";
-  }, [jobStatus, token]);
+    return jobStatus.audio_url ? `${api.getApiBaseUrl()}${jobStatus.audio_url}` : "";
+  }, [jobStatus]);
 
-  // Preload audio into memory buffer for instant 0ms playback
   useEffect(() => {
-    if (authenticatedUrl) {
-      audioEngine.preload(authenticatedUrl);
-    }
-  }, [authenticatedUrl]);
+    if (!protectedAudioUrl) return;
+    let cancelled = false;
+    let objectUrlToRevoke: string | null = null;
+
+    api.fetchProtectedAudioBlobUrl(protectedAudioUrl)
+      .then(({ blobUrl, isObjectUrl }) => {
+        if (cancelled) {
+          if (isObjectUrl) URL.revokeObjectURL(blobUrl);
+          return;
+        }
+        if (isObjectUrl) objectUrlToRevoke = blobUrl;
+        setAudioBlobUrl(blobUrl);
+        void audioEngine.preload(blobUrl);
+      })
+      .catch((err: unknown) => {
+        console.error("Không thể tải audio Playground:", err);
+      });
+
+    return () => {
+      cancelled = true;
+      setAudioBlobUrl("");
+      if (objectUrlToRevoke) {
+        URL.revokeObjectURL(objectUrlToRevoke);
+      }
+    };
+  }, [protectedAudioUrl]);
 
   // Audio Event Bindings
   useEffect(() => {
@@ -396,7 +437,7 @@ export const PlaygroundPanel: React.FC = () => {
       audio.removeEventListener("ended", handleEnded);
       stopPreciseTracking();
     };
-  }, [authenticatedUrl]);
+  }, [audioBlobUrl]);
 
   // Volume & Speed Sync
   useEffect(() => {
@@ -483,40 +524,6 @@ export const PlaygroundPanel: React.FC = () => {
     return `${mm}:${ss}.${mss}`;
   };
 
-  const handleDownloadSRT = () => {
-    if (subtitleSegments.length === 0) return;
-    
-    const formatTimeSRT = (seconds: number) => {
-      const h = Math.floor(seconds / 3600);
-      const m = Math.floor((seconds % 3600) / 60);
-      const s = Math.floor(seconds % 60);
-      const ms = Math.floor((seconds % 1) * 1000);
-      
-      const hh = h < 10 ? `0${h}` : `${h}`;
-      const mm = m < 10 ? `0${m}` : `${m}`;
-      const ss = s < 10 ? `0${s}` : `${s}`;
-      const mss = ms < 10 ? `00${ms}` : ms < 100 ? `0${ms}` : `${ms}`;
-      
-      return `${hh}:${mm}:${ss},${mss}`;
-    };
-
-    const srtContent = subtitleSegments
-      .map((seg, idx) => {
-        return `${idx + 1}\n${formatTimeSRT(seg.start)} --> ${formatTimeSRT(seg.end)}\n${seg.text}\n\n`;
-      })
-      .join("")
-      .trim();
-
-    const blob = new Blob([srtContent], { type: "text/srt;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.setAttribute("download", `subtitles_${jobId}.srt`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
-
   // Parse and normalize alignment array (works for both TTS and ASR layouts)
   const alignmentList = React.useMemo(() => {
     if (!jobStatus || !jobStatus.alignment) return [];
@@ -530,18 +537,19 @@ export const PlaygroundPanel: React.FC = () => {
       }
     }
 
-    let rawList: any[] = [];
+    let rawList: RawAlignmentItem[] = [];
     if (Array.isArray(alignmentData)) {
-      rawList = alignmentData;
+      rawList = alignmentData as RawAlignmentItem[];
     } else if (alignmentData && typeof alignmentData === "object") {
-      if (Array.isArray((alignmentData as any).words)) {
-        rawList = (alignmentData as any).words;
-      } else if (Array.isArray((alignmentData as any).chunks)) {
-        rawList = (alignmentData as any).chunks;
+      const container = alignmentData as AlignmentContainer;
+      if (Array.isArray(container.words)) {
+        rawList = container.words;
+      } else if (Array.isArray(container.chunks)) {
+        rawList = container.chunks;
       }
     }
 
-    return rawList.map((item: any) => {
+    return rawList.map((item: RawAlignmentItem) => {
       if (!item) return { word: "", start: 0, end: 0 };
       
       if (item.timestamp !== undefined) {
@@ -575,19 +583,20 @@ export const PlaygroundPanel: React.FC = () => {
   // Group word timings into sentence segments for the subtitle tab
   const subtitleSegments = React.useMemo(() => {
     if (alignmentList.length === 0) return [];
-    
+
     const segments: { text: string; start: number; end: number }[] = [];
     let currentSegmentWords: string[] = [];
     let segmentStart = alignmentList[0].start;
-    
-    alignmentList.forEach((item, index) => {
+
+    for (let index = 0; index < alignmentList.length; index++) {
+      const item = alignmentList[index];
       currentSegmentWords.push(item.word);
       const trimmedWord = item.word.trim();
-      
+
       const isPunctuationEnd = /[.!?]$/.test(trimmedWord);
       const isPause = index < alignmentList.length - 1 && (alignmentList[index + 1].start - item.end > 1.2);
       const isTooLong = currentSegmentWords.length >= 12;
-      
+
       if (isPunctuationEnd || isPause || isTooLong || index === alignmentList.length - 1) {
         segments.push({
           text: currentSegmentWords.join("").trim(),
@@ -599,17 +608,51 @@ export const PlaygroundPanel: React.FC = () => {
           currentSegmentWords = [];
         }
       }
-    });
-    
+    }
+
     return segments;
   }, [alignmentList]);
+
+  const handleDownloadSRT = () => {
+    if (subtitleSegments.length === 0) return;
+
+    const formatTimeSRT = (seconds: number) => {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = Math.floor(seconds % 60);
+      const ms = Math.floor((seconds % 1) * 1000);
+
+      const hh = h < 10 ? `0${h}` : `${h}`;
+      const mm = m < 10 ? `0${m}` : `${m}`;
+      const ss = s < 10 ? `0${s}` : `${s}`;
+      const mss = ms < 10 ? `00${ms}` : ms < 100 ? `0${ms}` : `${ms}`;
+
+      return `${hh}:${mm}:${ss},${mss}`;
+    };
+
+    const srtContent = subtitleSegments
+      .map((seg, idx) => {
+        return `${idx + 1}\n${formatTimeSRT(seg.start)} --> ${formatTimeSRT(seg.end)}\n${seg.text}\n\n`;
+      })
+      .join("")
+      .trim();
+
+    const blob = new Blob([srtContent], { type: "text/srt;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", `subtitles_${jobId}.srt`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
   return (
     <div className="w-full flex flex-col gap-6">
       {/* Header section */}
       <div className="flex flex-col gap-1 select-none max-w-fluid-editor mx-auto w-full">
         <div className="flex items-center gap-2.5">
-          <div className="bg-gradient-to-tr from-violet-600 via-indigo-600 to-accent p-1.5 rounded-lg text-white">
+          <div className="bg-primary p-1.5 rounded-lg text-primary-foreground">
             <Sparkles className="w-5.5 h-5.5" />
           </div>
           <div>
@@ -646,7 +689,7 @@ export const PlaygroundPanel: React.FC = () => {
               <label className="text-fluid-xs font-bold text-muted-foreground uppercase tracking-wider">Voice Mode</label>
               <select
                 value={mode}
-                onChange={(e) => setMode(e.target.value as any)}
+                onChange={(e) => setMode(e.target.value as "clone_voice" | "auto_voice" | "voice_design" | "asr")}
                 className="bg-secondary/40 border border-border/70 rounded-xl px-3 h-10 text-fluid-sm font-semibold text-foreground focus:outline-none w-full cursor-pointer shadow-sm"
               >
                 <option value="clone_voice">Sử dụng giọng mẫu (Clone)</option>
@@ -899,7 +942,7 @@ export const PlaygroundPanel: React.FC = () => {
               disabled={loading || (mode === "asr" ? !asrFile : !text)}
               className={`w-full h-11 rounded-xl font-bold text-fluid-sm transition-all duration-150 active:scale-[0.99] flex items-center justify-center gap-2 cursor-pointer shadow-md ${
                 !loading && (mode === "asr" ? asrFile : text)
-                  ? "bg-gradient-to-r from-violet-600 to-indigo-600 text-white hover:brightness-105 border-none shadow-lg shadow-indigo-600/10"
+                  ? "bg-primary hover:bg-primary/90 text-primary-foreground border-none shadow-lg shadow-primary/15"
                   : "bg-secondary text-muted-foreground cursor-not-allowed"
               }`}
             >
@@ -984,7 +1027,7 @@ export const PlaygroundPanel: React.FC = () => {
           {/* Main Karaoke Stage */}
           {jobStatus?.status === "completed" && (
             <div className="bg-card border border-border rounded-2xl flex flex-col shadow-sm overflow-hidden animate-fadeIn">
-              <audio ref={audioRef} src={authenticatedUrl} />
+              <audio ref={audioRef} src={audioBlobUrl || undefined} />
 
               {/* Display Alignment Analytics Metrics */}
               <div className="bg-secondary/25 border-b border-border p-4 grid grid-cols-3 gap-4 text-center select-none">
@@ -1145,7 +1188,7 @@ export const PlaygroundPanel: React.FC = () => {
                   <div className="animate-fadeIn">
                     {alignmentList.length > 0 ? (
                       <div className="flex flex-wrap gap-x-1.5 gap-y-2.5 items-center select-none">
-                        {alignmentList.map((item: any, index: number) => {
+                        {alignmentList.map((item, index: number) => {
                           const isActive = currentTime >= item.start && currentTime <= item.end;
                           const isPast = currentTime > item.end;
                           
@@ -1225,7 +1268,7 @@ export const PlaygroundPanel: React.FC = () => {
                     
                     <button
                       type="button" onClick={togglePlay}
-                      className="w-9 h-9 rounded-full bg-gradient-to-tr from-primary to-accent hover:brightness-105 text-white flex items-center justify-center cursor-pointer shadow hover:scale-105 duration-150 active:scale-95 shrink-0"
+                      className="w-10 h-10 rounded-full bg-primary hover:bg-primary/90 text-primary-foreground flex items-center justify-center cursor-pointer shadow hover:scale-105 duration-150 active:scale-95 shrink-0"
                     >
                       {isPlaying ? (
                         <Pause className="w-4.5 h-4.5 fill-current" />

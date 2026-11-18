@@ -71,7 +71,7 @@ async def text_to_speech(
         from app.models import VoiceSample
         db_sample = db.query(VoiceSample).filter(
             (VoiceSample.id == voice_val) | (VoiceSample.name == voice_val),
-            VoiceSample.user_id == current_user.id
+            (VoiceSample.user_id == current_user.id) | (VoiceSample.is_public == True),
         ).first()
         if db_sample:
             mode = "clone_voice"
@@ -205,36 +205,62 @@ async def text_to_speech(
             "alignment": alignment_data
         }
 
+    serve_path = job.output_audio_path
     media_type = "audio/wav"
     filename = f"speech_{job.id}.wav"
     if payload.response_format == "mp3":
+        import shutil
+        import subprocess
+
         media_type = "audio/mpeg"
         filename = f"speech_{job.id}.mp3"
-    
+        mp3_path = os.path.splitext(job.output_audio_path)[0] + ".mp3"
+        if os.path.exists(mp3_path):
+            serve_path = mp3_path
+        elif shutil.which("ffmpeg"):
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", job.output_audio_path, "-codec:a", "libmp3lame", "-qscale:a", "2", mp3_path],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                )
+                if os.path.exists(mp3_path):
+                    serve_path = mp3_path
+            except Exception as conv_err:
+                print(f"[Audio API] FFmpeg MP3 conversion fallback ({conv_err})")
+
     return FileResponse(
-        job.output_audio_path,
+        serve_path,
         media_type=media_type,
         filename=filename,
-        content_disposition_type="inline"
+        content_disposition_type="inline",
     )
+
 
 @router.get("/voices")
 def list_voices(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_user_or_api_key)
+    current_user: User = Depends(get_user_or_api_key),
 ):
-    """Lists available voices (voice samples uploaded by user + pre-defined presets)."""
+    """Lists available voices (voice samples uploaded by user + public + pre-defined presets)."""
     from app.models import VoiceSample
-    samples = db.query(VoiceSample).filter(VoiceSample.user_id == current_user.id).all()
-    
+
+    samples = (
+        db.query(VoiceSample)
+        .filter((VoiceSample.user_id == current_user.id) | (VoiceSample.is_public == True))
+        .all()
+    )
+
     voices = []
-    # Add user voice samples
     for s in samples:
+        display_name = s.name or s.id
         voices.append({
             "voice_id": s.id,
-            "name": s.name,
+            "name": display_name,
             "mode": "clone_voice",
-            "description": f"Giọng nhân bản từ file: {s.original_filename}"
+            "description": s.ref_text or f"Giọng nhân bản: {display_name}",
         })
         
     # Add default voice design presets

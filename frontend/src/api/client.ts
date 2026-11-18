@@ -10,11 +10,11 @@ export function getApiBaseUrl(): string {
       return "http://localhost:7860";
     }
     
-    // For Cloudflare Pages, custom domain (voice.oloka.net), etc., always route API requests through same-origin proxy
+    // Fallback in non-browser contexts
     return window.location.origin;
   }
-  
-  return "https://voice.oloka.net";
+
+  return "";
 }
 
 export function setApiBaseUrl(url: string) {
@@ -22,9 +22,20 @@ export function setApiBaseUrl(url: string) {
   void url;
 }
 
+export function getErrorMessage(err: unknown, fallback = "Đã xảy ra lỗi."): string {
+  if (err instanceof Error && err.message) {
+    return err.message;
+  }
+  if (typeof err === "string" && err.trim()) {
+    return err;
+  }
+  return fallback;
+}
+
 export interface HealthResponse {
   status: string;
   app: string;
+  git_commit?: string;
 }
 
 export interface VoiceSampleUploadResponse {
@@ -35,6 +46,7 @@ export interface VoiceSampleUploadResponse {
 
 export interface VoiceSampleResponse {
   id: string;
+  user_id?: string | null;
   source_type: string;
   ref_text: string | null;
   duration: number | null;
@@ -45,7 +57,14 @@ export interface VoiceSampleResponse {
   is_public: boolean;
   source_job_id: string | null;
   tags?: string[] | null;
-  source_job_data?: Record<string, any> | null;
+  source_job_data?: Record<string, unknown> | null;
+}
+
+export interface AlignmentWord {
+  word?: string;
+  text?: string;
+  start: number;
+  end: number;
 }
 
 export interface VoiceSampleUpdateRequest {
@@ -101,8 +120,8 @@ export interface JobStatusResponse {
   processing_time?: number;
   queue_time?: number;
   total_time?: number;
-  params?: Record<string, any>;
-  alignment?: any;
+  params?: Record<string, unknown>;
+  alignment?: AlignmentWord[] | Record<string, unknown> | null;
 }
 
 export interface ApiKeyResponse {
@@ -197,16 +216,19 @@ export interface PaginatedJobsResponse {
   total_pages: number;
 }
 
-export interface LLMProfile {
+export interface LLMProfilePublic {
   id: string;
   name: string;
   provider: string;
-  api_key?: string;
   model: string;
-  custom_endpoint?: string;
   thinking_effort: string;
   is_active: boolean;
   last_test_status: string;
+}
+
+export interface LLMProfile extends LLMProfilePublic {
+  api_key?: string;
+  custom_endpoint?: string;
   last_test_message?: string;
   last_tested_at?: string;
   created_at: string;
@@ -256,9 +278,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, newOptions);
   
   if (!response.ok) {
-    let errorDetail = "";
+    let errorDetail: string;
     try {
-      const errData = await response.json();
+      const errData = (await response.json()) as { detail?: string };
       errorDetail = errData.detail || response.statusText;
     } catch {
       errorDetail = response.statusText;
@@ -370,9 +392,8 @@ export const api = {
   },
 
   getASRAudioUrl: (jobId: string): string => {
-    const token = localStorage.getItem("VITE_JWT_TOKEN");
     const baseUrl = getApiBaseUrl();
-    return `${baseUrl}/v1/asr/jobs/${jobId}/audio?token=${token || ""}`;
+    return `${baseUrl}/v1/asr/jobs/${jobId}/audio`;
   },
   
   getJobStatus: async (jobId: string): Promise<JobStatusResponse> => {
@@ -516,12 +537,13 @@ export const api = {
     });
   },
 
-  oauthLogin: async (provider: string, redirectUri: string): Promise<{ auth_url: string }> => {
-    return request<{ auth_url: string }>(`/v1/auth/oauth/login/${provider}?redirect_uri=${encodeURIComponent(redirectUri)}`);
+  oauthLogin: async (provider: string, redirectUri: string): Promise<{ auth_url: string; state?: string }> => {
+    return request<{ auth_url: string; state?: string }>(`/v1/auth/oauth/login/${provider}?redirect_uri=${encodeURIComponent(redirectUri)}`);
   },
 
-  oauthCallback: async (provider: string, code: string, redirectUri: string): Promise<{ access_token: string; token_type: string }> => {
-    return request<{ access_token: string; token_type: string }>(`/v1/auth/oauth/callback/${provider}?code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}`);
+  oauthCallback: async (provider: string, code: string, redirectUri: string, state?: string): Promise<{ access_token: string; token_type: string }> => {
+    const stateParam = state ? `&state=${encodeURIComponent(state)}` : "";
+    return request<{ access_token: string; token_type: string }>(`/v1/auth/oauth/callback/${provider}?code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(redirectUri)}${stateParam}`);
   },
 
   getMe: async (): Promise<UserMeResponse> => {
@@ -736,15 +758,17 @@ export const api = {
           try {
             const res = JSON.parse(xhr.responseText) as VideoDubbingJobResponse;
             resolve(res);
-          } catch (e) {
+          } catch {
             reject(new Error("Không thể phân tích phản hồi từ server."));
           }
         } else {
           let errorMsg = "Tải video lên thất bại.";
           try {
-            const errData = JSON.parse(xhr.responseText);
+            const errData = JSON.parse(xhr.responseText) as { detail?: string };
             errorMsg = errData.detail || errorMsg;
-          } catch {}
+          } catch {
+            errorMsg = xhr.statusText || errorMsg;
+          }
           reject(new Error(errorMsg));
         }
       };
@@ -789,20 +813,45 @@ export const api = {
     });
   },
 
-  pollYouTubeOAuth: async (deviceCode: string): Promise<{ status: "success" | "pending" | "error"; message?: string; error?: string; token_data?: any }> => {
-    return request<{ status: "success" | "pending" | "error"; message?: string; error?: string; token_data?: any }>("/v1/video-dubbing/oauth/poll", {
+  pollYouTubeOAuth: async (deviceCode: string): Promise<{ status: "success" | "pending" | "error"; message?: string; error?: string; token_data?: Record<string, unknown> }> => {
+    return request<{ status: "success" | "pending" | "error"; message?: string; error?: string; token_data?: Record<string, unknown> }>("/v1/video-dubbing/oauth/poll", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ device_code: deviceCode }),
     });
   },
 
-  syncYouTubeOAuth: async (tokenData: any): Promise<{ status: string; connected: boolean }> => {
+  syncYouTubeOAuth: async (tokenData: Record<string, unknown>): Promise<{ status: string; connected: boolean }> => {
     return request<{ status: string; connected: boolean }>("/v1/video-dubbing/oauth/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token_data: tokenData }),
     });
+  },
+
+  listDubbingLlmProfiles: async (): Promise<LLMProfilePublic[]> => {
+    return request<LLMProfilePublic[]>("/v1/video-dubbing/llm-profiles");
+  },
+
+  fetchProtectedAudioBlobUrl: async (url: string): Promise<{ blobUrl: string; isObjectUrl: boolean }> => {
+    const isDirect =
+      url.startsWith("blob:") ||
+      url.startsWith("data:") ||
+      url.includes("huggingface.co/datasets");
+    if (isDirect) {
+      return { blobUrl: url, isObjectUrl: false };
+    }
+    const token = localStorage.getItem("VITE_JWT_TOKEN");
+    const headers: HeadersInit = {};
+    if ((token && !url.startsWith("http")) || (token && url.startsWith(getApiBaseUrl() || window.location.origin))) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    const response = await fetch(url, { headers });
+    if (!response.ok) {
+      throw new Error(`Không thể tải tệp âm thanh (HTTP ${response.status}).`);
+    }
+    const blob = await response.blob();
+    return { blobUrl: URL.createObjectURL(blob), isObjectUrl: true };
   },
 
   disconnectYouTubeOAuth: async (): Promise<{ status: string; message: string }> => {

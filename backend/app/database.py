@@ -295,12 +295,13 @@ def auto_align_legacy_user_ids(db_url: str):
         row = cursor.fetchone()
         if row:
             admin_id = row[0]
-            cursor.execute("UPDATE voice_samples SET user_id = ? WHERE user_id != ?", (admin_id, admin_id))
-            cursor.execute("UPDATE api_keys SET user_id = ? WHERE user_id != ?", (admin_id, admin_id))
-            cursor.execute("UPDATE tts_jobs SET user_id = ? WHERE user_id != ?", (admin_id, admin_id))
-            cursor.execute("UPDATE user_settings SET user_id = ? WHERE user_id != ?", (admin_id, admin_id))
+            orphan_cond = "user_id IS NULL OR user_id = '' OR user_id NOT IN (SELECT id FROM users)"
+            cursor.execute(f"UPDATE voice_samples SET user_id = ? WHERE {orphan_cond}", (admin_id,))
+            cursor.execute(f"UPDATE api_keys SET user_id = ? WHERE {orphan_cond}", (admin_id,))
+            cursor.execute(f"UPDATE tts_jobs SET user_id = ? WHERE {orphan_cond}", (admin_id,))
+            cursor.execute(f"UPDATE user_settings SET user_id = ? WHERE {orphan_cond}", (admin_id,))
             conn.commit()
-            print(f"[Database Auto-Align] Permanently aligned legacy user_id to admin ID: {admin_id}")
+            print(f"[Database Auto-Align] Aligned orphaned legacy records to admin ID: {admin_id}")
     except Exception as e:
         print(f"[Database Auto-Align Error] {e}")
     finally:

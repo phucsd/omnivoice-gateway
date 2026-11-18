@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional, List
 from datetime import datetime, timedelta
 
@@ -11,6 +11,7 @@ from app.models import User, ApiUsageLog, TTSJob, ApiKey, SystemSetting, LLMProf
 from app.schemas import LLMProfileResponse, LLMProfileCreateRequest, LLMProfileUpdateRequest, TestLLMProfileResponse
 from app.utils.auth import get_current_user, get_password_hash
 from app.utils.ids import generate_id
+from app.utils.url_security import validate_safe_external_url
 from app.config import settings
 
 router = APIRouter(prefix="/v1/admin", tags=["Admin Portal"])
@@ -22,6 +23,37 @@ def get_admin_user(current_user: User = Depends(get_current_user)) -> User:
             detail="Bạn không có quyền truy cập trang quản trị."
         )
     return current_user
+
+
+def _mask_secret(value: Optional[str]) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 8:
+        return "••••••••"
+    return f"{raw[:4]}••••••••{raw[-4:]}"
+
+
+def _is_masked_secret(value: Optional[str]) -> bool:
+    return bool(value and "••••" in value)
+
+
+def _serialize_llm_profile(profile: LLMProfile) -> LLMProfileResponse:
+    return LLMProfileResponse(
+        id=profile.id,
+        name=profile.name,
+        provider=profile.provider,
+        api_key=_mask_secret(profile.api_key),
+        model=profile.model,
+        custom_endpoint=profile.custom_endpoint,
+        thinking_effort=profile.thinking_effort,
+        is_active=profile.is_active,
+        last_test_status=profile.last_test_status,
+        last_test_message=profile.last_test_message,
+        last_tested_at=profile.last_tested_at,
+        created_at=profile.created_at,
+        updated_at=profile.updated_at,
+    )
 
 @router.get("/debug-db")
 def debug_db(db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
@@ -245,8 +277,7 @@ def run_sqlite_recover(db: Session = Depends(get_db), current_user: User = Depen
         
     target_backup = backup_files[0]
     
-    cmd = f'sqlite3 "{target_backup}" ".recover"'
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    res = subprocess.run(["sqlite3", target_backup, ".recover"], shell=False, capture_output=True, text=True)
     
     if not res.stdout or "INSERT INTO" not in res.stdout:
         return {"status": "error", "message": f"sqlite3 recover failed or no output. Stderr: {res.stderr}"}
@@ -291,8 +322,7 @@ class UserAdminResponse(BaseModel):
     oauth_provider: Optional[str]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class UserCreateRequest(BaseModel):
     username: str
@@ -318,8 +348,7 @@ class AdminApiKeyResponse(BaseModel):
     created_at: datetime
     last_used_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class AdminApiKeyCreateRequest(BaseModel):
     name: str
@@ -623,10 +652,10 @@ def get_system_settings_admin(
         smtp_host=smtp_host,
         smtp_port=smtp_port,
         smtp_username=smtp_username,
-        smtp_password=smtp_password,
+        smtp_password=_mask_secret(smtp_password),
         smtp_from=smtp_from,
         kaggle_username=kaggle_username,
-        kaggle_key=kaggle_key,
+        kaggle_key=_mask_secret(kaggle_key),
         kaggle_kernel_ref=kaggle_kernel_ref,
         kaggle_kernel_slug=kaggle_kernel_slug,
         kaggle_kernel_title=kaggle_kernel_title,
@@ -635,9 +664,9 @@ def get_system_settings_admin(
         kaggle_idle_timeout_seconds=kaggle_idle_timeout_seconds,
         kaggle_worker_dir=kaggle_worker_dir,
         ui_layout=ui_layout,
-        hf_token=hf_token,
+        hf_token=_mask_secret(hf_token),
         llm_provider=llm_provider,
-        llm_api_key=llm_api_key,
+        llm_api_key=_mask_secret(llm_api_key),
         llm_model=llm_model,
         llm_custom_endpoint=llm_custom_endpoint,
         llm_thinking_effort=llm_thinking_effort
@@ -683,14 +712,14 @@ def update_system_settings_admin(
             save_setting("smtp_port", payload.smtp_port)
         if payload.smtp_username is not None:
             save_setting("smtp_username", payload.smtp_username)
-        if payload.smtp_password is not None:
+        if payload.smtp_password is not None and not _is_masked_secret(payload.smtp_password):
             save_setting("smtp_password", payload.smtp_password)
         if payload.smtp_from is not None:
             save_setting("smtp_from", payload.smtp_from)
             
         if payload.kaggle_username is not None:
             save_setting("kaggle_username", payload.kaggle_username)
-        if payload.kaggle_key is not None:
+        if payload.kaggle_key is not None and not _is_masked_secret(payload.kaggle_key):
             save_setting("kaggle_key", payload.kaggle_key)
         if payload.kaggle_kernel_ref is not None:
             save_setting("kaggle_kernel_ref", payload.kaggle_kernel_ref)
@@ -706,16 +735,22 @@ def update_system_settings_admin(
             save_setting("kaggle_idle_timeout_seconds", payload.kaggle_idle_timeout_seconds)
         if payload.kaggle_worker_dir is not None:
             save_setting("kaggle_worker_dir", payload.kaggle_worker_dir)
-        if payload.hf_token is not None:
+        if payload.hf_token is not None and not _is_masked_secret(payload.hf_token):
             save_setting("hf_token", payload.hf_token)
         if payload.llm_provider is not None:
             save_setting("llm_provider", payload.llm_provider)
-        if payload.llm_api_key is not None:
+        if payload.llm_api_key is not None and not _is_masked_secret(payload.llm_api_key):
             save_setting("llm_api_key", payload.llm_api_key)
         if payload.llm_model is not None:
             save_setting("llm_model", payload.llm_model)
         if payload.llm_custom_endpoint is not None:
-            save_setting("llm_custom_endpoint", payload.llm_custom_endpoint)
+            endpoint_val = payload.llm_custom_endpoint.strip()
+            if endpoint_val:
+                try:
+                    validate_safe_external_url(endpoint_val)
+                except ValueError as ve:
+                    raise HTTPException(status_code=400, detail=f"LLM Custom Endpoint không hợp lệ: {ve}")
+            save_setting("llm_custom_endpoint", endpoint_val)
         if payload.llm_thinking_effort is not None:
             save_setting("llm_thinking_effort", payload.llm_thinking_effort)
         
@@ -748,7 +783,8 @@ def scan_llm_models_admin(
         entry = db.query(SystemSetting).filter(SystemSetting.key == key).first()
         return entry.value if entry else default
 
-    api_key = payload.api_key or get_setting("llm_api_key", settings.LLM_API_KEY)
+    raw_api_key = None if _is_masked_secret(payload.api_key) else payload.api_key
+    api_key = raw_api_key or get_setting("llm_api_key", settings.LLM_API_KEY)
     custom_endpoint = payload.custom_endpoint or get_setting("llm_custom_endpoint", settings.LLM_CUSTOM_ENDPOINT)
 
     import requests
@@ -759,7 +795,7 @@ def scan_llm_models_admin(
             if not api_key:
                 raise HTTPException(status_code=400, detail="Vui lòng nhập API Key để quét danh sách Gemini models.")
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-            res = requests.get(url, timeout=15)
+            res = requests.get(url, timeout=15, allow_redirects=False)
             res.raise_for_status()
             data = res.json()
             raw_models = data.get("models", [])
@@ -776,11 +812,13 @@ def scan_llm_models_admin(
             elif not url.endswith("/models"):
                 url = url.rstrip("/") + "/models"
 
+            validate_safe_external_url(url)
+
             headers = {}
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
             
-            res = requests.get(url, headers=headers, timeout=15)
+            res = requests.get(url, headers=headers, timeout=15, allow_redirects=False)
             res.raise_for_status()
             data = res.json()
             raw_models = data.get("data", [])
@@ -868,8 +906,10 @@ def list_llm_profiles(
     db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user)
 ):
-    """List all configured LLM Profiles."""
-    return db.query(LLMProfile).order_by(LLMProfile.is_active.desc(), LLMProfile.created_at.desc()).all()
+    """List all configured LLM Profiles with masked secrets."""
+    _ = admin
+    profiles = db.query(LLMProfile).order_by(LLMProfile.is_active.desc(), LLMProfile.created_at.desc()).all()
+    return [_serialize_llm_profile(p) for p in profiles]
 
 @router.post("/llm-profiles", response_model=LLMProfileResponse)
 def create_llm_profile(
@@ -878,6 +918,14 @@ def create_llm_profile(
     admin: User = Depends(get_admin_user)
 ):
     """Create a new LLM Profile."""
+    _ = admin
+    custom_ep = (payload.custom_endpoint or "").strip()
+    if custom_ep:
+        try:
+            validate_safe_external_url(custom_ep)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=f"Custom Endpoint không hợp lệ: {ve}")
+
     if payload.is_active:
         db.query(LLMProfile).update({LLMProfile.is_active: False})
 
@@ -890,14 +938,14 @@ def create_llm_profile(
         provider=payload.provider,
         api_key=payload.api_key or "",
         model=payload.model,
-        custom_endpoint=payload.custom_endpoint or "",
+        custom_endpoint=custom_ep,
         thinking_effort=payload.thinking_effort or "none",
         is_active=is_act
     )
     db.add(profile)
     db.commit()
     db.refresh(profile)
-    return profile
+    return _serialize_llm_profile(profile)
 
 @router.put("/llm-profiles/{profile_id}", response_model=LLMProfileResponse)
 def update_llm_profile(
@@ -907,9 +955,16 @@ def update_llm_profile(
     admin: User = Depends(get_admin_user)
 ):
     """Update an existing LLM Profile."""
+    _ = admin
     profile = db.query(LLMProfile).filter(LLMProfile.id == profile_id).first()
     if not profile:
         raise HTTPException(status_code=404, detail="Không tìm thấy LLM Profile.")
+
+    if payload.custom_endpoint is not None and payload.custom_endpoint.strip():
+        try:
+            validate_safe_external_url(payload.custom_endpoint.strip())
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=f"Custom Endpoint không hợp lệ: {ve}")
 
     if payload.is_active is True:
         db.query(LLMProfile).update({LLMProfile.is_active: False})
@@ -918,12 +973,12 @@ def update_llm_profile(
         profile.name = payload.name
     if payload.provider is not None:
         profile.provider = payload.provider
-    if payload.api_key is not None:
+    if payload.api_key is not None and not _is_masked_secret(payload.api_key):
         profile.api_key = payload.api_key
     if payload.model is not None:
         profile.model = payload.model
     if payload.custom_endpoint is not None:
-        profile.custom_endpoint = payload.custom_endpoint
+        profile.custom_endpoint = payload.custom_endpoint.strip()
     if payload.thinking_effort is not None:
         profile.thinking_effort = payload.thinking_effort
     if payload.is_active is not None:
@@ -931,7 +986,7 @@ def update_llm_profile(
 
     db.commit()
     db.refresh(profile)
-    return profile
+    return _serialize_llm_profile(profile)
 
 @router.delete("/llm-profiles/{profile_id}", response_model=dict)
 def delete_llm_profile(
@@ -971,7 +1026,7 @@ def activate_llm_profile(
     profile.is_active = True
     db.commit()
     db.refresh(profile)
-    return profile
+    return _serialize_llm_profile(profile)
 
 @router.post("/llm-profiles/{profile_id}/test", response_model=TestLLMProfileResponse)
 def test_llm_profile_connection(
@@ -980,6 +1035,7 @@ def test_llm_profile_connection(
     admin: User = Depends(get_admin_user)
 ):
     """Tests connection to a stored LLM Profile and persists test status to DB."""
+    _ = admin
     profile = db.query(LLMProfile).filter(LLMProfile.id == profile_id).first()
     if not profile:
         raise HTTPException(status_code=404, detail="Không tìm thấy LLM Profile.")
@@ -995,7 +1051,7 @@ def test_llm_profile_connection(
             if not profile.api_key:
                 raise ValueError("Chưa nhập Gemini API Key.")
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={profile.api_key}"
-            res = requests.get(url, timeout=10)
+            res = requests.get(url, timeout=10, allow_redirects=False)
             res.raise_for_status()
             latency = round((time.time() - start_time) * 1000, 1)
             status_str = "success"
@@ -1007,10 +1063,11 @@ def test_llm_profile_connection(
                 url = f"{base_url}/v1/models"
             else:
                 url = f"{base_url}/models"
+            validate_safe_external_url(url)
             headers = {}
             if profile.api_key:
                 headers["Authorization"] = f"Bearer {profile.api_key}"
-            res = requests.get(url, headers=headers, timeout=10)
+            res = requests.get(url, headers=headers, timeout=10, allow_redirects=False)
             res.raise_for_status()
             latency = round((time.time() - start_time) * 1000, 1)
             status_str = "success"

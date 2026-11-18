@@ -9,7 +9,7 @@ interface JobStatusCardProps {
   errorMessage?: string | null;
 }
 
-const statusMap: Record<string, { label: string; color: string; icon: any }> = {
+const statusMap: Record<string, { label: string; color: string; icon: React.ComponentType<{ className?: string }> }> = {
   queued: {
     label: "Đang xếp hàng chờ",
     color: "text-muted-foreground dark:text-muted-foreground bg-muted/10 border-border/20",

@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { Users, Activity, BarChart3, ArrowLeft, Trash2, ShieldCheck, ShieldAlert, CheckCircle, RefreshCw, Clock, Globe, Settings, UserPlus, Pencil, KeyRound, Plus, Eye, EyeOff, Save, X, Search, Loader2, Bot, Zap, Check, AlertCircle, FlaskConical, Radio } from "lucide-react";
-import { api } from "../api/client";
-import type { UserAdminResponse, AdminStatsResponse, ApiLogResponse, AdminApiKeyResponse, LLMProfile } from "../api/client";
+import { api, getErrorMessage } from "../api/client";
+import type { UserAdminResponse, AdminStatsResponse, ApiLogResponse, AdminApiKeyResponse, LLMProfile, SystemSettingsResponse, UserUpdateRequest } from "../api/client";
 
 interface AdminDashboardProps {
   onBack: () => void;
@@ -57,7 +57,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
   const [newKeyName, setNewKeyName] = useState("");
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
 
-  const [settingsData, setSettingsData] = useState<any>({
+  const [settingsData, setSettingsData] = useState<SystemSettingsResponse>({
     worker_mode: "mock",
     allow_registration: true,
     require_admin_approval: false,
@@ -88,60 +88,58 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
   const [scannedModels, setScannedModels] = useState<string[]>([]);
   const [scanMsg, setScanMsg] = useState<string | null>(null);
 
-  const fetchUsers = async () => {
+  const fetchUsers = useCallback(async () => {
     try {
       const res = await api.getAdminUsers();
       setUsers(res);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-      setStatusMsg({ type: "error", text: err.message || "Lỗi tải danh sách người dùng." });
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi tải danh sách người dùng.") });
     }
-  };
+  }, []);
 
-  const fetchStats = async () => {
+  const fetchStats = useCallback(async () => {
     try {
       const res = await api.getAdminStats();
       setStats(res);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-      setStatusMsg({ type: "error", text: err.message || "Lỗi tải số liệu thống kê." });
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi tải số liệu thống kê.") });
     }
-  };
+  }, []);
 
-  const fetchLogs = async () => {
+  const fetchLogs = useCallback(async () => {
     try {
       const res = await api.getAdminLogs();
       setLogs(res);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-      setStatusMsg({ type: "error", text: err.message || "Lỗi tải nhật ký hệ thống." });
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi tải nhật ký hệ thống.") });
     }
-  };
+  }, []);
 
-  const fetchSystemSettings = async () => {
+  const fetchSystemSettings = useCallback(async () => {
     try {
       const res = await api.adminGetSystemSettings();
       setSettingsData(res);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-      setStatusMsg({ type: "error", text: err.message || "Lỗi tải cấu hình hệ thống." });
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi tải cấu hình hệ thống.") });
     }
-  };
+  }, []);
 
-
-
-  const fetchLlmProfiles = async () => {
+  const fetchLlmProfiles = useCallback(async () => {
     setLoadingLlm(true);
     try {
       const res = await api.listLlmProfiles();
       setLlmProfiles(res);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-      setStatusMsg({ type: "error", text: err.message || "Lỗi tải danh sách LLM Profiles." });
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi tải danh sách LLM Profiles.") });
     } finally {
       setLoadingLlm(false);
     }
-  };
+  }, []);
 
   const handleTestLlmProfile = async (profileId: string) => {
     setTestingProfileId(profileId);
@@ -153,8 +151,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       } else {
         setStatusMsg({ type: "error", text: res.message });
       }
-    } catch (err: any) {
-      setStatusMsg({ type: "error", text: err.message || "Lỗi kiểm tra kết nối LLM." });
+    } catch (err: unknown) {
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi kiểm tra kết nối LLM.") });
     } finally {
       setTestingProfileId(null);
     }
@@ -166,8 +164,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       setStatusMsg({ type: "success", text: "Đã kích hoạt Profile LLM mới cho toàn hệ thống!" });
       await fetchLlmProfiles();
       onSettingsChanged?.();
-    } catch (err: any) {
-      setStatusMsg({ type: "error", text: err.message || "Lỗi kích hoạt LLM Profile." });
+    } catch (err: unknown) {
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi kích hoạt LLM Profile.") });
     }
   };
 
@@ -178,8 +176,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       setStatusMsg({ type: "success", text: `Đã xóa LLM Profile "${name}".` });
       await fetchLlmProfiles();
       onSettingsChanged?.();
-    } catch (err: any) {
-      setStatusMsg({ type: "error", text: err.message || "Lỗi xóa LLM Profile." });
+    } catch (err: unknown) {
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi xóa LLM Profile.") });
     }
   };
 
@@ -198,7 +196,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
   const handleOpenEditProfileModal = (p: LLMProfile) => {
     setEditingProfileId(p.id);
     setProfName(p.name);
-    setProfProvider(p.provider as any);
+    const provider = p.provider === "gemini" || p.provider === "openai" || p.provider === "custom" ? p.provider : "custom";
+    setProfProvider(provider);
     setProfApiKey(p.api_key || "");
     setProfModel(p.model);
     setProfCustomEndpoint(p.custom_endpoint || "");
@@ -241,8 +240,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       setShowProfileModal(false);
       await fetchLlmProfiles();
       onSettingsChanged?.();
-    } catch (err: any) {
-      setStatusMsg({ type: "error", text: err.message || "Lỗi lưu LLM Profile." });
+    } catch (err: unknown) {
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi lưu LLM Profile.") });
     }
   };
 
@@ -258,14 +257,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       } else {
         setScanMsg("Không tìm thấy mô hình nào từ Endpoint / Key.");
       }
-    } catch (err: any) {
-      setScanMsg(`Lỗi khi quét mô hình: ${err.message}`);
+    } catch (err: unknown) {
+      setScanMsg(`Lỗi khi quét mô hình: ${getErrorMessage(err, "Thất bại")}`);
     } finally {
       setScanningModels(false);
     }
   };
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setLoading(true);
     setStatusMsg(null);
     if (activeTab === "users") {
@@ -280,11 +279,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       await fetchSystemSettings();
     }
     setLoading(false);
-  };
+  }, [activeTab, fetchLlmProfiles, fetchLogs, fetchStats, fetchSystemSettings, fetchUsers]);
 
   useEffect(() => {
-    loadData();
-  }, [activeTab]);
+    let cancelled = false;
+    void Promise.resolve().then(async () => {
+      if (cancelled) return;
+      await loadData();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [loadData]);
+
+  useEffect(() => {
+    if (!showCreateModal && !editingUser && !keysUser && !showProfileModal) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (showProfileModal) setShowProfileModal(false);
+        else if (keysUser) setKeysUser(null);
+        else if (editingUser) setEditingUser(null);
+        else if (showCreateModal) setShowCreateModal(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [showCreateModal, editingUser, keysUser, showProfileModal]);
 
   const handleToggleAdmin = async (userId: string, currentVal: boolean) => {
     setActionLoading(userId + "_admin");
@@ -293,8 +313,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       await api.adminUpdateUser(userId, { is_admin: !currentVal });
       setStatusMsg({ type: "success", text: "Cập nhật quyền quản trị thành công." });
       await fetchUsers();
-    } catch (err: any) {
-      setStatusMsg({ type: "error", text: err.message || "Lỗi cập nhật quyền quản trị." });
+    } catch (err: unknown) {
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi cập nhật quyền quản trị.") });
     } finally {
       setActionLoading(null);
     }
@@ -307,8 +327,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       await api.adminUpdateUser(userId, { is_verified: !currentVal });
       setStatusMsg({ type: "success", text: "Cập nhật trạng thái xác thực thành công." });
       await fetchUsers();
-    } catch (err: any) {
-      setStatusMsg({ type: "error", text: err.message || "Lỗi cập nhật trạng thái xác thực." });
+    } catch (err: unknown) {
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi cập nhật trạng thái xác thực.") });
     } finally {
       setActionLoading(null);
     }
@@ -321,8 +341,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       await api.adminUpdateUser(userId, { is_approved: true });
       setStatusMsg({ type: "success", text: `Đã phê duyệt tài khoản @${username} thành công.` });
       await fetchUsers();
-    } catch (err: any) {
-      setStatusMsg({ type: "error", text: err.message || "Lỗi phê duyệt người dùng." });
+    } catch (err: unknown) {
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi phê duyệt người dùng.") });
     } finally {
       setActionLoading(null);
     }
@@ -336,8 +356,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       await api.deleteUser(userId);
       setStatusMsg({ type: "success", text: `Đã xóa thành công người dùng @${username}.` });
       await fetchUsers();
-    } catch (err: any) {
-      setStatusMsg({ type: "error", text: err.message || "Lỗi xóa người dùng." });
+    } catch (err: unknown) {
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi xóa người dùng.") });
     } finally {
       setActionLoading(null);
     }
@@ -365,8 +385,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       setCreateIsApproved(true);
       setCreateIsAdmin(false);
       await fetchUsers();
-    } catch (err: any) {
-      alert("Lỗi tạo người dùng: " + err.message);
+    } catch (err: unknown) {
+      alert("Lỗi tạo người dùng: " + getErrorMessage(err, "Thất bại"));
     }
   };
 
@@ -385,7 +405,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
     if (!editingUser) return;
     setStatusMsg(null);
     try {
-      const payload: any = {
+      const payload: UserUpdateRequest = {
         username: editUsername,
         email: editEmail,
         is_verified: editIsVerified,
@@ -399,8 +419,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       setStatusMsg({ type: "success", text: `Cập nhật tài khoản @${editUsername} thành công.` });
       setEditingUser(null);
       await fetchUsers();
-    } catch (err: any) {
-      alert("Lỗi cập nhật người dùng: " + err.message);
+    } catch (err: unknown) {
+      alert("Lỗi cập nhật người dùng: " + getErrorMessage(err, "Thất bại"));
     }
   };
 
@@ -411,8 +431,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
     try {
       const keys = await api.adminGetUserApiKeys(user.id);
       setUserKeys(keys);
-    } catch (err: any) {
-      alert("Lỗi lấy danh sách API Keys: " + err.message);
+    } catch (err: unknown) {
+      alert("Lỗi lấy danh sách API Keys: " + getErrorMessage(err, "Thất bại"));
     }
   };
 
@@ -426,8 +446,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       // Reload keys
       const keys = await api.adminGetUserApiKeys(keysUser.id);
       setUserKeys(keys);
-    } catch (err: any) {
-      alert("Lỗi tạo API Key: " + err.message);
+    } catch (err: unknown) {
+      alert("Lỗi tạo API Key: " + getErrorMessage(err, "Thất bại"));
     }
   };
 
@@ -439,8 +459,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
         const keys = await api.adminGetUserApiKeys(keysUser.id);
         setUserKeys(keys);
       }
-    } catch (err: any) {
-      alert("Lỗi xóa API Key: " + err.message);
+    } catch (err: unknown) {
+      alert("Lỗi xóa API Key: " + getErrorMessage(err, "Thất bại"));
     }
   };
 
@@ -452,8 +472,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       setStatusMsg({ type: "success", text: "Cấu hình hệ thống đã được lưu thành công." });
       await fetchSystemSettings();
       onSettingsChanged?.();
-    } catch (err: any) {
-      setStatusMsg({ type: "error", text: err.message || "Lỗi lưu cấu hình hệ thống." });
+    } catch (err: unknown) {
+      setStatusMsg({ type: "error", text: getErrorMessage(err, "Lỗi lưu cấu hình hệ thống.") });
     }
   };
 
@@ -1234,6 +1254,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       {showCreateModal && (
         <div
           className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="create-user-modal-title"
           onClick={() => setShowCreateModal(false)}
         >
           <div
@@ -1241,13 +1264,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
             onClick={(e) => e.stopPropagation()}
           >
             <button
+              type="button"
+              aria-label="Đóng hộp thoại"
               onClick={() => setShowCreateModal(false)}
-              className="absolute right-4 top-4 text-muted-foreground hover:text-foreground cursor-pointer"
+              className="absolute right-3 top-3 p-1.5 text-muted-foreground hover:text-foreground cursor-pointer rounded-lg hover:bg-secondary"
             >
               <X className="w-4 h-4" />
             </button>
 
-            <h3 className="text-sm font-bold text-foreground flex items-center gap-2">
+            <h3 id="create-user-modal-title" className="text-sm font-bold text-foreground flex items-center gap-2">
               <UserPlus className="w-4 h-4 text-primary" />
               <span>Tạo tài khoản người dùng</span>
             </h3>
@@ -1329,7 +1354,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
 
               <button
                 type="submit"
-                className="w-full bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs py-2.5 rounded-lg cursor-pointer mt-3 shadow-md shadow-primary/15"
+                className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-bold text-xs py-2.5 rounded-lg cursor-pointer mt-3 shadow-md shadow-primary/15"
               >
                 Tạo người dùng
               </button>
@@ -1342,6 +1367,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       {editingUser && (
         <div
           className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="edit-user-modal-title"
           onClick={() => setEditingUser(null)}
         >
           <div
@@ -1349,13 +1377,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
             onClick={(e) => e.stopPropagation()}
           >
             <button
+              type="button"
+              aria-label="Đóng hộp thoại"
               onClick={() => setEditingUser(null)}
-              className="absolute right-4 top-4 text-muted-foreground hover:text-foreground cursor-pointer"
+              className="absolute right-3 top-3 p-1.5 text-muted-foreground hover:text-foreground cursor-pointer rounded-lg hover:bg-secondary"
             >
               <X className="w-4 h-4" />
             </button>
 
-            <h3 className="text-sm font-bold text-foreground flex items-center gap-2">
+            <h3 id="edit-user-modal-title" className="text-sm font-bold text-foreground flex items-center gap-2">
               <Pencil className="w-4 h-4 text-primary" />
               <span>Chỉnh sửa thông tin tài khoản</span>
             </h3>
@@ -1437,7 +1467,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
 
               <button
                 type="submit"
-                className="w-full bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs py-2.5 rounded-lg cursor-pointer mt-3 shadow-md shadow-primary/15"
+                className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-bold text-xs py-2.5 rounded-lg cursor-pointer mt-3 shadow-md shadow-primary/15"
               >
                 Cập nhật thông tin
               </button>
@@ -1450,6 +1480,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       {keysUser && (
         <div
           className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="user-keys-modal-title"
           onClick={() => setKeysUser(null)}
         >
           <div
@@ -1457,13 +1490,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
             onClick={(e) => e.stopPropagation()}
           >
             <button
+              type="button"
+              aria-label="Đóng hộp thoại"
               onClick={() => setKeysUser(null)}
-              className="absolute right-4 top-4 text-muted-foreground hover:text-foreground cursor-pointer"
+              className="absolute right-3 top-3 p-1.5 text-muted-foreground hover:text-foreground cursor-pointer rounded-lg hover:bg-secondary"
             >
               <X className="w-4 h-4" />
             </button>
 
-            <h3 className="text-sm font-bold text-foreground flex items-center gap-2 border-b border-border pb-2.5">
+            <h3 id="user-keys-modal-title" className="text-sm font-bold text-foreground flex items-center gap-2 border-b border-border pb-2.5">
               <KeyRound className="w-4 h-4 text-primary" />
               <span>Quản lý API Keys của @{keysUser.username}</span>
             </h3>
@@ -1480,7 +1515,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
               />
               <button
                 type="submit"
-                className="bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs px-4 py-2 rounded-lg cursor-pointer flex items-center gap-1 shadow-md shadow-primary/10"
+                className="bg-primary hover:bg-primary/90 text-primary-foreground font-bold text-xs px-4 py-2 rounded-lg cursor-pointer flex items-center gap-1 shadow-md shadow-primary/10"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>Tạo Key</span>
@@ -1536,6 +1571,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       {showProfileModal && (
         <div
           className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="llm-profile-modal-title"
           onClick={() => setShowProfileModal(false)}
         >
           <div
@@ -1543,8 +1581,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
             onClick={(e) => e.stopPropagation()}
           >
             <button
+              type="button"
+              aria-label="Đóng hộp thoại"
               onClick={() => setShowProfileModal(false)}
-              className="absolute right-5 top-5 text-muted-foreground hover:text-foreground cursor-pointer"
+              className="absolute right-4 top-4 p-1.5 text-muted-foreground hover:text-foreground cursor-pointer rounded-lg hover:bg-secondary"
             >
               <X className="w-5 h-5" />
             </button>
@@ -1554,7 +1594,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                 <Bot className="w-5 h-5" />
               </div>
               <div>
-                <h3 className="font-bold text-sm text-foreground">
+                <h3 id="llm-profile-modal-title" className="font-bold text-sm text-foreground">
                   {editingProfileId ? "Chỉnh sửa LLM Profile" : "Thêm LLM Profile Mới"}
                 </h3>
                 <p className="text-[10px] text-muted-foreground font-semibold">
@@ -1583,7 +1623,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                 <select
                   value={profProvider}
                   onChange={(e) => {
-                    const p = e.target.value as any;
+                    const p = e.target.value as "gemini" | "openai" | "custom";
                     setProfProvider(p);
                     if (p === "gemini" && !profModel.includes("gemini")) setProfModel("gemini-2.5-flash");
                     else if (p === "openai" && !profModel.includes("gpt")) setProfModel("gpt-4o-mini");
@@ -1718,7 +1758,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs rounded-xl cursor-pointer shadow-md shadow-primary/20"
+                  className="px-5 py-2 bg-primary hover:bg-primary/90 text-primary-foreground font-bold text-xs rounded-xl cursor-pointer shadow-md shadow-primary/20"
                 >
                   {editingProfileId ? "Cập nhật Profile" : "Lưu Profile Mới"}
                 </button>

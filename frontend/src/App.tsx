@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Sparkles, Radio, RefreshCw, Layers, LogOut, Server, KeyRound, BookOpen, Sun, Moon, Monitor, Volume2, Menu, X, Mic, Sliders, Video } from "lucide-react";
 import { api } from "./api/client";
 
@@ -17,6 +17,42 @@ import { PlaygroundPanel } from "./components/PlaygroundPanel";
 import { ASRPanel } from "./components/ASRPanel";
 import DubbingStudio from "./components/DubbingStudio";
 import { ErrorBoundary } from "./components/ui/ErrorBoundary";
+
+function getAgentOrbState(
+  connectionStatus: "checking" | "connected" | "disconnected",
+  kaggleStatus: "unconfigured" | "connected" | "error"
+) {
+  if (connectionStatus === "disconnected") {
+    return {
+      colorClass: "bg-destructive",
+      pulseClass: "animate-orb-red",
+      label: "GPU Agent: Lỗi kết nối",
+      desc: "Gateway offline",
+    };
+  }
+  if (kaggleStatus === "unconfigured") {
+    return {
+      colorClass: "bg-muted-foreground",
+      pulseClass: "",
+      label: "GPU Agent: Chưa thiết lập",
+      desc: "Cần cấu hình Kaggle",
+    };
+  }
+  if (kaggleStatus === "error") {
+    return {
+      colorClass: "bg-destructive",
+      pulseClass: "animate-orb-red",
+      label: "GPU Agent: Lỗi kết nối",
+      desc: "Kiểm tra thông số Kaggle",
+    };
+  }
+  return {
+    colorClass: "bg-success",
+    pulseClass: "animate-orb-green",
+    label: "GPU Agent: Sẵn sàng",
+    desc: "Đang chờ tác vụ mới",
+  };
+}
 
 function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem("VITE_JWT_TOKEN"));
@@ -64,10 +100,6 @@ function App() {
     };
     window.addEventListener("hashchange", handleHashChange);
 
-    if (window.location.hash === "#/docs") {
-      setActiveTab("docs");
-    }
-
     return () => {
       window.removeEventListener("hashchange", handleHashChange);
     };
@@ -83,7 +115,8 @@ function App() {
     }
   };
 
-  const [currentUser, setCurrentUser] = useState<{ username: string; is_admin: boolean } | null>(null);
+  const [currentUser, setCurrentUser] = useState<{ id: string; username: string; is_admin: boolean } | null>(null);
+  const [uiLayout, setUiLayout] = useState<"classic" | "modern">("modern");
   const [activeVoiceSampleId, setActiveVoiceSampleId] = useState<string | null>(null);
   const [refreshHistory, setRefreshHistory] = useState(0);
   const handleJobCreatedOrUpdated = () => {
@@ -103,14 +136,21 @@ function App() {
     setGlobalPlayerPlaying(prev => !prev);
   };
   const [connectionStatus, setConnectionStatus] = useState<"checking" | "connected" | "disconnected">("checking");
-  const [apiBaseUrl, setApiBaseUrl] = useState("");
+  const [apiBaseUrl] = useState<string>(() => api.getApiBaseUrl() || (typeof window !== "undefined" ? window.location.origin : ""));
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
   const [kaggleStatus, setKaggleStatus] = useState<"unconfigured" | "connected" | "error">("unconfigured");
 
-  const fetchSettings = async () => {
+  const handleLogout = useCallback(() => {
+    localStorage.removeItem("VITE_JWT_TOKEN");
+    setToken(null);
+    setCurrentUser(null);
+  }, []);
+
+  const fetchSettings = useCallback(async () => {
     try {
       const res = await api.getSettings();
+      setUiLayout(res.ui_layout === "classic" ? "classic" : "modern");
       if (!res.kaggle_username || !res.kaggle_key_configured) {
         setKaggleStatus("unconfigured");
       } else {
@@ -119,10 +159,9 @@ function App() {
     } catch (err) {
       console.error("Lỗi lấy cấu hình hệ thống:", err);
     }
-  };
+  }, []);
 
-  const checkHealth = async () => {
-    setConnectionStatus("checking");
+  const checkHealth = useCallback(async () => {
     try {
       await api.getHealth();
       setConnectionStatus("connected");
@@ -130,37 +169,59 @@ function App() {
       console.error("Health check failed", err);
       setConnectionStatus("disconnected");
     }
-  };
+  }, []);
 
-  const fetchUser = async () => {
+  const fetchUser = useCallback(async () => {
     try {
       const res = await api.getMe();
-      setCurrentUser(res);
+      setCurrentUser({ id: res.id, username: res.username, is_admin: res.is_admin });
     } catch (err) {
       console.error("Lỗi lấy thông tin user:", err);
       handleLogout();
     }
-  };
-
-  const handleLogout = () => {
-    localStorage.removeItem("VITE_JWT_TOKEN");
-    setToken(null);
-    setCurrentUser(null);
-  };
+  }, [handleLogout]);
 
   useEffect(() => {
-    setApiBaseUrl(api.getApiBaseUrl() || window.location.origin);
-    checkHealth();
+    let active = true;
+    (async () => {
+      try {
+        await api.getHealth();
+        if (active) setConnectionStatus("connected");
+      } catch (err) {
+        console.error("Health check failed", err);
+        if (active) setConnectionStatus("disconnected");
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
-    if (token) {
-      fetchUser();
-      fetchSettings();
-    } else {
-      setCurrentUser(null);
-    }
-  }, [token]);
+    if (!token) return;
+    let active = true;
+    (async () => {
+      try {
+        const [meRes, settingsRes] = await Promise.all([api.getMe(), api.getSettings()]);
+        if (!active) return;
+        setCurrentUser({ id: meRes.id, username: meRes.username, is_admin: meRes.is_admin });
+        setUiLayout(settingsRes.ui_layout === "classic" ? "classic" : "modern");
+        if (!settingsRes.kaggle_username || !settingsRes.kaggle_key_configured) {
+          setKaggleStatus("unconfigured");
+        } else {
+          setKaggleStatus("connected");
+        }
+      } catch (err) {
+        console.error("Lỗi tải dữ liệu phiên đăng nhập:", err);
+        if (active) handleLogout();
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [token, handleLogout]);
+
+  const effectiveUser = token ? currentUser : null;
 
   const handleVoiceSampleActive = (sampleId: string) => {
     setActiveVoiceSampleId(sampleId);
@@ -181,40 +242,18 @@ function App() {
     return <LoginRegister onLoginSuccess={(t) => setToken(t)} />;
   }
 
-  // AI Agent Orb configuration based on system health and Kaggle status
-  let orbColorClass = "bg-muted-foreground";
-  let orbPulseClass = "";
-  let orbLabel = "GPU Agent: Ngoại tuyến";
-  let orbDesc = "Không có kết nối với máy chủ";
-
-  if (connectionStatus === "disconnected") {
-    orbColorClass = "bg-destructive";
-    orbPulseClass = "animate-orb-red";
-    orbLabel = "GPU Agent: Lỗi kết nối";
-    orbDesc = "Gateway offline";
-  } else if (kaggleStatus === "unconfigured") {
-    orbColorClass = "bg-muted-foreground";
-    orbLabel = "GPU Agent: Chưa thiết lập";
-    orbDesc = "Cần cấu hình Kaggle";
-  } else if (kaggleStatus === "error") {
-    orbColorClass = "bg-destructive";
-    orbPulseClass = "animate-orb-red";
-    orbLabel = "GPU Agent: Lỗi kết nối";
-    orbDesc = "Kiểm tra thông số Kaggle";
-  } else {
-    orbColorClass = "bg-success";
-    orbPulseClass = "animate-orb-green";
-    orbLabel = "GPU Agent: Sẵn sàng";
-    orbDesc = "Đang chờ tác vụ mới";
-  }
+  const { colorClass: orbColorClass, pulseClass: orbPulseClass, label: orbLabel, desc: orbDesc } = getAgentOrbState(
+    connectionStatus,
+    kaggleStatus
+  );
 
   const sidebarContent = (
-    <div className="flex flex-col h-full bg-card border-r border-border text-foreground select-none">
+    <div className="flex flex-col h-full bg-card border-r border-border text-foreground">
       {/* Brand logo & compact status */}
       <div className="p-4 border-b border-border flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2.5 min-w-0">
-          <div className="bg-gradient-to-tr from-primary to-accent p-1.5 rounded-lg shrink-0">
-            <Radio className="w-4.5 h-4.5 text-white" />
+          <div className="bg-primary text-primary-foreground p-2 rounded-lg shrink-0">
+            <Radio className="w-4.5 h-4.5" />
           </div>
           <div className="flex flex-col min-w-0">
             <h2 className="text-sm font-bold tracking-tight text-foreground flex items-center gap-1 leading-none">
@@ -424,8 +463,10 @@ function App() {
               </span>
             </div>
             <button
+              type="button"
               onClick={handleLogout}
-              className="p-1.5 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded transition-colors cursor-pointer shrink-0"
+              aria-label="Đăng xuất"
+              className="min-w-[40px] min-h-[40px] flex items-center justify-center p-1.5 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded transition-colors cursor-pointer shrink-0"
               title="Đăng xuất"
             >
               <LogOut className="w-3.5 h-3.5" />
@@ -433,19 +474,23 @@ function App() {
           </div>
         )}
 
-        <div className="flex items-center justify-between gap-1 text-[10px] text-muted-foreground px-1 select-none">
+        <div className="flex items-center justify-between gap-1 text-[10px] text-muted-foreground px-1">
           <span className="truncate">Status: {connectionStatus === "connected" ? "Online" : "Offline"}</span>
           
           <div className="flex items-center gap-2">
             <button 
+              type="button"
+              aria-label="Kiểm tra kết nối lại"
               onClick={checkHealth}
-              className="hover:text-foreground cursor-pointer flex items-center gap-0.5 font-bold"
+              className="min-w-[36px] min-h-[36px] justify-center hover:text-foreground cursor-pointer flex items-center gap-0.5 font-bold"
               title="Reload connection"
             >
-              <RefreshCw className="w-2.5 h-2.5" />
+              <RefreshCw className="w-3 h-3" />
             </button>
 
             <button
+              type="button"
+              aria-label="Chuyển đổi giao diện sáng tối"
               onClick={() => {
                 setTheme(prev => {
                   if (prev === "system") return "light";
@@ -453,7 +498,7 @@ function App() {
                   return "system";
                 });
               }}
-              className="text-muted-foreground hover:text-foreground cursor-pointer shrink-0"
+              className="min-w-[36px] min-h-[36px] flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer shrink-0"
               title={`Giao diện: ${theme === "system" ? "Tự động" : theme === "light" ? "Sáng" : "Tối"}`}
             >
               {theme === "system" && <Monitor className="w-3 h-3" />}
@@ -466,18 +511,18 @@ function App() {
     </div>
   );
 
-  return (
-    <div className="min-h-screen bg-background text-foreground flex font-sans select-none overflow-x-hidden relative">
-      <div className="absolute top-0 left-1/4 w-[400px] h-[400px] bg-primary/5 rounded-full blur-[100px] pointer-events-none" />
-      <div className="absolute bottom-0 right-1/4 w-[500px] h-[500px] bg-purple-500/5 rounded-full blur-[120px] pointer-events-none" />
+  // Keep fetchUser callable cleanly when child triggers refresh if needed
+  void fetchUser;
 
+  return (
+    <div className="min-h-screen bg-background text-foreground flex font-sans overflow-x-hidden relative">
       {/* Sidebar 240px */}
       <aside className="hidden lg:block w-fluid-sidebar h-screen fixed top-0 left-0 shrink-0 z-40">
         {sidebarContent}
       </aside>
 
       {sidebarOpen && (
-        <div className="lg:hidden fixed inset-0 z-[60] flex">
+        <div className="lg:hidden fixed inset-0 z-[60] flex" role="dialog" aria-modal="true" aria-label="Menu điều hướng">
           <div 
             onClick={() => setSidebarOpen(false)}
             className="fixed inset-0 bg-black/60 backdrop-blur-sm"
@@ -485,8 +530,10 @@ function App() {
           <div className="relative w-fluid-sidebar max-w-sm h-full flex-col z-[60] animate-fadeIn">
             {sidebarContent}
             <button
+              type="button"
+              aria-label="Đóng menu"
               onClick={() => setSidebarOpen(false)}
-              className="absolute top-4 -right-12 p-2 bg-card border border-border text-foreground rounded-xl"
+              className="min-w-[44px] min-h-[44px] flex items-center justify-center absolute top-3 -right-12 p-2 bg-card border border-border text-foreground rounded-xl cursor-pointer"
             >
               <X className="w-5 h-5" />
             </button>
@@ -496,17 +543,19 @@ function App() {
 
       {/* Padding left changed to pl-fluid-sidebar */}
       <div className="flex-grow flex flex-col min-w-0 lg:pl-fluid-sidebar min-h-screen">
-        <header className="lg:hidden sticky top-0 z-30 bg-background/80 backdrop-blur-md border-b border-border px-4 py-3 flex items-center justify-between">
+        <header className="lg:hidden sticky top-0 z-30 bg-background/85 backdrop-blur-md border-b border-border px-4 py-2.5 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <button
+              type="button"
+              aria-label="Mở menu điều hướng"
               onClick={() => setSidebarOpen(true)}
-              className="p-2 hover:bg-card border border-border/60 rounded-xl text-foreground"
+              className="min-w-[44px] min-h-[44px] flex items-center justify-center p-2 hover:bg-card border border-border/60 rounded-xl text-foreground cursor-pointer"
             >
               <Menu className="w-5 h-5" />
             </button>
             <div className="flex items-center gap-2">
-              <div className="bg-gradient-to-tr from-primary to-accent p-1.5 rounded-lg">
-                <Radio className="w-4 h-4 text-white" />
+              <div className="bg-primary text-primary-foreground p-1.5 rounded-lg">
+                <Radio className="w-4 h-4" />
               </div>
               <span className="text-sm font-bold tracking-tight text-foreground">OmniVoice</span>
             </div>
@@ -540,7 +589,7 @@ function App() {
                 <TTSPanel 
                   activeVoiceSampleId={activeVoiceSampleId} 
                   onJobCreatedOrUpdated={handleJobCreatedOrUpdated}
-                  layout="modern"
+                  layout={uiLayout}
                   currentPlayUrl={currentPlayUrl}
                   globalPlayerPlaying={globalPlayerPlaying}
                   onPlayAudio={handlePlayAudio}
@@ -553,11 +602,11 @@ function App() {
           {activeTab === "voice-lab" && (
             <div className="w-full grid grid-cols-1 xl:grid-cols-2 gap-6 animate-fadeIn items-start">
               <ErrorBoundary fallbackTitle="Lỗi hiển thị Voice Design">
-                <VoiceSampleUpload onUploadSuccess={handleVoiceSampleActive} layout="classic" />
+                <VoiceSampleUpload onUploadSuccess={handleVoiceSampleActive} layout={uiLayout} />
                 <VoiceDesignPanel 
                   onAcceptSuccess={handleVoiceSampleActive} 
                   onJobCreatedOrUpdated={handleJobCreatedOrUpdated}
-                  layout="classic"
+                  layout={uiLayout}
                   currentPlayUrl={currentPlayUrl}
                   globalPlayerPlaying={globalPlayerPlaying}
                   onPlayAudio={handlePlayAudio}
@@ -572,11 +621,12 @@ function App() {
               <ErrorBoundary fallbackTitle="Lỗi hiển thị Voice Library">
                 <VoiceLibraryPanel 
                   activeVoiceSampleId={activeVoiceSampleId}
+                  currentUser={effectiveUser}
                   onUseVoice={(id) => { 
                     setActiveVoiceSampleId(id); 
                     navigateToTab("workspace"); 
                   }} 
-                  layout="modern" 
+                  layout={uiLayout} 
                   currentPlayUrl={currentPlayUrl}
                   globalPlayerPlaying={globalPlayerPlaying}
                   onPlayAudio={handlePlayAudio}
@@ -591,7 +641,7 @@ function App() {
               <ErrorBoundary fallbackTitle="Lỗi hiển thị History">
                 <JobHistoryPanel 
                   refreshTrigger={refreshHistory} 
-                  layout="modern" 
+                  layout={uiLayout} 
                   currentPlayUrl={currentPlayUrl}
                   globalPlayerPlaying={globalPlayerPlaying}
                   onPlayAudio={handlePlayAudio}
@@ -609,7 +659,7 @@ function App() {
             </div>
           )}
 
-          {activeTab === "admin" && currentUser?.is_admin && (
+          {activeTab === "admin" && effectiveUser?.is_admin && (
             <div className="w-full animate-fadeIn">
               <ErrorBoundary fallbackTitle="Lỗi hiển thị Admin Portal">
                 <AdminDashboard onBack={() => navigateToTab("workspace")} onSettingsChanged={fetchSettings} />
@@ -617,7 +667,7 @@ function App() {
             </div>
           )}
 
-          {activeTab === "playground" && currentUser?.is_admin && (
+          {activeTab === "playground" && effectiveUser?.is_admin && (
             <div className="w-full animate-fadeIn">
               <ErrorBoundary fallbackTitle="Lỗi hiển thị Playground">
                 <PlaygroundPanel />
@@ -636,7 +686,7 @@ function App() {
           {activeTab === "dubbing" && (
             <div className="w-full animate-fadeIn">
               <ErrorBoundary fallbackTitle="Lỗi hiển thị Video Dubbing">
-                <DubbingStudio />
+                <DubbingStudio currentUser={effectiveUser} />
               </ErrorBoundary>
             </div>
           )}

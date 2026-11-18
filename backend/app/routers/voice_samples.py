@@ -1,7 +1,7 @@
 import os
 import shutil
 from typing import Optional, List
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, status
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Request, Query, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from app.database import get_db
@@ -12,6 +12,10 @@ from app.utils.slugify import slugify
 from app.services.audio_service import AudioService
 from app.config import settings
 from app.utils.auth import get_user_or_api_key
+from app.utils.files import save_upload_with_limit
+from app.utils.url_security import ensure_within_directory
+
+MAX_VOICE_SAMPLE_BYTES = 25 * 1024 * 1024  # 25 MB
 
 router = APIRouter(prefix="/v1/voice-samples", tags=["Voice Samples"])
 
@@ -69,20 +73,16 @@ async def upload_voice_sample(
     if not resolved_name and file.filename:
         resolved_name = os.path.splitext(file.filename)[0]
         
-    # Save the original upload first
-    filename = file.filename or f"{resolved_id}_raw"
+    # Save the original upload first with size limit
+    filename = os.path.basename(file.filename or f"{resolved_id}_raw")
     ext = os.path.splitext(filename)[1] or ".bin"
-    upload_temp_path = os.path.join(settings.uploads_dir, f"{resolved_id}_raw{ext}")
-    
-    try:
-        with open(upload_temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Không thể lưu file tải lên: {e}"
-        )
-    
+    upload_temp_path = ensure_within_directory(
+        settings.uploads_dir,
+        os.path.join(settings.uploads_dir, f"{resolved_id}_raw{ext}"),
+    )
+
+    await save_upload_with_limit(file, upload_temp_path, max_bytes=MAX_VOICE_SAMPLE_BYTES)
+
     # Standardize and save into voice_samples
     target_filename = f"{resolved_id}.wav"
     try:
@@ -90,12 +90,16 @@ async def upload_voice_sample(
             upload_temp_path, target_filename
         )
     except Exception as e:
-        if os.path.exists(upload_temp_path):
-            os.remove(upload_temp_path)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Định dạng tệp âm thanh không hợp lệ hoặc lỗi xử lý: {e}"
+            detail=f"Định dạng tệp âm thanh không hợp lệ hoặc lỗi xử lý: {e}",
         )
+    finally:
+        if os.path.exists(upload_temp_path):
+            try:
+                os.remove(upload_temp_path)
+            except Exception:
+                pass
 
     # Save details to database
     db_sample = VoiceSample(
@@ -284,11 +288,8 @@ def update_voice_sample(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Updates name, tags, ref_text, or is_public of a user's own voice sample."""
-    sample = db.query(VoiceSample).filter(
-        VoiceSample.id == voice_sample_id,
-        VoiceSample.user_id == current_user.id
-    ).first()
-    if not sample:
+    sample = db.query(VoiceSample).filter(VoiceSample.id == voice_sample_id).first()
+    if not sample or (sample.user_id != current_user.id and not current_user.is_admin):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Không tìm thấy hoặc không có quyền chỉnh sửa Voice Sample: {voice_sample_id}"
@@ -309,39 +310,77 @@ def update_voice_sample(
     return sample
 
 @router.get("/{voice_sample_id}/audio")
-def get_voice_sample_audio(voice_sample_id: str, db: Session = Depends(get_db)):
-    """Serves the WAV audio file of the voice sample. Public voices don't require auth."""
+def get_voice_sample_audio(
+    voice_sample_id: str,
+    request: Request,
+    token: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Serves the WAV audio file of the voice sample. Public voices don't require auth; private voices require owner/admin auth."""
     sample = db.query(VoiceSample).filter(VoiceSample.id == voice_sample_id).first()
     if not sample:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Không tìm thấy Voice Sample với ID: {voice_sample_id}"
         )
-    # For non-public samples, we still allow access (auth is handled at the router level for other endpoints)
+
+    cache_header = "public, max-age=86400"
+    if not sample.is_public:
+        auth_token = (
+            request.headers.get("x-api-key")
+            or request.headers.get("x-ov-api-key")
+            or request.headers.get("xi-api-key")
+        )
+        if not auth_token:
+            auth_hdr = request.headers.get("Authorization", "")
+            if auth_hdr.startswith("Bearer "):
+                auth_token = auth_hdr[7:].strip()
+        if not auth_token:
+            auth_token = token
+
+        if not auth_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Yêu cầu xác thực để nghe mẫu giọng riêng tư.",
+            )
+
+        current_user = get_user_or_api_key(
+            token=auth_token,
+            token_query=None,
+            x_api_key=None,
+            x_ov_api_key=None,
+            db=db,
+        )
+        if sample.user_id != current_user.id and not current_user.is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Bạn không có quyền truy cập mẫu giọng riêng tư này.",
+            )
+        cache_header = "private, no-store"
+
     if not sample.file_path or not os.path.exists(sample.file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Tệp âm thanh của Voice Sample không tồn tại trên máy chủ."
         )
+
+    safe_path = ensure_within_directory(settings.STORAGE_DIR, sample.file_path)
     return FileResponse(
-        sample.file_path,
+        safe_path,
         media_type="audio/wav",
         filename=f"{voice_sample_id}.wav",
         content_disposition_type="inline",
         headers={
-            "Cache-Control": "public, max-age=86400",
-            "Accept-Ranges": "bytes"
-        }
+            "Cache-Control": cache_header,
+            "Accept-Ranges": "bytes",
+        },
     )
 
 @router.delete("/{voice_sample_id}")
 def delete_voice_sample(voice_sample_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_user_or_api_key)):
     """Deletes a user's own voice sample from database and disk storage."""
-    sample = db.query(VoiceSample).filter(
-        VoiceSample.id == voice_sample_id,
-        VoiceSample.user_id == current_user.id
-    ).first()
-    if not sample:
+    sample = db.query(VoiceSample).filter(VoiceSample.id == voice_sample_id).first()
+    if not sample or (sample.user_id != current_user.id and not current_user.is_admin):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Không tìm thấy hoặc không có quyền xóa Voice Sample với ID: {voice_sample_id}"

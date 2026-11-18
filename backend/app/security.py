@@ -1,41 +1,29 @@
+import hmac
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.orm import Session
-from datetime import datetime
-from app.config import settings
-from app.database import get_db
-from app.models import User, ApiKey
 
-security_scheme = HTTPBearer()
+from app.config import settings
+
+security_scheme = HTTPBearer(auto_error=False)
+
 
 def verify_worker_token(
     credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
-    db: Session = Depends(get_db)
 ):
-    """Verifies that the provided Bearer token matches the configured WORKER_TOKEN OR a user's API Key."""
-    token = credentials.credentials
-    if not token:
+    """Verifies that the provided Bearer token matches the configured system WORKER_TOKEN."""
+    if not credentials or not credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing worker token.",
+            detail="Missing worker authentication token.",
         )
-        
-    # 1. Check if system worker token
-    if settings.WORKER_TOKEN and token == settings.WORKER_TOKEN:
-        return token
 
-    # 2. Check if valid User API key
-    user = db.query(User).filter(User.api_key == token).first()
-    if user:
-        return token
+    token = credentials.credentials.strip()
+    expected = (settings.WORKER_TOKEN or "").strip()
 
-    # 3. Check if valid ApiKey record
-    api_key_obj = db.query(ApiKey).filter(ApiKey.key == token).first()
-    if api_key_obj:
+    if expected and hmac.compare_digest(token, expected):
         return token
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid worker token.",
     )
-

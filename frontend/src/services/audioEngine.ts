@@ -1,4 +1,8 @@
-// High-Performance Web Audio API Engine for Instant 0ms Playback
+// High-Performance Web Audio API Engine for Instant Playback
+
+interface WindowWithWebkitAudio extends Window {
+  webkitAudioContext?: typeof AudioContext;
+}
 
 class AudioEngineService {
   private audioCtx: AudioContext | null = null;
@@ -12,66 +16,67 @@ class AudioEngineService {
   private isPlaying: boolean = false;
   private volume: number = 0.8;
 
-  constructor() {
-    // AudioContext will be initialized on first user gesture or preload
-  }
-
   private getContext(): AudioContext {
     if (!this.audioCtx) {
-      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+      const win = window as WindowWithWebkitAudio;
+      const AudioCtxClass = window.AudioContext || win.webkitAudioContext;
+      if (!AudioCtxClass) {
+        throw new Error("Web Audio API is not supported in this browser.");
+      }
       this.audioCtx = new AudioCtxClass();
       this.gainNode = this.audioCtx.createGain();
       this.gainNode.gain.value = this.volume;
       this.gainNode.connect(this.audioCtx.destination);
     }
     if (this.audioCtx.state === "suspended") {
-      this.audioCtx.resume();
+      void this.audioCtx.resume();
     }
     return this.audioCtx;
   }
 
   /**
-   * Pre-fetches audio data over HTTPS and decodes it into an in-memory AudioBuffer.
+   * Pre-fetches audio data over HTTPS with Bearer auth when needed and decodes into AudioBuffer.
    */
   async preload(url: string): Promise<AudioBuffer | null> {
     if (!url) return null;
     if (this.bufferCache.has(url)) {
-      return this.bufferCache.get(url)!;
+      return this.bufferCache.get(url) ?? null;
     }
 
     try {
       const ctx = this.getContext();
-      const response = await fetch(url);
+      const headers: HeadersInit = {};
+      const token = localStorage.getItem("VITE_JWT_TOKEN");
+      if (token && !url.startsWith("blob:") && !url.startsWith("data:") && !url.includes("huggingface.co/datasets")) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+      const response = await fetch(url, { headers });
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-      
+
       const arrayBuffer = await response.arrayBuffer();
       const decodedBuffer = await ctx.decodeAudioData(arrayBuffer);
-      
+
       this.bufferCache.set(url, decodedBuffer);
       return decodedBuffer;
     } catch (err) {
-      console.warn("[AudioEngine] Preload failed, fallback to native fetch:", err);
+      console.warn("[AudioEngine] Preload failed, fallback to element fetch:", err);
       return null;
     }
   }
 
-  /**
-   * Plays the specified audio URL instantly (0ms latency if preloaded).
-   */
   async play(
-    url: string, 
-    offset: number = 0, 
+    url: string,
+    offset: number = 0,
     onEnded?: () => void
   ): Promise<boolean> {
     if (!url) return false;
     const ctx = this.getContext();
 
-    // Stop current playing audio
     this.stop();
 
     let buffer = this.bufferCache.get(url);
     if (!buffer) {
-      buffer = (await this.preload(url)) || undefined;
+      buffer = (await this.preload(url)) ?? undefined;
     }
 
     if (!buffer) {
@@ -100,9 +105,6 @@ class AudioEngineService {
     return true;
   }
 
-  /**
-   * Pauses the currently playing audio track.
-   */
   pause(): number {
     if (!this.isPlaying || !this.audioCtx) return this.startOffset;
 
@@ -112,7 +114,9 @@ class AudioEngineService {
     if (this.activeSourceNode) {
       try {
         this.activeSourceNode.stop();
-      } catch {}
+      } catch (err) {
+        console.debug("[AudioEngine] Stop during pause ignored:", err);
+      }
       this.activeSourceNode = null;
     }
 
@@ -120,23 +124,19 @@ class AudioEngineService {
     return this.startOffset;
   }
 
-  /**
-   * Stops audio playback and resets state.
-   */
   stop(): void {
     if (this.activeSourceNode) {
       try {
         this.activeSourceNode.stop();
-      } catch {}
+      } catch (err) {
+        console.debug("[AudioEngine] Stop ignored:", err);
+      }
       this.activeSourceNode = null;
     }
     this.isPlaying = false;
     this.startOffset = 0;
   }
 
-  /**
-   * Sets current output volume (0.0 to 1.0).
-   */
   setVolume(vol: number): void {
     this.volume = Math.max(0, Math.min(1, vol));
     if (this.gainNode) {
@@ -144,16 +144,10 @@ class AudioEngineService {
     }
   }
 
-  /**
-   * Returns whether audio is currently playing.
-   */
   getIsPlaying(): boolean {
     return this.isPlaying;
   }
 
-  /**
-   * Returns total duration of preloaded buffer in seconds.
-   */
   getDuration(url: string): number {
     const buf = this.bufferCache.get(url);
     return buf ? buf.duration : 0;

@@ -16,6 +16,10 @@ __pycache__/
 !.env.example
 kaggle.json
 *.jsonl
+cookies.txt
+*.cookies.txt
+.gateway_secrets.json
+.tmp_admin_pass
 
 # Node / Frontend
 node_modules/

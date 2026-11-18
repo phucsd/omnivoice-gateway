@@ -1,80 +1,90 @@
+import os
 import subprocess
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends
+
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.models import User
-from app.config import settings
+from app.routers.admin import get_admin_user
 
 router = APIRouter()
+
 
 @router.get("/health")
 @router.get("/v1/health")
 def get_health():
     """Simple check validating backend and orchestration layers are active."""
-    git_hash = "unknown"
-    try:
-        git_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
-    except Exception:
-        pass
+    git_hash = (os.environ.get("GIT_COMMIT") or os.environ.get("SPACE_SHA") or "").strip()
+    if not git_hash:
+        try:
+            git_hash = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            git_hash = "hf-space" if os.environ.get("SPACE_ID") else "unknown"
+    else:
+        git_hash = git_hash[:12]
+
     return {
         "status": "ok",
         "app": "OmniVoice On-Demand Gateway",
-        "git_commit": git_hash
+        "git_commit": git_hash,
     }
+
 
 @router.get("/health/db")
 @router.get("/v1/health/db")
-def get_db_health(db: Session = Depends(get_db)):
-    """Comprehensive database health, tables check, and storage verification."""
+def get_db_health(
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_admin_user),
+):
+    """Admin-only database health, tables check, and storage verification (no secret leakage)."""
+    _ = current_admin
     result = {
-        "database_url": settings.DATABASE_URL,
-        "storage_dir": settings.STORAGE_DIR,
         "is_sqlite": settings.DATABASE_URL.startswith("sqlite"),
         "engine_session": "ok",
         "tables": {},
         "raw_sqlite": {},
         "writable": False,
-        "errors": []
+        "errors": [],
     }
-    
+
     # 1. Query SQLAlchemy session
     try:
-        from app.models import User, ApiKey, VoiceSample, TTSJob, WorkerSession, SystemSetting
+        from app.models import ApiKey, SystemSetting, TTSJob, VoiceSample, WorkerSession
+
         result["tables"]["users"] = db.query(User).count()
         result["tables"]["api_keys"] = db.query(ApiKey).count()
         result["tables"]["voice_samples"] = db.query(VoiceSample).count()
         result["tables"]["tts_jobs"] = db.query(TTSJob).count()
         result["tables"]["worker_sessions"] = db.query(WorkerSession).count()
         result["tables"]["system_settings"] = db.query(SystemSetting).count()
-        
-        # Check admin user
+
         admin = db.query(User).filter(User.is_admin == True).first()
-        active_key = db.query(ApiKey).first()
-        resolved_key = (active_key.key if active_key else None) or (admin.api_key if admin else None)
         result["admin_user"] = {
             "exists": admin is not None,
             "username": admin.username if admin else None,
-            "email": admin.email if admin else None,
             "is_verified": admin.is_verified if admin else None,
             "is_approved": admin.is_approved if admin else None,
-            "api_key": resolved_key
         }
     except Exception as e:
         result["engine_session"] = f"error: {e}"
         result["errors"].append(f"SQLAlchemy query error: {e}")
-        
+
     # 2. Test raw SQLite direct inspection
     try:
-        import sqlite3, os
+        import sqlite3
         from app.database import get_sqlite_path
+
         db_path = get_sqlite_path(settings.DATABASE_URL)
-            
-        result["db_path"] = db_path
         result["db_file_exists"] = os.path.exists(db_path)
         if os.path.exists(db_path):
             result["db_file_size_bytes"] = os.path.getsize(db_path)
-            
+
             raw_conn = sqlite3.connect(db_path, timeout=5)
             c = raw_conn.cursor()
             c.execute("PRAGMA integrity_check")
@@ -84,8 +94,7 @@ def get_db_health(db: Session = Depends(get_db)):
             c.execute("SELECT name FROM sqlite_master WHERE type='table'")
             result["raw_sqlite"]["tables"] = [r[0] for r in c.fetchall()]
             raw_conn.close()
-            
-            # Test write
+
             test_conn = sqlite3.connect(db_path, timeout=5)
             tc = test_conn.cursor()
             tc.execute("CREATE TABLE IF NOT EXISTS _health_write_test (id INTEGER PRIMARY KEY)")
@@ -97,7 +106,5 @@ def get_db_health(db: Session = Depends(get_db)):
     except Exception as e:
         result["raw_sqlite"]["error"] = str(e)
         result["errors"].append(f"Raw SQLite error: {e}")
-        
+
     return result
-
-

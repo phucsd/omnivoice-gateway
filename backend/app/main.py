@@ -91,7 +91,7 @@ async def lifespan(app: FastAPI):
     print("[Main] Seeding default admin account (phucsd@gmail.com) if not present...")
     from app.database import SessionLocal
     from app.models import User
-    from app.utils.auth import get_password_hash
+    from app.utils.auth import get_password_hash, verify_password
     from sqlalchemy import text
     import secrets
     db = SessionLocal()
@@ -127,7 +127,14 @@ async def lifespan(app: FastAPI):
         admin_user = db.query(User).filter((User.email == "phucsd@gmail.com") | (User.username == "phucsd@gmail.com")).first()
         if not admin_user:
             from app.utils.ids import generate_id
-            admin_pass = os.environ.get("ADMIN_PASSWORD", "admin_password_2026")
+            env_admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
+            if env_admin_pass:
+                admin_pass = env_admin_pass
+            elif settings.APP_ENV == "testing":
+                admin_pass = "admin_password_2026"
+            else:
+                admin_pass = secrets.token_urlsafe(18)
+                print("[Bootstrap] Initial admin user created without ADMIN_PASSWORD env; generated random credentials cleanly (set ADMIN_PASSWORD secret or reset via DB/OAuth).")
             hashed_pwd = get_password_hash(admin_pass)
             api_key = f"ovg_live_{secrets.token_hex(24)}"
             admin_user = User(
@@ -143,10 +150,19 @@ async def lifespan(app: FastAPI):
             db.add(admin_user)
             db.commit()
         else:
+            changed = False
             if not admin_user.is_verified or not admin_user.is_approved or not admin_user.is_admin:
                 admin_user.is_verified = True
                 admin_user.is_approved = True
                 admin_user.is_admin = True
+                changed = True
+            if settings.APP_ENV != "testing" and admin_user.hashed_password and verify_password("admin_password_2026", admin_user.hashed_password):
+                env_admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
+                new_admin_pass = env_admin_pass or secrets.token_urlsafe(18)
+                admin_user.hashed_password = get_password_hash(new_admin_pass)
+                changed = True
+                print("[Security] Replaced legacy default admin password on startup.")
+            if changed:
                 db.commit()
         # Seed default LLM Profile if none exist
         from app.models import LLMProfile, SystemSetting
@@ -229,19 +245,24 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_origin_regex="https://.*\\.pages\\.dev",
+    allow_origin_regex=r"https://([a-z0-9-]+\.)?omnivoice-gateway\.pages\.dev",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-OV-API-Key", "xi-api-key", "Accept"],
 )
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
+    # Allow Hugging Face Space wrapper iframe while blocking arbitrary third-party clickjacking
+    response.headers["Content-Security-Policy"] = (
+        "frame-ancestors 'self' https://huggingface.co https://*.hf.space"
+    )
+    if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), geolocation=(), payment=()"
     return response
 
 @app.middleware("http")

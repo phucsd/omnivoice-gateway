@@ -107,9 +107,9 @@ class DubbingNotebookBuilder:
         worker_path = os.path.join(abs_dir, "dubbing_worker.py")
 
         if not public_api_url:
-            public_api_url = settings.PUBLIC_API_BASE_URL or "https://voice.oloka.net"
+            public_api_url = (settings.PUBLIC_API_BASE_URL or settings.API_BASE_URL or "").strip()
         if not worker_token:
-            worker_token = settings.WORKER_TOKEN or "default_worker_token"
+            worker_token = settings.WORKER_TOKEN
 
         code_content = f'''import os
 import sys
@@ -393,12 +393,8 @@ if __name__ == "__main__":
         user_id: Optional[str] = None
     ) -> str:
         abs_dir = DubbingNotebookBuilder.ensure_worker_dir(worker_dir)
+        _ = user_id
         worker_token = settings.WORKER_TOKEN
-        if user_id and db:
-            from app.models import User
-            user = db.query(User).filter(User.id == user_id).first()
-            if user and user.api_key:
-                worker_token = user.api_key
 
         DubbingNotebookBuilder.generate_requirements(abs_dir)
         DubbingNotebookBuilder.generate_metadata(abs_dir)

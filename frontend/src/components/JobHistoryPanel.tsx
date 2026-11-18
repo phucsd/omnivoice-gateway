@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { Clock, RefreshCw, Layers, Heart, Lock, Globe, X, ChevronDown, ChevronUp, AlertCircle, CheckCircle, Play, Pause, Zap, Copy, Check, Terminal, Settings, Tag, Trash2, Search, Filter, ChevronLeft, ChevronRight } from "lucide-react";
-import { api, type JobStatusResponse } from "../api/client";
+import { api, getErrorMessage, type JobStatusResponse } from "../api/client";
 
 interface JobHistoryPanelProps {
   refreshTrigger: number;
@@ -88,7 +88,7 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
     });
   };
 
-  const loadJobs = async () => {
+  const loadJobs = useCallback(async () => {
     setLoading(true);
     setErrorMsg(null);
     try {
@@ -102,30 +102,64 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
       setJobs(res.items || []);
       setTotalJobs(res.total || 0);
       setTotalPages(res.total_pages || 1);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Lỗi lấy lịch sử công việc:", err);
-      setErrorMsg(err.message || "Không thể tải danh sách lịch sử công việc.");
+      setErrorMsg(getErrorMessage(err, "Không thể tải danh sách lịch sử công việc."));
     } finally {
       setLoading(false);
     }
-  };
+  }, [page, pageSize, selectedCategory, selectedStatus, debouncedSearch]);
 
   const handleDeleteJob = async (jobId: string) => {
     const isConfirmed = window.confirm("Bạn có chắc chắn muốn xóa tác vụ này không? Hành động này không thể hoàn tác.");
     if (!isConfirmed) return;
-    
+
     try {
       await api.deleteJob(jobId);
-      loadJobs();
-    } catch (err: any) {
+      await loadJobs();
+    } catch (err: unknown) {
       console.error("Lỗi khi xóa tác vụ:", err);
-      alert(`Không thể xóa tác vụ: ${err.message || "Lỗi không xác định"}`);
+      setErrorMsg(`Không thể xóa tác vụ: ${getErrorMessage(err, "Lỗi không xác định")}`);
     }
   };
 
   useEffect(() => {
-    loadJobs();
+    let active = true;
+    (async () => {
+      try {
+        const res = await api.listJobs({
+          page,
+          page_size: pageSize,
+          job_type: selectedCategory,
+          status_filter: selectedStatus,
+          search: debouncedSearch
+        });
+        if (!active) return;
+        setJobs(res.items || []);
+        setTotalJobs(res.total || 0);
+        setTotalPages(res.total_pages || 1);
+        setErrorMsg(null);
+      } catch (err: unknown) {
+        if (!active) return;
+        console.error("Lỗi lấy lịch sử công việc:", err);
+        setErrorMsg(getErrorMessage(err, "Không thể tải danh sách lịch sử công việc."));
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, [refreshTrigger, page, pageSize, selectedCategory, selectedStatus, debouncedSearch]);
+
+  useEffect(() => {
+    if (!isSaveModalOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIsSaveModalOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isSaveModalOpen]);
 
   const toggleExpand = (jobId: string) => {
     setExpandedJobs(prev => ({
@@ -166,8 +200,8 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
       setTimeout(() => {
         setIsSaveModalOpen(false);
       }, 1500);
-    } catch (err: any) {
-      setSaveVoiceStatus(`Lỗi: ${err.message || "Không thể lưu giọng."}`);
+    } catch (err: unknown) {
+      setSaveVoiceStatus(`Lỗi: ${getErrorMessage(err, "Không thể lưu giọng.")}`);
     } finally {
       setIsSavingVoice(false);
     }
@@ -176,15 +210,21 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
   const getJobTypeLabel = (type?: string) => {
     switch (type) {
       case "clone_voice":
-        return { label: "Clone Voice", color: "text-primary dark:text-primary border-primary/20 bg-primary/5" };
+        return { label: "Clone Voice", color: "text-primary border-primary/20 bg-primary/5" };
       case "auto_voice":
-        return { label: "Auto Voice", color: "text-primary border-sky-550/20 bg-sky-500/5" };
+        return { label: "Auto Voice", color: "text-sky-600 dark:text-sky-400 border-sky-500/20 bg-sky-500/5" };
+      case "voice_design_tts":
       case "voice_design":
-        return { label: "Voice Design Direct", color: "text-primary border-purple-550/20 bg-purple-500/5" };
+        return { label: "Voice Design", color: "text-indigo-600 dark:text-indigo-400 border-indigo-500/20 bg-indigo-500/5" };
       case "voice_design_preview":
-        return { label: "Voice Design Preview", color: "text-primary border-pink-550/20 bg-pink-500/5" };
+        return { label: "Voice Preview", color: "text-violet-600 dark:text-violet-400 border-violet-500/20 bg-violet-500/5" };
+      case "asr":
+        return { label: "Speech-to-Text (ASR)", color: "text-emerald-600 dark:text-emerald-400 border-emerald-500/20 bg-emerald-500/5" };
+      case "separate_audio":
+      case "dub_segments":
+        return { label: "Video Dubbing", color: "text-amber-600 dark:text-amber-400 border-amber-500/20 bg-amber-500/5" };
       default:
-        return { label: "TTS Job", color: "text-muted-foreground dark:text-muted-foreground border-border/20 bg-muted/5" };
+        return { label: type || "TTS Job", color: "text-muted-foreground border-border/40 bg-muted/10" };
     }
   };
 
@@ -261,20 +301,22 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
         <div className="flex items-center gap-1 overflow-x-auto scrollbar-none pb-1 sm:pb-0">
           {[
             { id: "all", label: "Tất cả" },
-            { id: "clone_voice", label: "🎙️ Clone Voice" },
-            { id: "auto_voice", label: "⚡ Auto Voice" },
-            { id: "voice_design", label: "✨ Voice Design" },
-            { id: "video_dubbing", label: "🎬 Video Dubbing" }
+            { id: "clone_voice", label: "Clone Voice" },
+            { id: "auto_voice", label: "Auto Voice" },
+            { id: "voice_design", label: "Voice Design" },
+            { id: "asr", label: "Speech-to-Text" },
+            { id: "video_dubbing", label: "Video Dubbing" }
           ].map((cat) => (
             <button
+              type="button"
               key={cat.id}
               onClick={() => {
                 setSelectedCategory(cat.id);
                 setPage(1);
               }}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap cursor-pointer ${
+              className={`min-h-[40px] px-3 py-1.5 rounded-xl text-xs font-bold transition-colors whitespace-nowrap cursor-pointer ${
                 selectedCategory === cat.id
-                  ? "bg-primary text-primary-foreground shadow-sm shadow-primary/20"
+                  ? "bg-primary text-primary-foreground"
                   : "text-muted-foreground hover:text-foreground hover:bg-card/50"
               }`}
             >
@@ -657,27 +699,32 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
 
       {/* Save Voice Modal Overlay */}
       {isSaveModalOpen && (
-        <div 
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="save-voice-modal-title"
           className="fixed inset-0 z-50 flex items-center justify-center p-4 lg:pl-64 bg-background/80 backdrop-blur-md animate-fadeIn"
           onClick={() => setIsSaveModalOpen(false)}
         >
-          <div 
-            className="bg-card border border-border rounded-[32px] p-6 w-full max-w-md flex flex-col gap-4.5 shadow-2xl relative"
+          <div
+            className="bg-card border border-border rounded-[20px] p-6 w-full max-w-md flex flex-col gap-4.5 shadow-2xl relative"
             onClick={(e) => e.stopPropagation()}
           >
             <button
+              type="button"
+              aria-label="Đóng hộp thoại lưu giọng"
               onClick={() => setIsSaveModalOpen(false)}
-              className="absolute top-5 right-5 text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              className="min-w-[40px] min-h-[40px] flex items-center justify-center absolute top-4 right-4 text-muted-foreground hover:text-foreground transition-colors cursor-pointer rounded-full hover:bg-muted"
             >
               <X className="w-5 h-5" />
             </button>
-            
+
             <div className="flex items-center gap-3 border-b border-border/60 pb-3">
               <div className="p-2.5 bg-success/10 rounded-2xl text-success">
                 <Heart className="w-5 h-5 fill-emerald-400" />
               </div>
               <div>
-                <h3 className="font-bold text-sm text-foreground">Lưu giọng nói yêu thích</h3>
+                <h3 id="save-voice-modal-title" className="font-bold text-sm text-foreground">Lưu giọng nói yêu thích</h3>
                 <p className="text-[10px] text-muted-foreground font-semibold">Cắt 8 giây đầu và lưu làm mẫu clone giọng</p>
               </div>
             </div>
@@ -783,7 +830,7 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
                 type="button"
                 onClick={handleSaveVoiceSubmit}
                 disabled={isSavingVoice || !saveVoiceName || !saveVoiceRefText}
-                className="px-5 py-2.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 disabled:bg-muted disabled:text-muted-foreground text-xs font-bold text-white rounded-lg cursor-pointer transition-colors shadow-md shadow-primary/10 border-none"
+                className="min-h-[44px] px-5 py-2.5 bg-primary hover:bg-primary-hover disabled:bg-muted disabled:text-muted-foreground text-xs font-bold text-primary-foreground rounded-xl cursor-pointer transition-colors"
               >
                 {isSavingVoice ? "Đang lưu..." : "Xác nhận Lưu"}
               </button>

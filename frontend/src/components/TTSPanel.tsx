@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef } from "react";
-import { Play, Pause, Loader2, Sparkles, Settings2, CheckCircle2 } from "lucide-react";
-import { api } from "../api/client";
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { Play, Pause, Loader2, Sparkles, Settings2, CheckCircle2, Mic, Sliders, Wand2 } from "lucide-react";
+import { api, getErrorMessage } from "../api/client";
 import type { JobStatusResponse, VoiceSampleResponse } from "../api/client";
 
 import { JobStatusCard } from "./JobStatusCard";
@@ -27,11 +27,12 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
 }) => {
   const [mode, setMode] = useState<"clone_voice" | "auto_voice" | "voice_design">("clone_voice");
   const [text, setText] = useState("Học sinh hôm nay được nghỉ học do thời tiết xấu. Xin nhắc lại, học sinh được nghỉ học.");
-  const [customVoiceSampleId, setCustomVoiceSampleId] = useState("");
+  const [customVoiceSampleId, setCustomVoiceSampleId] = useState(() => activeVoiceSampleId || "");
   const [refText, setRefText] = useState("");
+  const [instruct, setInstruct] = useState("female, young adult, warm");
   
   const [loading, setLoading] = useState(false);
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobId, setJobId] = useState<string | null>(() => localStorage.getItem("VITE_TTS_JOB_ID"));
   const [jobStatus, setJobStatus] = useState<JobStatusResponse | null>(null);
   const [isPolling, setIsPolling] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -87,30 +88,60 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
   const timeoutRef = useRef<number | null>(null);
 
   const [voiceSamples, setVoiceSamples] = useState<VoiceSampleResponse[]>([]);
-
-  const fetchVoiceSamples = async () => {
-    try {
-      const samples = await api.listVoiceSamples();
-      setVoiceSamples(samples);
-    } catch (err) {
-      console.error("Lỗi lấy danh sách mẫu giọng:", err);
-    }
-  };
-
+  const onJobUpdatedRef = useRef(onJobCreatedOrUpdated);
   useEffect(() => {
-    fetchVoiceSamples();
+    onJobUpdatedRef.current = onJobCreatedOrUpdated;
+  }, [onJobCreatedOrUpdated]);
+
+  const stopPolling = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    setIsPolling(false);
+    setLoading(false);
   }, []);
 
   useEffect(() => {
-    if (activeVoiceSampleId) {
+    let active = true;
+    (async () => {
+      try {
+        const samples = await api.listVoiceSamples();
+        if (active) setVoiceSamples(samples);
+      } catch (err) {
+        console.error("Lỗi lấy danh sách mẫu giọng:", err);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!activeVoiceSampleId) return;
+    let active = true;
+    Promise.resolve().then(async () => {
+      if (!active) return;
       setCustomVoiceSampleId(activeVoiceSampleId);
       setMode("clone_voice");
-      fetchVoiceSamples();
-    }
+      try {
+        const samples = await api.listVoiceSamples();
+        if (active) setVoiceSamples(samples);
+      } catch (err) {
+        console.error("Lỗi cập nhật danh sách mẫu giọng:", err);
+      }
+    });
+    return () => {
+      active = false;
+    };
   }, [activeVoiceSampleId]);
 
-  const handleGenerate = async () => {
-    if (!text) return;
+  const handleGenerate = useCallback(async () => {
+    if (!text.trim()) return;
     setLoading(true);
     setJobId(null);
     setJobStatus(null);
@@ -118,9 +149,10 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
 
     const voiceSampleId = mode === "clone_voice" ? customVoiceSampleId : undefined;
     const refTextParam = mode === "clone_voice" && refText ? refText : undefined;
+    const instructParam = mode === "voice_design" ? instruct.trim() || "female, young adult" : undefined;
 
     if (mode === "clone_voice" && !voiceSampleId) {
-      setErrorMsg("Vui lòng chọn mẫu giọng.");
+      setErrorMsg("Vui lòng chọn mẫu giọng để nhân bản.");
       setLoading(false);
       return;
     }
@@ -144,7 +176,7 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
     };
 
     try {
-      const res = await api.createTTSJob(mode, text, voiceSampleId, undefined, speed, numStep, params, refTextParam);
+      const res = await api.createTTSJob(mode, text, voiceSampleId, instructParam, speed, numStep, params, refTextParam);
       setJobId(res.job_id);
       localStorage.setItem("VITE_TTS_JOB_ID", res.job_id);
       setJobStatus({
@@ -156,31 +188,72 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
         error_message: null,
       });
       setIsPolling(true);
-      onJobCreatedOrUpdated?.();
-    } catch (err: any) {
-      setErrorMsg(err.message || "Không thể khởi tạo tiến trình TTS.");
+      onJobUpdatedRef.current?.();
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, "Không thể khởi tạo tiến trình TTS."));
       setLoading(false);
     }
-  };
+  }, [
+    text,
+    mode,
+    customVoiceSampleId,
+    refText,
+    instruct,
+    denoise,
+    guidanceScale,
+    tShift,
+    positionTemperature,
+    classTemperature,
+    layerPenaltyFactor,
+    duration,
+    preprocessPrompt,
+    postprocessOutput,
+    audioChunkDuration,
+    audioChunkThreshold,
+    language,
+    padDuration,
+    fadeDuration,
+    normalizeText,
+    speed,
+    numStep,
+  ]);
+
+  const handleGenerateRef = useRef(handleGenerate);
+  useEffect(() => {
+    handleGenerateRef.current = handleGenerate;
+  }, [handleGenerate]);
+
+  useEffect(() => {
+    const onRegenerate = () => {
+      void handleGenerateRef.current();
+    };
+    window.addEventListener("omnivoice:regenerate", onRegenerate);
+    return () => {
+      window.removeEventListener("omnivoice:regenerate", onRegenerate);
+    };
+  }, []);
 
   useEffect(() => {
     const savedJobId = localStorage.getItem("VITE_TTS_JOB_ID");
-    if (savedJobId) {
-      setJobId(savedJobId);
-      setLoading(true);
-      api.getJobStatus(savedJobId)
-        .then((status) => {
-          setJobStatus(status);
-          setLoading(false);
-          if (status.status !== "completed" && status.status !== "failed") {
-            setIsPolling(true);
-          }
-        })
-        .catch((err) => {
-          console.error("Lỗi khôi phục TTS job status:", err);
-          setLoading(false);
-        });
-    }
+    if (!savedJobId) return;
+    let active = true;
+    (async () => {
+      try {
+        const status = await api.getJobStatus(savedJobId);
+        if (!active) return;
+        setJobStatus(status);
+        setLoading(false);
+        if (status.status !== "completed" && status.status !== "failed") {
+          setIsPolling(true);
+        }
+      } catch (err) {
+        console.error("Lỗi khôi phục TTS job status:", err);
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -191,10 +264,10 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
           setJobStatus(status);
           if (status.status === "completed" || status.status === "failed") {
             stopPolling();
-            onJobCreatedOrUpdated?.();
+            onJobUpdatedRef.current?.();
           }
-        } catch (err: any) {
-          setErrorMsg(`Lỗi khi thăm dò trạng thái: ${err.message}`);
+        } catch (err: unknown) {
+          setErrorMsg(`Lỗi khi thăm dò trạng thái: ${getErrorMessage(err)}`);
           stopPolling();
         }
       }, 2000);
@@ -206,20 +279,7 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
     }
 
     return () => stopPolling();
-  }, [isPolling, jobId]);
-
-  const stopPolling = () => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
-    }
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-    setIsPolling(false);
-    setLoading(false);
-  };
+  }, [isPolling, jobId, stopPolling]);
 
   const handleClearJob = () => {
     setJobId(null);
@@ -237,49 +297,145 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
         <div className="lg:col-span-2 flex flex-col gap-6">
-          {/* Step 1: Select Voice */}
-          <SectionCard title="1. Chọn giọng đọc">
+          {/* Step 1: Select Mode & Voice */}
+          <SectionCard title="1. Chọn phương thức &amp; giọng đọc">
             <div className="flex flex-col gap-4">
-              {activeVoiceSampleId && customVoiceSampleId === activeVoiceSampleId && (
-                <div className="bg-primary/10 border border-primary/30 p-3 rounded-lg flex items-center gap-3">
-                  <CheckCircle2 className="w-5 h-5 text-primary shrink-0" />
-                  <div className="flex flex-col">
-                    <span className="text-xs font-bold text-primary">Giọng đang chọn</span>
-                    <span className="text-sm font-medium">{activeVoiceSampleId.substring(0, 15)}...</span>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2" role="tablist" aria-label="Chế độ tạo giọng">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === "clone_voice"}
+                  onClick={() => setMode("clone_voice")}
+                  className={`min-h-[44px] px-3 py-2 rounded-xl border text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer transition-colors ${
+                    mode === "clone_voice"
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-secondary/40 text-muted-foreground hover:text-foreground border-border"
+                  }`}
+                >
+                  <Mic className="w-3.5 h-3.5 shrink-0" />
+                  <span>Nhân bản giọng</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === "voice_design"}
+                  onClick={() => setMode("voice_design")}
+                  className={`min-h-[44px] px-3 py-2 rounded-xl border text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer transition-colors ${
+                    mode === "voice_design"
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-secondary/40 text-muted-foreground hover:text-foreground border-border"
+                  }`}
+                >
+                  <Sliders className="w-3.5 h-3.5 shrink-0" />
+                  <span>Thiết kế giọng (Prompt)</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === "auto_voice"}
+                  onClick={() => setMode("auto_voice")}
+                  className={`min-h-[44px] px-3 py-2 rounded-xl border text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer transition-colors ${
+                    mode === "auto_voice"
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-secondary/40 text-muted-foreground hover:text-foreground border-border"
+                  }`}
+                >
+                  <Wand2 className="w-3.5 h-3.5 shrink-0" />
+                  <span>Giọng tự động</span>
+                </button>
+              </div>
+
+              {mode === "clone_voice" && (
+                <>
+                  {activeVoiceSampleId && customVoiceSampleId === activeVoiceSampleId && (
+                    <div className="bg-primary/10 border border-primary/30 p-3 rounded-lg flex items-center gap-3">
+                      <CheckCircle2 className="w-5 h-5 text-primary shrink-0" />
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-primary">Giọng đang chọn</span>
+                        <span className="text-sm font-medium">{activeVoiceSampleId.substring(0, 15)}...</span>
+                      </div>
+                    </div>
+                  )}
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="tts-voice-select" className="text-xs font-semibold text-foreground">
+                      Mẫu giọng tham chiếu
+                    </label>
+                    <select
+                      id="tts-voice-select"
+                      value={customVoiceSampleId}
+                      onChange={(e) => {
+                        setCustomVoiceSampleId(e.target.value);
+                        const found = voiceSamples.find(s => s.id === e.target.value);
+                        if (found && found.ref_text) setRefText(found.ref_text);
+                      }}
+                      className="bg-secondary/50 border border-border/70 hover:border-border rounded-xl px-4 min-h-[48px] text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 w-full"
+                    >
+                      <option value="">-- Chọn một mẫu giọng --</option>
+                      <optgroup label="Giọng cá nhân (Private)">
+                        {voiceSamples.filter(s => !s.is_public).map(s => (
+                          <option key={s.id} value={s.id}>
+                            {s.name || s.id.substring(0, 10)} {s.duration ? `[${s.duration.toFixed(1)}s]` : ""}
+                          </option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Giọng cộng đồng (Public)">
+                        {voiceSamples.filter(s => s.is_public).map(s => (
+                          <option key={s.id} value={s.id}>
+                            {s.name || s.id.substring(0, 10)} {s.duration ? `[${s.duration.toFixed(1)}s]` : ""}
+                          </option>
+                        ))}
+                      </optgroup>
+                    </select>
+                  </div>
+                </>
+              )}
+
+              {mode === "voice_design" && (
+                <div className="flex flex-col gap-2">
+                  <label htmlFor="tts-voice-instruct" className="text-xs font-semibold text-foreground">
+                    Mô tả đặc điểm giọng nói (Instruct)
+                  </label>
+                  <input
+                    id="tts-voice-instruct"
+                    type="text"
+                    value={instruct}
+                    onChange={(e) => setInstruct(e.target.value)}
+                    placeholder="Ví dụ: female, young adult, american accent hoặc Giọng nữ trẻ ấm áp"
+                    className="min-h-[44px] w-full px-3.5 py-2.5 bg-background border border-input rounded-xl text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/30"
+                  />
+                  <div className="flex flex-wrap gap-1.5">
+                    {[
+                      "female, young adult",
+                      "male, middle-aged, low pitch",
+                      "female, calm, whisper",
+                      "male, young adult, british accent",
+                    ].map((sample) => (
+                      <button
+                        type="button"
+                        key={sample}
+                        onClick={() => setInstruct(sample)}
+                        className="min-h-[36px] px-2.5 py-1 rounded-lg bg-muted hover:bg-secondary border border-border text-xs text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+                      >
+                        {sample}
+                      </button>
+                    ))}
                   </div>
                 </div>
               )}
-              <select
-                value={customVoiceSampleId}
-                onChange={(e) => {
-                  setCustomVoiceSampleId(e.target.value);
-                  const found = voiceSamples.find(s => s.id === e.target.value);
-                  if (found && found.ref_text) setRefText(found.ref_text);
-                }}
-                className="bg-secondary/50 border border-border/70 hover:border-border rounded-xl px-4 h-12 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 w-full"
-              >
-                <option value="">-- Chọn một mẫu giọng --</option>
-                <optgroup label="Giọng cá nhân (Private)">
-                  {voiceSamples.filter(s => !s.is_public).map(s => (
-                    <option key={s.id} value={s.id}>
-                      {s.name || s.id.substring(0, 10)} {s.duration ? `[${s.duration.toFixed(1)}s]` : ""}
-                    </option>
-                  ))}
-                </optgroup>
-                <optgroup label="Giọng cộng đồng (Public)">
-                  {voiceSamples.filter(s => s.is_public).map(s => (
-                    <option key={s.id} value={s.id}>
-                      {s.name || s.id.substring(0, 10)} {s.duration ? `[${s.duration.toFixed(1)}s]` : ""}
-                    </option>
-                  ))}
-                </optgroup>
-              </select>
+
+              {mode === "auto_voice" && (
+                <p className="text-xs text-muted-foreground bg-muted/50 border border-border rounded-xl p-3">
+                  Hệ thống tự động chọn giọng đọc tự nhiên phù hợp nhất với văn bản bạn nhập, không cần mẫu ghi âm tham chiếu.
+                </p>
+              )}
             </div>
           </SectionCard>
 
           {/* Step 2: Enter Text */}
           <SectionCard title="2. Nhập văn bản">
+            <label htmlFor="tts-text-input" className="sr-only">Nội dung văn bản cần tổng hợp</label>
             <textarea
+              id="tts-text-input"
               ref={textareaRef}
               value={text}
               onChange={(e) => setText(e.target.value)}
@@ -329,11 +485,12 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
         {/* Right column: Config & Generate */}
         <div className="lg:col-span-1 flex flex-col gap-6">
            <button
+              type="button"
               onClick={handleGenerate}
-              disabled={loading || !text || !customVoiceSampleId}
-              className={`w-full h-14 rounded-xl font-bold text-base transition-all flex items-center justify-center gap-2 shadow-lg ${
-                !loading && text && customVoiceSampleId
-                  ? "bg-primary text-primary-foreground hover:bg-primary-hover shadow-primary/20"
+              disabled={loading || !text.trim() || (mode === "clone_voice" && !customVoiceSampleId)}
+              className={`w-full min-h-[52px] rounded-xl font-bold text-base transition-colors flex items-center justify-center gap-2 cursor-pointer active:translate-y-[1px] ${
+                !loading && text.trim() && (mode !== "clone_voice" || customVoiceSampleId)
+                  ? "bg-primary text-primary-foreground hover:bg-primary-hover"
                   : "bg-secondary text-muted-foreground cursor-not-allowed"
               }`}
             >

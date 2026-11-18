@@ -2,7 +2,8 @@ export const onRequest: PagesFunction = async (context) => {
   const url = new URL(context.request.url);
   
   // Construct the target URL for backend health check
-  const backendBase = ((context.env as any)?.BACKEND_URL as string) || "https://phucsd-oloka-voice-studio.hf.space";
+  const env = context.env as Record<string, string | undefined> | undefined;
+  const backendBase = env?.BACKEND_URL || "https://phucsd-oloka-voice-studio.hf.space";
   const targetUrl = `${backendBase.replace(/\/$/, "")}/health${url.search}`;
   
   // Clone request headers
@@ -22,9 +23,10 @@ export const onRequest: PagesFunction = async (context) => {
       statusText: response.statusText,
       headers: response.headers,
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
     return new Response(JSON.stringify({
-      detail: `Cloudflare Pages Health Proxy Error: ${error.message}`
+      detail: `Cloudflare Pages Health Proxy Error: ${msg}`
     }), {
       status: 502,
       headers: { "Content-Type": "application/json" }

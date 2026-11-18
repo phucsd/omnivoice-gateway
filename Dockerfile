@@ -37,7 +37,7 @@ COPY --chown=user . $HOME/app
 
 # Build frontend static bundle
 WORKDIR $HOME/app/frontend
-RUN npm install && npm run build
+RUN npm install --include=dev && npm run build
 
 # Set PYTHONPATH and Python UTF8 environment variables
 ENV PYTHONPATH=$HOME/app/backend
@@ -48,6 +48,8 @@ RUN mkdir -p $HOME/app/backend/storage
 
 # Set working directory to backend folder
 WORKDIR $HOME/app/backend
+
+ENV APP_ENV=production
 
 # Expose port 7860
 EXPOSE 7860

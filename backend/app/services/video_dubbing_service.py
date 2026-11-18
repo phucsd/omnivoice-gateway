@@ -17,8 +17,6 @@ from app.models import LLMProfile, SystemSetting
 
 
 
-_GOOGLE_CLIENT_ID = '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com'
-_GOOGLE_CLIENT_SECRET = 'SboVhoG9s0rNafixCSGGKXAT'
 _GOOGLE_SCOPES = 'https://gdata.youtube.com https://www.googleapis.com/auth/youtube'
 
 class VideoDubbingService:
@@ -228,6 +226,7 @@ class VideoDubbingService:
                 pass
 
         # 3. DB SystemSetting (youtube_proxy_pool)
+        db = None
         try:
             from app.database import SessionLocal
             from app.models import SystemSetting
@@ -241,6 +240,9 @@ class VideoDubbingService:
                             proxies.append(item.strip())
         except Exception:
             pass
+        finally:
+            if db is not None:
+                db.close()
 
         # 4. Fallback legacy storage/youtube_proxy.txt and single DB key
         legacy_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "youtube_proxy.txt"))
@@ -253,6 +255,7 @@ class VideoDubbingService:
             except Exception:
                 pass
 
+        db = None
         try:
             from app.database import SessionLocal
             from app.models import SystemSetting
@@ -262,6 +265,9 @@ class VideoDubbingService:
                 proxies.append(legacy_entry.value.strip())
         except Exception:
             pass
+        finally:
+            if db is not None:
+                db.close()
 
         # Normalize format and deduplicate preserving order
         seen = set()
@@ -299,6 +305,7 @@ class VideoDubbingService:
             f.write("\n".join(clean))
 
         # 2. Save to DB SystemSetting
+        db = None
         try:
             from app.database import SessionLocal
             from app.models import SystemSetting
@@ -322,6 +329,9 @@ class VideoDubbingService:
             db.commit()
         except Exception:
             pass
+        finally:
+            if db is not None:
+                db.close()
 
     @staticmethod
     def save_youtube_proxy(proxy_url: str):
@@ -454,11 +464,15 @@ class VideoDubbingService:
         refresh_token = token_data.get('refresh_token')
         if not refresh_token:
             return None
+        client_id = (settings.GOOGLE_CLIENT_ID or "").strip()
+        client_secret = (settings.GOOGLE_CLIENT_SECRET or "").strip()
+        if not client_id or not client_secret:
+            return None
         try:
             import requests as py_requests
             r = py_requests.post('https://oauth2.googleapis.com/token', data={
-                'client_id': _GOOGLE_CLIENT_ID,
-                'client_secret': _GOOGLE_CLIENT_SECRET,
+                'client_id': client_id,
+                'client_secret': client_secret,
                 'refresh_token': refresh_token,
                 'grant_type': 'refresh_token'
             }, timeout=10)
@@ -477,8 +491,11 @@ class VideoDubbingService:
     @staticmethod
     def start_oauth_device_flow() -> dict:
         import requests as py_requests
+        client_id = (settings.GOOGLE_CLIENT_ID or "").strip()
+        if not client_id:
+            raise ValueError("Chưa cấu hình GOOGLE_CLIENT_ID trên máy chủ.")
         r = py_requests.post('https://oauth2.googleapis.com/device/code', data={
-            'client_id': _GOOGLE_CLIENT_ID,
+            'client_id': client_id,
             'scope': _GOOGLE_SCOPES
         }, timeout=10)
         return r.json()
@@ -486,9 +503,13 @@ class VideoDubbingService:
     @staticmethod
     def poll_oauth_device_flow(device_code: str) -> dict:
         import requests as py_requests
+        client_id = (settings.GOOGLE_CLIENT_ID or "").strip()
+        client_secret = (settings.GOOGLE_CLIENT_SECRET or "").strip()
+        if not client_id or not client_secret:
+            raise ValueError("Chưa cấu hình GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET trên máy chủ.")
         r = py_requests.post('https://oauth2.googleapis.com/token', data={
-            'client_id': _GOOGLE_CLIENT_ID,
-            'client_secret': _GOOGLE_CLIENT_SECRET,
+            'client_id': client_id,
+            'client_secret': client_secret,
             'device_code': device_code,
             'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
         }, timeout=10)

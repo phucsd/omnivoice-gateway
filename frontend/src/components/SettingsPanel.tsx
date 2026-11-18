@@ -1,7 +1,6 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Settings, X, HelpCircle } from "lucide-react";
-import { api } from "../api/client";
-import type { SystemSettings } from "../api/client";
+import { api, getErrorMessage, type SettingsUpdateRequest, type SystemSettings } from "../api/client";
 
 interface SettingsPanelProps {
   isOpen: boolean;
@@ -21,36 +20,47 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
   const [connectionResult, setConnectionResult] = useState<{ success: boolean; message: string } | null>(null);
   const [pushResult, setPushResult] = useState<{ success: boolean; message: string; url?: string } | null>(null);
 
-  const fetchSettings = async () => {
-    setLoading(true);
-    try {
-      const res = await api.getSettings();
-      setConfig(res);
-      setUsername(res.kaggle_username);
-      
-      // Determine status
-      if (onStatusChange) {
-        if (!res.kaggle_username || !res.kaggle_key_configured) {
-          onStatusChange("unconfigured");
-        } else {
-          onStatusChange("connected");
-        }
-      }
-    } catch (err: any) {
-      console.error("Lỗi tải cấu hình:", err);
-    } finally {
-      setLoading(false);
-    }
-  };
+  const onStatusChangeRef = useRef(onStatusChange);
+  useEffect(() => {
+    onStatusChangeRef.current = onStatusChange;
+  }, [onStatusChange]);
 
   useEffect(() => {
-    if (isOpen) {
-      fetchSettings();
-    }
+    if (!isOpen) return;
+    let active = true;
+    (async () => {
+      try {
+        const res = await api.getSettings();
+        if (!active) return;
+        setConfig(res);
+        setUsername(res.kaggle_username);
+        if (!res.kaggle_username || !res.kaggle_key_configured) {
+          onStatusChangeRef.current?.("unconfigured");
+        } else {
+          onStatusChangeRef.current?.("connected");
+        }
+      } catch (err: unknown) {
+        console.error("Lỗi tải cấu hình:", err);
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, [isOpen]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, onClose]);
+
   const handleAutoSave = async (field: "username" | "key", val: string) => {
-    const payload: any = {};
+    const payload: SettingsUpdateRequest = {};
     if (field === "username") {
       payload.kaggle_username = val.trim();
     } else {
@@ -60,10 +70,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
 
     try {
       await api.updateSettings(payload);
-      // Reload configurations
       const res = await api.getSettings();
       setConfig(res);
-      if (field === "key") setKey(""); // Clear key input value
+      if (field === "key") setKey("");
 
       if (onStatusChange) {
         if (!res.kaggle_username || !res.kaggle_key_configured) {
@@ -72,8 +81,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
           onStatusChange("connected");
         }
       }
-    } catch (err: any) {
-      console.error("Auto-save failed:", err);
+    } catch (err: unknown) {
+      console.error("Auto-save failed:", getErrorMessage(err));
     }
   };
 
@@ -86,10 +95,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
       if (onStatusChange) {
         onStatusChange(res.success ? "connected" : "error");
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       setConnectionResult({
         success: false,
-        message: err.message || "Không thể kết nối đến máy chủ API hoặc lệnh kiểm tra thất bại.",
+        message: getErrorMessage(err, "Không thể kết nối đến máy chủ API hoặc lệnh kiểm tra thất bại."),
       });
       if (onStatusChange) {
         onStatusChange("error");
@@ -109,10 +118,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
       if (onStatusChange) {
         onStatusChange(res.success ? "connected" : "error");
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       setPushResult({
         success: false,
-        message: err.message || "Lỗi hệ thống khi đẩy notebook lên Kaggle.",
+        message: getErrorMessage(err, "Lỗi hệ thống khi đẩy notebook lên Kaggle."),
       });
       if (onStatusChange) {
         onStatusChange("error");
@@ -125,17 +134,22 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
   if (!isOpen) return null;
 
   return (
-    <div 
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="kaggle-settings-modal-title"
       className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
       onClick={onClose}
     >
-      <div 
-        className="bg-card border border-border rounded-3xl p-6 max-w-lg w-full flex flex-col gap-4 shadow-2xl relative animate-fadeIn max-h-[90vh] overflow-y-auto"
+      <div
+        className="bg-card border border-border rounded-[20px] p-6 max-w-lg w-full flex flex-col gap-4 shadow-2xl relative animate-fadeIn max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <button
+          type="button"
+          aria-label="Đóng cài đặt Kaggle"
           onClick={onClose}
-          className="absolute right-5 top-5 text-muted-foreground hover:text-foreground cursor-pointer"
+          className="min-w-[40px] min-h-[40px] flex items-center justify-center absolute right-4 top-4 text-muted-foreground hover:text-foreground rounded-full hover:bg-muted cursor-pointer"
           title="Đóng"
         >
           <X className="w-4.5 h-4.5" />
@@ -146,7 +160,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
             <Settings className="w-5 h-5" />
           </div>
           <div>
-            <h3 className="font-bold text-foreground text-sm">Cấu hình Kết nối Máy chủ Kaggle</h3>
+            <h3 id="kaggle-settings-modal-title" className="font-bold text-foreground text-sm">Cấu hình Kết nối Máy chủ Kaggle</h3>
             <p className="text-[11px] text-muted-foreground mt-0.5">
               Tài khoản Kaggle Credentials được tự động lưu sau khi nhập để kích hoạt máy chủ dịch vụ GPU.
             </p>

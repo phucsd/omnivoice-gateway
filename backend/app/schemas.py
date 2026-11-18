@@ -16,6 +16,7 @@ class VoiceSampleResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     
     id: str
+    user_id: Optional[str] = None
     source_type: str
     ref_text: Optional[str] = None
     duration: Optional[float] = None
@@ -307,6 +308,18 @@ class LLMProfileResponse(BaseModel):
     last_tested_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+
+
+class LLMProfilePublicResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    provider: str
+    model: str
+    thinking_effort: str
+    is_active: bool
+    last_test_status: str = "untested"
 
 class LLMProfileCreateRequest(BaseModel):
     name: str

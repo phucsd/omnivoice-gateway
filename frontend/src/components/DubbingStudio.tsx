@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { 
   Sparkles, 
   CheckCircle2, 
@@ -39,9 +39,24 @@ import {
   AlertTriangle,
   Edit3
 } from "lucide-react";
-import { api, type VideoDubbingJobResponse, type SubtitleSegment, type LLMProfile } from "../api/client";
+import { api, getErrorMessage, type VideoDubbingJobResponse, type SubtitleSegment, type LLMProfilePublic } from "../api/client";
 import { PageHeader } from "./ui/PageHeader";
 import { SectionCard } from "./ui/SectionCard";
+
+interface DubbingStudioProps {
+  currentUser?: { id: string; username: string; is_admin: boolean } | null;
+}
+
+interface ProxyTestResult {
+  hash?: string;
+  status: "online" | "offline";
+  latency_ms: number;
+  ip?: string;
+  country?: string;
+  city?: string;
+  org?: string;
+  message: string;
+}
 
 // Pipeline steps definition
 const PIPELINE_STEPS = [
@@ -61,7 +76,8 @@ function getYouTubeId(url?: string | null): string {
   return match ? match[1] : (url.length > 20 ? url.slice(-11) : url);
 }
 
-export default function DubbingStudio() {
+export default function DubbingStudio({ currentUser }: DubbingStudioProps) {
+  const isAdmin = Boolean(currentUser?.is_admin);
   // Navigation / Multi-project states: 'create' | 'workspace' | 'list'
   const [viewMode, setViewMode] = useState<"create" | "workspace" | "list">(() => {
     return localStorage.getItem("active_dubbing_job_id") ? "workspace" : "create";
@@ -109,7 +125,7 @@ export default function DubbingStudio() {
   const [llmProvider, setLlmProvider] = useState("gemini");
   const [llmModel, setLlmModel] = useState("gemini-2.5-flash");
   const [llmCustomEndpoint, setLlmCustomEndpoint] = useState("");
-  const [llmProfiles, setLlmProfiles] = useState<LLMProfile[]>([]);
+  const [llmProfiles, setLlmProfiles] = useState<LLMProfilePublic[]>([]);
   const [selectedLlmProfileId, setSelectedLlmProfileId] = useState<string>("");
 
   // Subtitle editor state
@@ -136,7 +152,7 @@ export default function DubbingStudio() {
   const [remixing, setRemixing] = useState(false);
   const [remixVocalVol, setRemixVocalVol] = useState(1.2);
   const [remixBgmVol, setRemixBgmVol] = useState(0.3);
-  const [outputVideoTimestamp, setOutputVideoTimestamp] = useState<number>(Date.now());
+  const [outputVideoTimestamp, setOutputVideoTimestamp] = useState<number>(() => Date.now());
   const [showRemixPanel, setShowRemixPanel] = useState(false);
 
   // YouTube Authentication States (OAuth, Cookie, Residential Proxy Pool)
@@ -148,7 +164,7 @@ export default function DubbingStudio() {
   const [oauthCopied, setOauthCopied] = useState(false);
   const [oauthError, setOauthError] = useState<string | null>(null);
   const [oauthSuccessMsg, setOauthSuccessMsg] = useState<string | null>(null);
-  const pollTimerRef = useRef<any>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [cookieStatus, setCookieStatus] = useState<{ has_cookies: boolean; size_bytes?: number } | null>(null);
   const [showCookieModal, setShowCookieModal] = useState(false);
@@ -168,18 +184,10 @@ export default function DubbingStudio() {
   const [proxyBatchInput, setProxyBatchInput] = useState("");
   const [proxyAdding, setProxyAdding] = useState(false);
   const [proxyTestingAll, setProxyTestingAll] = useState(false);
-  const [proxyTestResults, setProxyTestResults] = useState<Record<string, {
-    status: "online" | "offline";
-    latency_ms: number;
-    ip?: string;
-    country?: string;
-    city?: string;
-    org?: string;
-    message: string;
-  }>>({});
+  const [proxyTestResults, setProxyTestResults] = useState<Record<string, ProxyTestResult>>({});
   const [proxyPoolMsg, setProxyPoolMsg] = useState<string | null>(null);
 
-  const fetchAllJobs = async (showLoading = false) => {
+  const fetchAllJobs = useCallback(async (showLoading = false) => {
     if (showLoading) setLoadingAllJobs(true);
     try {
       const res = await api.listDubbingJobs(1, 100);
@@ -194,55 +202,151 @@ export default function DubbingStudio() {
         localStorage.setItem("open_dubbing_job_tabs", JSON.stringify(merged));
         return merged;
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Lỗi lấy danh sách dự án:", err);
     } finally {
       if (showLoading) setLoadingAllJobs(false);
     }
-  };
-
-  // Restore active job from localStorage on mount & fetch settings & auth statuses
-  useEffect(() => {
-    fetchSystemLlmSettings();
-    fetchLlmProfiles();
-    fetchCookieStatus();
-    fetchOAuthStatus();
-    fetchProxyPool();
-    fetchAllJobs(true);
-    if (jobId) {
-      fetchJobDetails(jobId);
-    }
-
-    // Auto-restore OAuth session from localStorage if server restarted
-    const savedOauth = localStorage.getItem("youtube_oauth_token");
-    if (savedOauth) {
-      try {
-        const parsed = JSON.parse(savedOauth);
-        api.syncYouTubeOAuth(parsed).then(() => fetchOAuthStatus()).catch(() => fetchOAuthStatus());
-      } catch {
-        fetchOAuthStatus();
-      }
-    } else {
-      fetchOAuthStatus();
-    }
-
-    // Periodic background poll for all jobs
-    const allJobsInterval = setInterval(() => {
-      fetchAllJobs(false);
-    }, 4000);
-
-    return () => {
-      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-      clearInterval(allJobsInterval);
-    };
   }, []);
 
-  const fetchOAuthStatus = async () => {
+  const fetchOAuthStatus = useCallback(async () => {
     try {
       const res = await api.getYouTubeOAuthStatus();
       setOauthStatus(res);
-    } catch {}
-  };
+    } catch (err: unknown) {
+      console.debug("OAuth status unavailable:", err);
+    }
+  }, []);
+
+  const fetchCookieStatus = useCallback(async () => {
+    try {
+      const res = await api.getDubbingCookieStatus();
+      setCookieStatus(res);
+    } catch (err: unknown) {
+      console.debug("Cookie status unavailable:", err);
+    }
+  }, []);
+
+  const fetchProxyPool = useCallback(async () => {
+    try {
+      const res = await api.getProxyPool();
+      setProxyPool(res.proxies || []);
+    } catch (err: unknown) {
+      console.debug("Proxy pool unavailable:", err);
+    }
+  }, []);
+
+  const fetchLlmProfiles = useCallback(async () => {
+    try {
+      const profiles = await api.listDubbingLlmProfiles();
+      setLlmProfiles(profiles);
+      const activeProf = profiles.find(p => p.is_active);
+      if (activeProf) {
+        setSelectedLlmProfileId(activeProf.id);
+      } else if (profiles.length > 0) {
+        setSelectedLlmProfileId(profiles[0].id);
+      }
+    } catch (err: unknown) {
+      console.debug("LLM profiles unavailable:", err);
+    }
+  }, []);
+
+  const fetchSystemLlmSettings = useCallback(async () => {
+    try {
+      const settings = await api.adminGetSystemSettings();
+      if (settings.llm_provider) setLlmProvider(settings.llm_provider);
+      if (settings.llm_model) setLlmModel(settings.llm_model);
+      if (settings.llm_custom_endpoint) setLlmCustomEndpoint(settings.llm_custom_endpoint);
+    } catch (err: unknown) {
+      console.debug("System LLM settings unavailable:", err);
+    }
+  }, []);
+
+  const fetchJobDetails = useCallback(async (id: string) => {
+    try {
+      const data = await api.getDubbingJob(id);
+      setJob(data);
+      if (data.original_subtitles) setOriginalSubs(data.original_subtitles);
+      if (data.translated_subtitles) setTranslatedSubs(data.translated_subtitles);
+
+      // Fetch logs
+      try {
+        const logData = await api.getDubbingJobLog(id);
+        setJobLogs(logData.log);
+      } catch {
+        // Log file may not exist yet for queued jobs
+      }
+    } catch (err: unknown) {
+      console.error("Lỗi lấy thông tin Job:", err);
+    }
+  }, []);
+
+  // Restore active job from localStorage on mount & fetch settings & auth statuses
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      void fetchLlmProfiles();
+      void fetchAllJobs(false);
+
+      const initialJobId = localStorage.getItem("active_dubbing_job_id");
+      if (initialJobId) {
+        void fetchJobDetails(initialJobId);
+      }
+
+      if (isAdmin) {
+        void fetchSystemLlmSettings();
+        void fetchCookieStatus();
+        void fetchProxyPool();
+
+        const savedOauth = localStorage.getItem("youtube_oauth_token");
+        if (savedOauth) {
+          try {
+            const parsed = JSON.parse(savedOauth);
+            api.syncYouTubeOAuth(parsed)
+              .then(() => fetchOAuthStatus())
+              .catch(() => fetchOAuthStatus());
+          } catch {
+            void fetchOAuthStatus();
+          }
+        } else {
+          void fetchOAuthStatus();
+        }
+      }
+    });
+
+    // Periodic background poll for all jobs
+    const allJobsInterval = setInterval(() => {
+      void fetchAllJobs(false);
+    }, 4000);
+
+    return () => {
+      cancelled = true;
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+      clearInterval(allJobsInterval);
+    };
+  }, [
+    isAdmin,
+    fetchAllJobs,
+    fetchCookieStatus,
+    fetchJobDetails,
+    fetchLlmProfiles,
+    fetchOAuthStatus,
+    fetchProxyPool,
+    fetchSystemLlmSettings,
+  ]);
+
+  useEffect(() => {
+    if (!showCookieModal) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setShowCookieModal(false);
+        setCookieMsg(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [showCookieModal]);
 
   const handleStartOAuth = async () => {
     setOauthStarting(true);
@@ -260,24 +364,25 @@ export default function DubbingStudio() {
         try {
           const pollRes = await api.pollYouTubeOAuth(data.device_code);
           if (pollRes.status === "success") {
-            clearInterval(pollTimerRef.current);
+            if (pollTimerRef.current) clearInterval(pollTimerRef.current);
             setOauthPolling(false);
             if (pollRes.token_data) {
               localStorage.setItem("youtube_oauth_token", JSON.stringify(pollRes.token_data));
             }
             setOauthSuccessMsg(pollRes.message || "Đã kết nối tài khoản YouTube thành công!");
-            fetchOAuthStatus();
+            void fetchOAuthStatus();
           } else if (pollRes.status === "error") {
-            clearInterval(pollTimerRef.current);
+            if (pollTimerRef.current) clearInterval(pollTimerRef.current);
             setOauthPolling(false);
             setOauthError(pollRes.error || "Quá trình xác thực không thành công.");
           }
-        } catch (err: any) {
+        } catch (err: unknown) {
           // Keep polling on minor network hiccups
+          console.debug("OAuth polling transient error:", err);
         }
       }, pollInterval);
-    } catch (err: any) {
-      setOauthError(err.message || "Không thể khởi tạo phiên đăng nhập Google");
+    } catch (err: unknown) {
+      setOauthError(getErrorMessage(err, "Không thể khởi tạo phiên đăng nhập Google"));
     } finally {
       setOauthStarting(false);
     }
@@ -291,8 +396,8 @@ export default function DubbingStudio() {
       setOauthStatus({ connected: false });
       setOauthFlowData(null);
       setOauthSuccessMsg(null);
-    } catch (err: any) {
-      alert(`Lỗi: ${err.message || "Không thể ngắt kết nối"}`);
+    } catch (err: unknown) {
+      alert(`Lỗi: ${getErrorMessage(err, "Không thể ngắt kết nối")}`);
     }
   };
 
@@ -303,13 +408,6 @@ export default function DubbingStudio() {
     setTimeout(() => setOauthCopied(false), 2500);
   };
 
-  const fetchCookieStatus = async () => {
-    try {
-      const res = await api.getDubbingCookieStatus();
-      setCookieStatus(res);
-    } catch {}
-  };
-
   const handleUploadCookieFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -318,9 +416,9 @@ export default function DubbingStudio() {
     try {
       const res = await api.uploadDubbingCookies(file);
       setCookieMsg(res.message);
-      fetchCookieStatus();
-    } catch (err: any) {
-      setCookieMsg(`Lỗi: ${err.message || "Không thể tải cookie"}`);
+      void fetchCookieStatus();
+    } catch (err: unknown) {
+      setCookieMsg(`Lỗi: ${getErrorMessage(err, "Không thể tải cookie")}`);
     } finally {
       setCookieUploading(false);
     }
@@ -334,9 +432,9 @@ export default function DubbingStudio() {
       const res = await api.uploadDubbingCookies(undefined, cookieText.trim());
       setCookieMsg(res.message);
       setCookieText("");
-      fetchCookieStatus();
-    } catch (err: any) {
-      setCookieMsg(`Lỗi: ${err.message || "Không thể lưu cookie"}`);
+      void fetchCookieStatus();
+    } catch (err: unknown) {
+      setCookieMsg(`Lỗi: ${getErrorMessage(err, "Không thể lưu cookie")}`);
     } finally {
       setCookieUploading(false);
     }
@@ -349,19 +447,31 @@ export default function DubbingStudio() {
     try {
       const res = await api.deleteDubbingCookies();
       setCookieMsg(res.message);
-      fetchCookieStatus();
-    } catch (err: any) {
-      setCookieMsg(`Lỗi: ${err.message || "Không thể xóa cookie"}`);
+      void fetchCookieStatus();
+    } catch (err: unknown) {
+      setCookieMsg(`Lỗi: ${getErrorMessage(err, "Không thể xóa cookie")}`);
     } finally {
       setCookieUploading(false);
     }
   };
 
-  const fetchProxyPool = async () => {
+  const handleTestAllProxies = async () => {
+    setProxyTestingAll(true);
+    setProxyPoolMsg(null);
     try {
-      const res = await api.getProxyPool();
-      setProxyPool(res.proxies || []);
-    } catch {}
+      const res = await api.testAllProxiesInPool();
+      const map: Record<string, ProxyTestResult> = {};
+      for (const r of res.results) {
+        map[r.hash] = r;
+      }
+      setProxyTestResults(map);
+      const onlineCount = res.results.filter((r) => r.status === "online").length;
+      setProxyPoolMsg(`Kiểm tra hoàn tất: ${onlineCount}/${res.results.length} Proxy đang hoạt động tốt.`);
+    } catch (err: unknown) {
+      setProxyPoolMsg(`Lỗi kiểm tra proxy: ${getErrorMessage(err, "Timeout")}`);
+    } finally {
+      setProxyTestingAll(false);
+    }
   };
 
   const handleAddProxyPool = async () => {
@@ -375,30 +485,13 @@ export default function DubbingStudio() {
       setProxyBatchInput("");
       setProxyPoolMsg(res.message);
       // Auto-trigger test for newly added proxies
-      setTimeout(() => handleTestAllProxies(), 400);
-    } catch (err: any) {
-      setProxyPoolMsg(`Lỗi: ${err.message || "Không thể thêm proxy vào pool"}`);
+      setTimeout(() => {
+        void handleTestAllProxies();
+      }, 400);
+    } catch (err: unknown) {
+      setProxyPoolMsg(`Lỗi: ${getErrorMessage(err, "Không thể thêm proxy vào pool")}`);
     } finally {
       setProxyAdding(false);
-    }
-  };
-
-  const handleTestAllProxies = async () => {
-    setProxyTestingAll(true);
-    setProxyPoolMsg(null);
-    try {
-      const res = await api.testAllProxiesInPool();
-      const map: Record<string, any> = {};
-      for (const r of res.results) {
-        map[r.hash] = r;
-      }
-      setProxyTestResults(map);
-      const onlineCount = res.results.filter((r) => r.status === "online").length;
-      setProxyPoolMsg(`Kiểm tra hoàn tất: ${onlineCount}/${res.results.length} Proxy đang hoạt động tốt.`);
-    } catch (err: any) {
-      setProxyPoolMsg(`Lỗi kiểm tra proxy: ${err.message || "Timeout"}`);
-    } finally {
-      setProxyTestingAll(false);
     }
   };
 
@@ -412,8 +505,8 @@ export default function DubbingStudio() {
         return next;
       });
       setProxyPoolMsg("Đã xóa proxy khỏi danh sách.");
-    } catch (err: any) {
-      setProxyPoolMsg(`Lỗi: ${err.message || "Không thể xóa"}`);
+    } catch (err: unknown) {
+      setProxyPoolMsg(`Lỗi: ${getErrorMessage(err, "Không thể xóa")}`);
     }
   };
 
@@ -424,51 +517,8 @@ export default function DubbingStudio() {
       setProxyPool([]);
       setProxyTestResults({});
       setProxyPoolMsg("Đã làm trống toàn bộ danh sách Proxy.");
-    } catch (err: any) {
-      setProxyPoolMsg(`Lỗi: ${err.message || "Không thể xóa"}`);
-    }
-  };
-
-  const fetchLlmProfiles = async () => {
-    try {
-      const profiles = await api.listLlmProfiles();
-      setLlmProfiles(profiles);
-      const activeProf = profiles.find(p => p.is_active);
-      if (activeProf) {
-        setSelectedLlmProfileId(activeProf.id);
-      } else if (profiles.length > 0) {
-        setSelectedLlmProfileId(profiles[0].id);
-      }
-    } catch {
-      // Non-admin fallback or ignore
-    }
-  };
-
-  const fetchSystemLlmSettings = async () => {
-    try {
-      const settings = await api.adminGetSystemSettings();
-      if (settings.llm_provider) setLlmProvider(settings.llm_provider);
-      if (settings.llm_model) setLlmModel(settings.llm_model);
-      if (settings.llm_custom_endpoint) setLlmCustomEndpoint(settings.llm_custom_endpoint);
-    } catch {
-      // Non-admin fallback or ignore
-    }
-  };
-
-  const fetchJobDetails = async (id: string) => {
-    try {
-      const data = await api.getDubbingJob(id);
-      setJob(data);
-      if (data.original_subtitles) setOriginalSubs(data.original_subtitles);
-      if (data.translated_subtitles) setTranslatedSubs(data.translated_subtitles);
-      
-      // Fetch logs
-      try {
-        const logData = await api.getDubbingJobLog(id);
-        setJobLogs(logData.log);
-      } catch {}
-    } catch (err: any) {
-      console.error("Lỗi lấy thông tin Job:", err);
+    } catch (err: unknown) {
+      setProxyPoolMsg(`Lỗi: ${getErrorMessage(err, "Không thể xóa")}`);
     }
   };
 
@@ -483,9 +533,11 @@ export default function DubbingStudio() {
       try {
         const logData = await api.getDubbingJobLog(jobId);
         setJobLogs(logData.log);
-      } catch {}
+      } catch {
+        // Log may not be initialized yet
+      }
     };
-    fetchLogs();
+    void fetchLogs();
 
     const interval = setInterval(async () => {
       try {
@@ -503,12 +555,14 @@ export default function DubbingStudio() {
         try {
           const logData = await api.getDubbingJobLog(jobId);
           setJobLogs(logData.log);
-        } catch {}
+        } catch {
+          // Ignore transient log poll errors
+        }
 
         if (data.status === "completed" || data.status === "failed") {
           clearInterval(interval);
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error("Lỗi đồng bộ Job status:", err);
       }
     }, 2500);
@@ -541,8 +595,8 @@ export default function DubbingStudio() {
       });
       setUploadedJobId(response.id);
       setUploadedVideoUrl(api.getDubbingFileUrl(response.id, "video"));
-    } catch (err: any) {
-      setError(err.message || "Tải video lên thất bại. Vui lòng thử lại.");
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, "Tải video lên thất bại. Vui lòng thử lại."));
       setSelectedFile(null);
     } finally {
       setUploading(false);
@@ -584,8 +638,8 @@ export default function DubbingStudio() {
       setSelectedFile(null);
       setUploadedJobId(null);
       setUploadedVideoUrl(null);
-    } catch (err: any) {
-      setError(err.message || "Không thể khởi tạo tác vụ lồng tiếng.");
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, "Không thể khởi tạo tác vụ lồng tiếng."));
     } finally {
       setLoading(false);
     }
@@ -598,8 +652,8 @@ export default function DubbingStudio() {
     try {
       await api.updateDubbingSubtitles(jobId, originalSubs, translatedSubs);
       alert("Đã lưu bản dịch phụ đề thành công!");
-    } catch (err: any) {
-      setError(err.message || "Lỗi lưu phụ đề.");
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, "Lỗi lưu phụ đề."));
     } finally {
       setSavingSubs(false);
     }
@@ -614,8 +668,8 @@ export default function DubbingStudio() {
       await api.finalizeDubbingJob(jobId, vocalsVolume, bgmVolume);
       const data = await api.getDubbingJob(jobId);
       setJob(data);
-    } catch (err: any) {
-      setError(err.message || "Lỗi hoàn tất lồng tiếng.");
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, "Lỗi hoàn tất lồng tiếng."));
     } finally {
       setLoading(false);
     }
@@ -633,9 +687,9 @@ export default function DubbingStudio() {
       if (updated.original_subtitles && updated.original_subtitles.length > 0) {
         setOriginalSubs(updated.original_subtitles);
       }
-      fetchAllJobs();
-    } catch (e: any) {
-      alert(`Lỗi khi mở lại chế độ chỉnh sửa: ${e.message || "Vui lòng thử lại"}`);
+      void fetchAllJobs();
+    } catch (e: unknown) {
+      alert(`Lỗi khi mở lại chế độ chỉnh sửa: ${getErrorMessage(e, "Vui lòng thử lại")}`);
     } finally {
       setReEditing(false);
     }
@@ -656,8 +710,8 @@ export default function DubbingStudio() {
       if (res.shortened_text) {
         updateSubText(segId, res.shortened_text);
       }
-    } catch (e: any) {
-      alert(`Không thể rút gọn câu bằng AI: ${e.message || "Mô hình LLM không phản hồi"}`);
+    } catch (e: unknown) {
+      alert(`Không thể rút gọn câu bằng AI: ${getErrorMessage(e, "Mô hình LLM không phản hồi")}`);
     } finally {
       setShorteningSegId(null);
     }
@@ -672,10 +726,10 @@ export default function DubbingStudio() {
         bgm_volume: remixBgmVol,
       });
       setOutputVideoTimestamp(Date.now());
-      fetchAllJobs();
+      void fetchAllJobs();
       alert("Đã hòa âm lại và cập nhật video thành công!");
-    } catch (e: any) {
-      alert(`Lỗi hòa âm video: ${e.message || "Không tìm thấy file âm thanh"}`);
+    } catch (e: unknown) {
+      alert(`Lỗi hòa âm video: ${getErrorMessage(e, "Không tìm thấy file âm thanh")}`);
     } finally {
       setRemixing(false);
     }
@@ -739,8 +793,8 @@ export default function DubbingStudio() {
       if (jobId === idToDelete) {
         resetState();
       }
-    } catch (err: any) {
-      alert(`Lỗi khi xóa: ${err.message || "Không thể xóa dự án"}`);
+    } catch (err: unknown) {
+      alert(`Lỗi khi xóa: ${getErrorMessage(err, "Không thể xóa dự án")}`);
     }
   };
 
@@ -886,8 +940,8 @@ export default function DubbingStudio() {
         if (bgmPlayerRef.current) bgmPlayerRef.current.load();
       }, 300);
       alert("Tách lại âm thanh thành công! Hãy bấm Play để nghe thử.");
-    } catch (err: any) {
-      alert(`Lỗi khi tách lại âm thanh: ${err.message || "Không thể thực hiện"}`);
+    } catch (err: unknown) {
+      alert(`Lỗi khi tách lại âm thanh: ${getErrorMessage(err, "Không thể thực hiện")}`);
     } finally {
       setReseparating(false);
     }
@@ -951,23 +1005,25 @@ export default function DubbingStudio() {
         />
         
         <div className="flex items-center gap-2">
-          {/* Button: YouTube / Proxy Settings */}
-          <button
-            type="button"
-            onClick={() => setShowCookieModal(true)}
-            className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
-              proxyPool.length > 0 
-                ? "bg-purple-500/10 text-purple-600 dark:text-purple-400 border-purple-500/30 hover:bg-purple-500/20"
-                : oauthStatus?.connected
-                ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20"
-                : "bg-secondary hover:bg-secondary/80 text-foreground border-border"
-            }`}
-          >
-            <Globe className="w-3.5 h-3.5" />
-            <span>
-              {proxyPool.length > 0 ? `Proxy Pool (${proxyPool.length})` : oauthStatus?.connected ? "YouTube: Đã kết nối" : "Proxy / YouTube"}
-            </span>
-          </button>
+          {/* Button: YouTube / Proxy Settings (Admin only) */}
+          {isAdmin && (
+            <button
+              type="button"
+              onClick={() => setShowCookieModal(true)}
+              className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
+                proxyPool.length > 0 
+                  ? "bg-purple-500/10 text-purple-600 dark:text-purple-400 border-purple-500/30 hover:bg-purple-500/20"
+                  : oauthStatus?.connected
+                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20"
+                  : "bg-secondary hover:bg-secondary/80 text-foreground border-border"
+              }`}
+            >
+              <Globe className="w-3.5 h-3.5" />
+              <span>
+                {proxyPool.length > 0 ? `Proxy Pool (${proxyPool.length})` : oauthStatus?.connected ? "YouTube: Đã kết nối" : "Proxy / YouTube"}
+              </span>
+            </button>
+          )}
 
           {/* Button: Tất Cả Dự Án */}
           <button
@@ -1247,8 +1303,8 @@ export default function DubbingStudio() {
                       setJob(updated);
                       if (updated.original_subtitles) setOriginalSubs(updated.original_subtitles);
                       if (updated.translated_subtitles) setTranslatedSubs(updated.translated_subtitles);
-                    } catch (e: any) {
-                      alert(e.message || "Không thể bỏ qua");
+                    } catch (e: unknown) {
+                      alert(getErrorMessage(e, "Không thể bỏ qua"));
                     } finally {
                       setRetranslating(false);
                     }
@@ -1258,7 +1314,7 @@ export default function DubbingStudio() {
                   title="Bỏ qua dịch thuật LLM nếu bị kẹt và chuyển ngay sang bước duyệt phụ đề"
                 >
                   <Zap className="w-3.5 h-3.5" />
-                  <span>{retranslating ? "Đang mở duyệt..." : "⚡ Bỏ Qua Dịch & Mở Duyệt Ngay"}</span>
+                  <span>{retranslating ? "Đang mở duyệt..." : "Bỏ Qua Dịch & Mở Duyệt Ngay"}</span>
                 </button>
               )}
             </div>
@@ -1277,7 +1333,9 @@ export default function DubbingStudio() {
                       try {
                         const logData = await api.getDubbingJobLog(jobId);
                         setJobLogs(logData.log);
-                      } catch {}
+                      } catch {
+                        // Ignore log refresh error
+                      }
                     }
                   }}
                   className="text-[10px] text-primary hover:underline font-semibold flex items-center gap-1 cursor-pointer"
@@ -1289,9 +1347,9 @@ export default function DubbingStudio() {
                 {jobLogs ? (
                   jobLogs.split("\n").map((line, lIdx) => {
                     if (!line.trim()) return null;
-                    let isError = line.includes("LỖI") || line.includes("FAILED") || line.includes("ERROR");
-                    let isSuccess = line.includes("thành công") || line.includes("SUCCESS") || line.includes("hoàn tất");
-                    let isKaggle = line.includes("[KAGGLE]") || line.includes("[MOCK]");
+                    const isError = line.includes("LỖI") || line.includes("FAILED") || line.includes("ERROR");
+                    const isSuccess = line.includes("thành công") || line.includes("SUCCESS") || line.includes("hoàn tất");
+                    const isKaggle = line.includes("[KAGGLE]") || line.includes("[MOCK]");
                     return (
                       <div key={lIdx} className="leading-relaxed break-all text-left">
                         <span className={isError ? "text-red-400 font-bold" : isSuccess ? "text-emerald-400" : isKaggle ? "text-cyan-400" : "text-zinc-300"}>
@@ -1684,55 +1742,57 @@ export default function DubbingStudio() {
                       <PlaySquare className="w-3.5 h-3.5 text-red-500" />
                       <span>Đường dẫn YouTube</span>
                     </label>
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setActiveModalTab("proxy");
-                          setShowCookieModal(true);
-                        }}
-                        className={`text-[11px] px-2.5 py-1 rounded-lg border flex items-center gap-1.5 font-medium transition-all cursor-pointer ${
-                          proxyPool.length > 0
-                            ? "bg-purple-500/15 text-purple-600 dark:text-purple-400 border-purple-500/30 hover:bg-purple-500/25"
-                            : "bg-secondary/60 text-muted-foreground border-border hover:bg-secondary hover:text-foreground"
-                        }`}
-                      >
-                        <Globe className={`w-3.5 h-3.5 ${proxyPool.length > 0 ? "text-purple-500" : "text-muted-foreground"}`} />
-                        <span>{proxyPool.length > 0 ? `Proxy Pool (${proxyPool.length})` : "Proxy Dân Cư"}</span>
-                      </button>
+                    {isAdmin && (
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveModalTab("proxy");
+                            setShowCookieModal(true);
+                          }}
+                          className={`text-[11px] px-2.5 py-1 rounded-lg border flex items-center gap-1.5 font-medium transition-all cursor-pointer ${
+                            proxyPool.length > 0
+                              ? "bg-purple-500/15 text-purple-600 dark:text-purple-400 border-purple-500/30 hover:bg-purple-500/25"
+                              : "bg-secondary/60 text-muted-foreground border-border hover:bg-secondary hover:text-foreground"
+                          }`}
+                        >
+                          <Globe className={`w-3.5 h-3.5 ${proxyPool.length > 0 ? "text-purple-500" : "text-muted-foreground"}`} />
+                          <span>{proxyPool.length > 0 ? `Proxy Pool (${proxyPool.length})` : "Proxy Dân Cư"}</span>
+                        </button>
 
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setActiveModalTab(oauthStatus?.connected ? "oauth" : cookieStatus?.has_cookies ? "cookies" : "oauth");
-                          setShowCookieModal(true);
-                        }}
-                        className={`text-[11px] px-2.5 py-1 rounded-lg border flex items-center gap-1.5 font-medium transition-all cursor-pointer ${
-                          oauthStatus?.connected
-                            ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/25"
-                            : cookieStatus?.has_cookies
-                            ? "bg-blue-500/15 text-blue-600 dark:text-blue-400 border-blue-500/30 hover:bg-blue-500/25"
-                            : "bg-primary/15 text-primary border-primary/30 hover:bg-primary/25"
-                        }`}
-                      >
-                        {oauthStatus?.connected ? (
-                          <>
-                            <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
-                            <span>YouTube: Đã kết nối</span>
-                          </>
-                        ) : cookieStatus?.has_cookies ? (
-                          <>
-                            <Cookie className="w-3.5 h-3.5 text-blue-500" />
-                            <span>Cookie: Đã cài đặt</span>
-                          </>
-                        ) : (
-                          <>
-                            <Key className="w-3.5 h-3.5 text-primary" />
-                            <span>Kết nối YouTube</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActiveModalTab(oauthStatus?.connected ? "oauth" : cookieStatus?.has_cookies ? "cookies" : "oauth");
+                            setShowCookieModal(true);
+                          }}
+                          className={`text-[11px] px-2.5 py-1 rounded-lg border flex items-center gap-1.5 font-medium transition-all cursor-pointer ${
+                            oauthStatus?.connected
+                              ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/25"
+                              : cookieStatus?.has_cookies
+                              ? "bg-blue-500/15 text-blue-600 dark:text-blue-400 border-blue-500/30 hover:bg-blue-500/25"
+                              : "bg-primary/15 text-primary border-primary/30 hover:bg-primary/25"
+                          }`}
+                        >
+                          {oauthStatus?.connected ? (
+                            <>
+                              <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
+                              <span>YouTube: Đã kết nối</span>
+                            </>
+                          ) : cookieStatus?.has_cookies ? (
+                            <>
+                              <Cookie className="w-3.5 h-3.5 text-blue-500" />
+                              <span>Cookie: Đã cài đặt</span>
+                            </>
+                          ) : (
+                            <>
+                              <Key className="w-3.5 h-3.5 text-primary" />
+                              <span>Kết nối YouTube</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    )}
                   </div>
                   <input
                     type="url"
@@ -1841,7 +1901,7 @@ export default function DubbingStudio() {
                   )}
 
                   <span className="text-[9px] text-primary/80 italic mt-0.5">
-                    💡 Quản lý, Thêm/Sửa API Key & Profile LLM tại Admin Portal -&gt; Tab Cấu hình LLM.
+                    Quản lý, Thêm/Sửa API Key & Profile LLM tại Admin Portal -&gt; Tab Cấu hình LLM.
                   </span>
                 </div>
 
@@ -2042,14 +2102,14 @@ export default function DubbingStudio() {
                 </div>
 
                 <p className="text-[10px] text-muted-foreground/80 leading-relaxed italic bg-secondary/20 p-2 rounded-lg border border-border/40">
-                  💡 Giọng nói và nhạc nền đã được cách ly thành 2 track độc lập. Bạn có thể bấm <strong>Solo</strong> để thẩm âm từng track hoặc kéo thanh trượt để tinh chỉnh tỷ lệ hòa trộn trước khi hoàn tất lồng tiếng.
+                  Giọng nói và nhạc nền đã được cách ly thành 2 track độc lập. Bạn có thể bấm <strong>Solo</strong> để thẩm âm từng track hoặc kéo thanh trượt để tinh chỉnh tỷ lệ hòa trộn trước khi hoàn tất lồng tiếng.
                 </p>
               </div>
 
               <button
                 onClick={handleFinalize}
                 disabled={loading}
-                className="w-full py-3 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white text-xs font-bold rounded-xl transition-all shadow-md shadow-primary/10 flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+                className="w-full py-3 bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-bold rounded-xl transition-all shadow-md shadow-primary/10 flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
               >
                 {loading ? (
                   <>
@@ -2108,8 +2168,8 @@ export default function DubbingStudio() {
                         setJob(updated);
                         if (updated.translated_subtitles) setTranslatedSubs(updated.translated_subtitles);
                         alert("Đã dịch lại toàn bộ phụ đề qua AI thành công!");
-                      } catch (e: any) {
-                        alert(`Lỗi khi dịch lại: ${e.message || "Mô hình LLM không phản hồi"}`);
+                      } catch (e: unknown) {
+                        alert(`Lỗi khi dịch lại: ${getErrorMessage(e, "Mô hình LLM không phản hồi")}`);
                       } finally {
                         setRetranslating(false);
                       }
@@ -2398,12 +2458,12 @@ export default function DubbingStudio() {
 
                 <div className="flex items-center justify-between pt-1">
                   <span className="text-[11px] text-muted-foreground italic">
-                    💡 Nhạc nền sẽ tự động giảm nhỏ (-14dB) khi giọng nói cất lên và hồi phục khi hết câu.
+                    Nhạc nền sẽ tự động giảm nhỏ (-14dB) khi giọng nói cất lên và hồi phục khi hết câu.
                   </span>
                   <button
                     onClick={handleFastRemix}
                     disabled={remixing}
-                    className="px-4 py-2 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    className="px-4 py-2 bg-primary hover:bg-primary/90 text-primary-foreground font-bold text-xs rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
                   >
                     {remixing ? (
                       <>
@@ -2426,8 +2486,13 @@ export default function DubbingStudio() {
       )}
 
       {/* --- YOUTUBE AUTHENTICATION MODAL --- */}
-      {showCookieModal && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+      {isAdmin && showCookieModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="dubbing-auth-modal-title"
+        >
           <div className="bg-card border border-border rounded-2xl max-w-lg w-full p-6 shadow-2xl flex flex-col gap-4 animate-in fade-in zoom-in-95 duration-200">
             <div className="flex items-center justify-between pb-3 border-b border-border">
               <div className="flex items-center gap-2.5">
@@ -2435,13 +2500,15 @@ export default function DubbingStudio() {
                   <Key className="w-5 h-5" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-bold text-foreground">Kết Nối Tài Khoản YouTube</h3>
+                  <h3 id="dubbing-auth-modal-title" className="text-sm font-bold text-foreground">Kết Nối Tài Khoản YouTube</h3>
                   <p className="text-[11px] text-muted-foreground">Mở khóa tải video YouTube Full HD 1080p 60fps siêu tốc</p>
                 </div>
               </div>
               <button
+                type="button"
+                aria-label="Đóng hộp thoại"
                 onClick={() => { setShowCookieModal(false); setCookieMsg(null); }}
-                className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+                className="p-2 min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -2539,7 +2606,7 @@ export default function DubbingStudio() {
                   </div>
                 ) : (
                   <div className="p-3.5 bg-secondary/40 border border-border rounded-xl">
-                    <h4 className="text-xs font-bold text-foreground mb-1">💡 Hệ Thống Proxy Dân Cư Xoay Vòng (Proxy Pool)</h4>
+                    <h4 className="text-xs font-bold text-foreground mb-1">Hệ Thống Proxy Dân Cư Xoay Vòng (Proxy Pool)</h4>
                     <p className="text-[11px] text-muted-foreground leading-relaxed">
                       Dán danh sách Proxy dân cư (từ Webshare hoặc nhà mạng). Khi tải video, hệ thống tự động xoay vòng qua từng proxy còn sống để bypass hoàn toàn lỗi chặn bot của YouTube.
                     </p>
@@ -2654,7 +2721,7 @@ export default function DubbingStudio() {
 
                 {/* Help tip */}
                 <div className="p-3 bg-secondary/20 rounded-xl border border-border/60 text-[11px] text-muted-foreground flex flex-col gap-1">
-                  <span className="font-bold text-foreground">💡 Nơi lấy Proxy miễn phí / giá rẻ:</span>
+                  <span className="font-bold text-foreground">Nơi lấy Proxy miễn phí / giá rẻ:</span>
                   <span>• Bạn có thể đăng ký tài khoản tại <a href="https://www.webshare.io" target="_blank" rel="noreferrer" className="text-primary underline font-bold">Webshare.io</a> để nhận ngay <strong>10 Proxy miễn phí</strong> vĩnh viễn (hỗ trợ HTTP & SOCKS5).</span>
                   <span>• Trong Webshare, bấm <strong>Download List</strong> hoặc <strong>Copy All</strong> rồi dán trực tiếp vào ô trên.</span>
                 </div>

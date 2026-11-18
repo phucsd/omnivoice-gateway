@@ -30,6 +30,8 @@
   --color-surface-soft: var(--surface-soft);
   --color-text-primary: var(--foreground);
   --color-text-secondary: var(--muted-foreground);
+  --font-sans: "Be Vietnam Pro", "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --breakpoint-xs: 30rem;
 }
 
 :root {

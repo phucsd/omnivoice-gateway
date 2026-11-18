@@ -25,9 +25,8 @@ if "%needs_setup%"=="1" (
     echo.
     set /p hf_user="1. Username Hugging Face: "
     set /p hf_space="2. Ten Space - vi du: omnivoice-backend: "
-    echo 3. Nhap Hugging Face Access Token quyen WRITE:
-    echo    Lay tai dia chi: https://huggingface.co/settings/tokens
-    set /p hf_token="Token: "
+    echo 3. Khi day len, Git Credential Manager se hoi token Hugging Face quyen WRITE
+    echo    (lay tai: https://huggingface.co/settings/tokens).
     
     echo.
     echo [INFO] Dang thiet lap remote 'hf'...

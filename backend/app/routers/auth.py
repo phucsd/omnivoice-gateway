@@ -1,25 +1,30 @@
-import secrets
-import random
-import string
+import hashlib
+import hmac
 import re
-import requests
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
-from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field, EmailStr
-from typing import Optional
+import secrets
+import string
+import time
 from datetime import datetime, timedelta
+from typing import Optional
+from urllib.parse import urlencode, urlparse
 
+import requests
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.orm import Session
+
+from app.config import settings
 from app.database import get_db
 from app.models import User
-from app.utils.ids import generate_id
-from app.config import settings
 from app.utils.auth import (
-    get_password_hash,
-    verify_password,
     create_access_token,
     get_current_user,
+    get_password_hash,
+    verify_password,
 )
+from app.utils.ids import generate_id
 from app.utils.mail import send_verification_email
+from app.utils.rate_limit import enforce_auth_rate_limit
 
 router = APIRouter(prefix="/v1/auth", tags=["Authentication"])
 
@@ -41,8 +46,7 @@ class ApiKeyResponse(BaseModel):
     created_at: datetime
     last_used_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class UserLoginRequest(BaseModel):
     username: str
@@ -76,7 +80,13 @@ class UserMeResponse(BaseModel):
     created_at: datetime
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-def register(payload: UserRegisterRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def register(
+    payload: UserRegisterRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    enforce_auth_rate_limit(request, "register", limit=5, window_seconds=300)
     # Check if registration feature is enabled
     from app.models import SystemSetting
     allow_reg = db.query(SystemSetting).filter(SystemSetting.key == "allow_registration").first()
@@ -115,8 +125,8 @@ def register(payload: UserRegisterRequest, background_tasks: BackgroundTasks, db
     # Auto-generate API Key on registration
     api_key = f"ovg_live_{secrets.token_hex(24)}"
     
-    # Generate 6-digit verification code
-    otp_code = "".join(random.choices(string.digits, k=6))
+    # Generate cryptographically strong 6-digit verification code
+    otp_code = "".join(secrets.choice(string.digits) for _ in range(6))
     expires_at = datetime.utcnow() + timedelta(minutes=10)
     
     from app.models import SystemSetting
@@ -147,77 +157,87 @@ def register(payload: UserRegisterRequest, background_tasks: BackgroundTasks, db
         "message": "Đăng ký thành công. Vui lòng kiểm tra email để lấy mã xác thực kích hoạt tài khoản."
     }
     
-    # Expose debug_code ONLY in development or testing environments
-    if settings.APP_ENV in ["development", "testing"]:
+    # Expose debug_code ONLY in automated testing environments
+    if (settings.APP_ENV or "").lower() == "testing":
         response_data["debug_code"] = otp_code
-        
+
     return response_data
 
+
 @router.post("/verify-email", response_model=dict)
-def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)):
+def verify_email(payload: VerifyEmailRequest, request: Request, db: Session = Depends(get_db)):
+    enforce_auth_rate_limit(request, "verify_email", limit=10, window_seconds=300, extra_key=payload.username)
     user = db.query(User).filter(User.username == payload.username).first()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Không tìm thấy người dùng."
         )
-        
+
     if user.is_verified:
         return {"status": "success", "message": "Tài khoản đã được xác thực trước đó."}
-        
-    if not user.verification_code or user.verification_code != payload.code:
+
+    if not user.verification_code or not hmac.compare_digest(user.verification_code, payload.code):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Mã xác thực không hợp lệ."
         )
-        
+
     if user.verification_expires_at and user.verification_expires_at < datetime.utcnow():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Mã xác thực đã hết hạn. Vui lòng yêu cầu mã mới."
         )
-        
+
     user.is_verified = True
     user.verification_code = None
     user.verification_expires_at = None
     db.commit()
-    
+
     return {"status": "success", "message": "Xác thực email thành công! Tài khoản đã được kích hoạt."}
 
+
 @router.post("/resend-code", response_model=dict)
-def resend_code(payload: ResendCodeRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def resend_code(
+    payload: ResendCodeRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    enforce_auth_rate_limit(request, "resend_code", limit=5, window_seconds=300, extra_key=payload.username)
     user = db.query(User).filter(User.username == payload.username).first()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Không tìm thấy người dùng."
         )
-        
+
     if user.is_verified:
         return {"status": "success", "message": "Tài khoản đã được xác thực trước đó."}
-        
-    # Generate new code
-    otp_code = "".join(random.choices(string.digits, k=6))
+
+    otp_code = "".join(secrets.choice(string.digits) for _ in range(6))
     expires_at = datetime.utcnow() + timedelta(minutes=10)
-    
+
     user.verification_code = otp_code
     user.verification_expires_at = expires_at
     db.commit()
-    
+
     background_tasks.add_task(send_verification_email, user.email, user.username, otp_code)
-    
+
     response_data = {
         "status": "success",
         "message": "Đã gửi lại mã xác thực mới vào email của bạn."
     }
-    
-    if settings.APP_ENV in ["development", "testing"]:
+
+    if (settings.APP_ENV or "").lower() == "testing":
         response_data["debug_code"] = otp_code
-        
+
     return response_data
 
+
 @router.post("/login", response_model=TokenResponse)
-def login(payload: UserLoginRequest, db: Session = Depends(get_db)):
+def login(payload: UserLoginRequest, request: Request, db: Session = Depends(get_db)):
+    enforce_auth_rate_limit(request, "login", limit=10, window_seconds=300, extra_key=payload.username)
     user = db.query(User).filter(User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(
@@ -312,15 +332,99 @@ def delete_user_api_key(key_id: str, current_user: User = Depends(get_current_us
     db.commit()
     return {"status": "success", "message": "Thu hồi khóa API thành công."}
 
-# --- OAuth Login (Google Only) ---
+# --- OAuth Helpers & Login (Google Only) ---
+
+
+def _validate_oauth_redirect_uri(redirect_uri: str, request: Request) -> str:
+    """Allow OAuth redirect only to trusted origins matching gateway/CORS configuration."""
+    raw = (redirect_uri or "").strip()
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="redirect_uri không hợp lệ.",
+        )
+
+    target_host = parsed.netloc.lower()
+    allowed_hosts = {urlparse(str(request.base_url)).netloc.lower()}
+    for origin in settings.cors_origins:
+        netloc = urlparse(origin).netloc.lower()
+        if netloc:
+            allowed_hosts.add(netloc)
+    for configured in (settings.PUBLIC_API_BASE_URL, settings.API_BASE_URL):
+        if configured:
+            netloc = urlparse(configured).netloc.lower()
+            if netloc:
+                allowed_hosts.add(netloc)
+
+    hostname_only = (parsed.hostname or "").lower()
+    is_trusted_suffix = (
+        parsed.scheme == "https"
+        and (
+            hostname_only.endswith(".hf.space")
+            or hostname_only == "omnivoice-gateway.pages.dev"
+            or hostname_only.endswith(".omnivoice-gateway.pages.dev")
+        )
+    )
+    is_local_dev = hostname_only in ("localhost", "127.0.0.1")
+
+    if target_host not in allowed_hosts and not is_trusted_suffix and not is_local_dev:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="redirect_uri không nằm trong danh sách tên miền được phép.",
+        )
+    return raw
+
+
+def _sign_oauth_state(redirect_uri: str) -> str:
+    ts = str(int(time.time()))
+    nonce = secrets.token_urlsafe(16)
+    msg = f"{ts}.{nonce}.{redirect_uri}".encode("utf-8")
+    sig = hmac.new(settings.SECRET_KEY.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:32]
+    return f"{ts}.{nonce}.{sig}"
+
+
+def _verify_oauth_state(state: Optional[str], redirect_uri: str) -> None:
+    if not state or state.count(".") != 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Thiếu hoặc sai chữ ký OAuth state (CSRF protection).",
+        )
+    ts_str, nonce, sig = state.split(".", 2)
+    try:
+        ts_val = int(ts_str)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth state không hợp lệ.",
+        ) from exc
+
+    now = int(time.time())
+    if now - ts_val > 600 or ts_val - now > 60:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Phiên đăng nhập Google đã hết hạn. Vui lòng thử lại.",
+        )
+
+    expected = hmac.new(
+        settings.SECRET_KEY.encode("utf-8"),
+        f"{ts_str}.{nonce}.{redirect_uri}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Xác thực OAuth state thất bại.",
+        )
+
 
 @router.post("/oauth/mock", response_model=TokenResponse)
 def oauth_mock(payload: MockOAuthRequest, db: Session = Depends(get_db)):
-    """Mock OAuth login endpoint for testing frontend UI in simulated environment."""
-    if settings.APP_ENV not in ["development", "testing"]:
+    """Mock OAuth login endpoint strictly limited to automated testing."""
+    if (settings.APP_ENV or "").lower() != "testing":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Mock OAuth endpoint is disabled in production."
+            detail="Mock OAuth endpoint is disabled outside automated tests.",
         )
     if payload.oauth_provider != "google":
         raise HTTPException(
@@ -402,8 +506,9 @@ def oauth_mock(payload: MockOAuthRequest, db: Session = Depends(get_db)):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @router.get("/oauth/login/{provider}")
-def oauth_login(provider: str, redirect_uri: str, state: str | None = None):
+def oauth_login(provider: str, redirect_uri: str, request: Request, state: str | None = None):
     """Initiates actual OAuth redirect (Google Authorize endpoint)."""
+    _ = state
     if provider != "google":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -416,19 +521,29 @@ def oauth_login(provider: str, redirect_uri: str, state: str | None = None):
             detail="Google OAuth chưa được cấu hình Client ID trên hệ thống."
         )
 
-    csrf_state = state or secrets.token_hex(16)
-    auth_url = (
-        f"https://accounts.google.com/o/oauth2/v2/auth?"
-        f"response_type=code&"
-        f"client_id={settings.GOOGLE_CLIENT_ID}&"
-        f"redirect_uri={redirect_uri}&"
-        f"scope=openid%20email%20profile&"
-        f"state={csrf_state}"
+    safe_redirect = _validate_oauth_redirect_uri(redirect_uri, request)
+    csrf_state = _sign_oauth_state(safe_redirect)
+    query_str = urlencode(
+        {
+            "response_type": "code",
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "redirect_uri": safe_redirect,
+            "scope": "openid email profile",
+            "state": csrf_state,
+        }
     )
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{query_str}"
     return {"auth_url": auth_url, "state": csrf_state}
 
 @router.get("/oauth/callback/{provider}", response_model=TokenResponse)
-def oauth_callback(provider: str, code: str, redirect_uri: str, db: Session = Depends(get_db)):
+def oauth_callback(
+    provider: str,
+    code: str,
+    redirect_uri: str,
+    request: Request,
+    state: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """Processes callback and exchanges OAuth code for local JWT session token."""
     if provider != "google":
         raise HTTPException(
@@ -436,26 +551,34 @@ def oauth_callback(provider: str, code: str, redirect_uri: str, db: Session = De
             detail="Hệ thống hiện tại chỉ hỗ trợ đăng nhập qua tài khoản Google."
         )
 
+    safe_redirect = _validate_oauth_redirect_uri(redirect_uri, request)
+    _verify_oauth_state(state, safe_redirect)
+
     # 1. Exchange code for access token
-    token_res = requests.post("https://oauth2.googleapis.com/token", data={
-        "code": code,
-        "client_id": settings.GOOGLE_CLIENT_ID,
-        "client_secret": settings.GOOGLE_CLIENT_SECRET,
-        "redirect_uri": redirect_uri,
-        "grant_type": "authorization_code"
-    })
+    token_res = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "redirect_uri": safe_redirect,
+            "grant_type": "authorization_code",
+        },
+        timeout=15,
+    )
     if token_res.status_code != 200:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Lỗi exchange token với Google: {token_res.text}"
+            detail="Lỗi trao đổi mã xác thực OAuth với Google."
         )
     g_tokens = token_res.json()
     g_access_token = g_tokens.get("access_token")
-    
+
     # 2. Get user info
     user_res = requests.get(
         "https://www.googleapis.com/oauth2/v3/userinfo",
-        headers={"Authorization": f"Bearer {g_access_token}"}
+        headers={"Authorization": f"Bearer {g_access_token}"},
+        timeout=15,
     )
     if user_res.status_code != 200:
         raise HTTPException(
@@ -465,7 +588,12 @@ def oauth_callback(provider: str, code: str, redirect_uri: str, db: Session = De
     user_info = user_res.json()
     email = user_info.get("email")
     oauth_id = user_info.get("sub")
-    username = user_info.get("name", email.split("@")[0]).replace(" ", "_")
+    if not user_info.get("email_verified"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email trên tài khoản Google chưa được xác minh."
+        )
+    username = user_info.get("name", (email or "user").split("@")[0]).replace(" ", "_")
 
     if not email or not oauth_id:
         raise HTTPException(

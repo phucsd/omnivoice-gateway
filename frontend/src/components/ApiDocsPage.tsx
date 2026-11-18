@@ -15,13 +15,22 @@ export const ApiDocsPage: React.FC<ApiDocsPageProps> = ({ onBack, isLoggedIn }) 
   const [copiedCode, setCopiedCode] = useState(false);
 
   useEffect(() => {
-    if (isLoggedIn) {
+    if (!isLoggedIn) return;
+    let cancelled = false;
+    (async () => {
       setLoadingKeys(true);
-      api.getUserApiKeys()
-        .then((res) => setApiKeys(res))
-        .catch((err) => console.error("Lỗi lấy API Keys cho tài liệu:", err))
-        .finally(() => setLoadingKeys(false));
-    }
+      try {
+        const res = await api.getUserApiKeys();
+        if (!cancelled) setApiKeys(res);
+      } catch (err: unknown) {
+        console.error("Lỗi lấy API Keys cho tài liệu:", err);
+      } finally {
+        if (!cancelled) setLoadingKeys(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [isLoggedIn]);
 
   const activeKey = apiKeys[0]?.key || "YOUR_API_KEY";
@@ -217,7 +226,7 @@ async function generateSpeech() {
 
     // 4. Lấy danh sách giọng công khai trong Thư viện
     console.log("\\nĐang lấy danh sách giọng từ thư viện công khai...");
-    const libRes = await fetch(\`\${API_URL}/v1/voice-library?tag=Miên Nam\`);
+    const libRes = await fetch(\`\${API_URL}/v1/voice-library?tag=Mi%E1%BB%81n%20Nam\`);
     const library = await libRes.json();
     console.log(\`Tìm thấy \${library.length} giọng miền Nam công khai.\`);
 
@@ -244,26 +253,24 @@ generateSpeech();`
   };
 
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col font-sans select-text">
-      {/* Background patterns */}
-      <div className="absolute top-0 left-1/3 w-[600px] h-[600px] bg-primary/5 rounded-full blur-[140px] pointer-events-none" />
-      <div className="absolute bottom-0 right-1/4 w-[500px] h-[500px] bg-purple-500/5 rounded-full blur-[120px] pointer-events-none" />
-
+    <div className="min-h-screen bg-background text-foreground flex flex-col font-sans select-text overflow-x-hidden relative">
       {/* Docs Header */}
-      <header className="sticky top-0 z-50 bg-background/80 backdrop-blur-md border-b border-border px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-3">
+      <header className="sticky top-0 z-50 bg-background/85 backdrop-blur-md border-b border-border px-4 sm:px-6 py-3 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-3 min-w-0">
           <button
+            type="button"
             onClick={onBack}
-            className="p-2 bg-card hover:bg-muted border border-border rounded-xl text-foreground hover:text-white transition-colors cursor-pointer flex items-center gap-1.5"
+            aria-label="Quay lại"
+            className="min-h-[44px] min-w-[44px] px-3 bg-card hover:bg-muted border border-border rounded-xl text-foreground hover:text-foreground transition-colors cursor-pointer flex items-center justify-center gap-1.5 shrink-0"
             title="Quay lại"
           >
             <ArrowLeft className="w-4 h-4" />
             <span className="text-xs font-bold hidden sm:inline">Quay lại</span>
           </button>
-          <div className="w-px h-6 bg-muted" />
-          <div className="flex items-center gap-2">
-            <BookOpen className="w-5 h-5 text-primary" />
-            <h1 className="text-sm font-bold text-foreground tracking-tight">Tài liệu API Tích hợp</h1>
+          <div className="w-px h-6 bg-muted shrink-0" />
+          <div className="flex items-center gap-2 min-w-0">
+            <BookOpen className="w-5 h-5 text-primary shrink-0" />
+            <h1 className="text-sm font-bold text-foreground tracking-tight truncate">Tài liệu API Tích hợp</h1>
           </div>
         </div>
 
@@ -701,13 +708,16 @@ generateSpeech();`
                   <p className="text-xs text-muted-foreground leading-relaxed mt-0.5">
                     Phát trực tiếp tệp âm thanh nghe thử (preview) của giọng đọc tương ứng.
                   </p>
-                  <div className="text-[11px] text-muted-foreground mt-1 bg-background/50 border border-border/40 p-2.5 rounded-lg space-y-1">
-                    <span className="font-bold text-foreground">Cách sử dụng cho thẻ &lt;audio&gt;:</span>
-                    <p className="text-[10px] text-muted-foreground leading-relaxed mt-0.5">
-                      Đối với giọng riêng tư, bạn có thể truyền Token qua URL query parameter <code className="text-primary font-mono">?token=YOUR_API_KEY</code> để phát trực tiếp trên trình duyệt.
+                  <div className="text-xs text-muted-foreground mt-1 bg-background/50 border border-border/40 p-2.5 rounded-lg space-y-1">
+                    <span className="font-bold text-foreground">Cách xác thực khi phát âm thanh riêng tư:</span>
+                    <p className="text-xs text-muted-foreground leading-relaxed mt-0.5">
+                      Với giọng công khai có thể nhúng trực tiếp; với giọng riêng tư nên fetch kèm header <code className="text-primary font-mono">Authorization: Bearer YOUR_API_KEY</code> rồi tạo <code className="text-primary font-mono">URL.createObjectURL(blob)</code> trên trình duyệt để tránh lộ token trong URL.
                     </p>
-                    <pre className="font-mono text-[9px] text-primary/90 mt-1 leading-normal overflow-x-auto whitespace-pre">
-{`<audio src="${baseUrl}/v1/voices/YOUR_VOICE_ID/previews?token=${activeKey}" controls />`}
+                    <pre className="font-mono text-xs text-primary mt-1 leading-normal overflow-x-auto whitespace-pre">
+{`const res = await fetch("${baseUrl}/v1/voices/YOUR_VOICE_ID/previews", {
+  headers: { Authorization: "Bearer YOUR_API_KEY" }
+});
+audioEl.src = URL.createObjectURL(await res.blob());`}
                     </pre>
                   </div>
                 </div>
@@ -764,18 +774,18 @@ generateSpeech();`
                 <p className="text-[11px] text-muted-foreground leading-relaxed">
                   Nhúng các thẻ biểu cảm trực tiếp vào bất kỳ vị trí nào trong câu để mô phỏng âm thanh tự nhiên của con người.
                 </p>
-                <div className="flex flex-col gap-1.5 mt-1 font-mono text-[10px]">
-                  <div className="bg-card p-1.5 rounded text-primary/90">
-                    <span className="text-white font-semibold">Thở dài:</span> [sigh]
+                <div className="flex flex-col gap-1.5 mt-1 font-mono text-xs">
+                  <div className="bg-card p-2 rounded text-primary font-medium border border-border/50">
+                    <span className="text-foreground font-semibold">Thở dài:</span> [sigh]
                   </div>
-                  <div className="bg-card p-1.5 rounded text-primary/90">
-                    <span className="text-white font-semibold">Sụt sịt:</span> [sniff]
+                  <div className="bg-card p-2 rounded text-primary font-medium border border-border/50">
+                    <span className="text-foreground font-semibold">Sụt sịt:</span> [sniff]
                   </div>
-                  <div className="bg-card p-1.5 rounded text-primary/90">
-                    <span className="text-white font-semibold">Nghe nghi vấn:</span> [question-en], [question-ah]
+                  <div className="bg-card p-2 rounded text-primary font-medium border border-border/50">
+                    <span className="text-foreground font-semibold">Nghe nghi vấn:</span> [question-en], [question-ah]
                   </div>
-                  <div className="bg-card p-1.5 rounded text-primary/90">
-                    <span className="text-white font-semibold">Ngạc nhiên:</span> [surprise-ah], [surprise-oh]
+                  <div className="bg-card p-2 rounded text-primary font-medium border border-border/50">
+                    <span className="text-foreground font-semibold">Ngạc nhiên:</span> [surprise-ah], [surprise-oh]
                   </div>
                 </div>
                 <span className="text-[10px] text-muted-foreground italic mt-0.5 leading-normal">
@@ -845,8 +855,8 @@ generateSpeech();`
                   <Cpu className="w-3.5 h-3.5 text-warning" />
                   Động cơ OmniVoice thế hệ mới &amp; Caching
                 </span>
-                <p className="text-[11px] text-muted-foreground leading-relaxed">
-                  Voice.oloka.net đã nâng cấp engine OmniVoice mới nhất với các cải tiến hiệu năng vượt trội:
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  OmniVoice Gateway hỗ trợ engine thế hệ mới với các cải tiến hiệu năng vượt trội:
                 </p>
                 <ul className="text-[11px] text-muted-foreground list-disc list-inside space-y-1 pl-1">
                   <li><strong className="text-foreground">PyTorch SDPA GPU Acceleration:</strong> Tối ưu hóa xử lý GPU với Scaled Dot-Product Attention, đảm bảo tốc độ sinh giọng nói cao và độ ổn định tuyệt đối.</li>
@@ -908,8 +918,9 @@ generateSpeech();`
                 </span>
                 
                 <button
+                  type="button"
                   onClick={() => handleCopyCode(codeSnippets[docTab])}
-                  className="flex items-center gap-1 bg-card border border-border hover:bg-muted hover:text-white px-3 py-1.5 rounded text-[10px] font-bold cursor-pointer text-foreground transition-colors"
+                  className="min-h-[44px] flex items-center gap-1.5 bg-card border border-border hover:bg-muted hover:text-foreground px-3.5 py-2 rounded-xl text-xs font-bold cursor-pointer text-foreground transition-colors"
                 >
                   {copiedCode ? (
                     <>

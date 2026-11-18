@@ -15,21 +15,37 @@ import {
   Mic,
   Trash2
 } from "lucide-react";
-import { api } from "../api/client";
+import { api, getErrorMessage } from "../api/client";
 import type { JobStatusResponse } from "../api/client";
 import { PageHeader } from "./ui/PageHeader";
 import { SectionCard } from "./ui/SectionCard";
+
+interface RawAlignmentItem {
+  word?: string;
+  text?: string;
+  start?: number;
+  start_time?: number;
+  end?: number;
+  end_time?: number;
+  timestamp?: [number?, number?] | { start?: number; end?: number } | null;
+}
+
+interface AlignmentContainer {
+  words?: RawAlignmentItem[];
+  chunks?: RawAlignmentItem[];
+}
 
 export const ASRPanel: React.FC = () => {
   const [asrFile, setAsrFile] = useState<File | null>(null);
   const [resultTab, setResultTab] = useState<"text" | "subtitles" | "karaoke">("text");
   
   // Job Polling States
-  const [loading, setLoading] = useState(false);
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobId, setJobId] = useState<string | null>(() => localStorage.getItem("VITE_ASR_PANEL_JOB_ID"));
+  const [loading, setLoading] = useState<boolean>(() => Boolean(localStorage.getItem("VITE_ASR_PANEL_JOB_ID")));
   const [jobStatus, setJobStatus] = useState<JobStatusResponse | null>(null);
   const [isPolling, setIsPolling] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [audioBlobUrl, setAudioBlobUrl] = useState<string>("");
 
   // Karaoke Player States
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -72,8 +88,8 @@ export const ASRPanel: React.FC = () => {
         error_message: null
       });
       setIsPolling(true);
-    } catch (err: any) {
-      setErrorMsg(err.message || "Không thể khởi tạo tiến trình ASR.");
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, "Không thể khởi tạo tiến trình ASR."));
       setLoading(false);
     }
   };
@@ -87,22 +103,27 @@ export const ASRPanel: React.FC = () => {
 
   useEffect(() => {
     const savedJobId = localStorage.getItem("VITE_ASR_PANEL_JOB_ID");
-    if (savedJobId) {
-      setJobId(savedJobId);
-      setLoading(true);
-      api.getJobStatus(savedJobId)
-        .then((status) => {
-          setJobStatus(status);
-          setLoading(false);
-          if (status.status !== "completed" && status.status !== "failed") {
-            setIsPolling(true);
-          }
-        })
-        .catch((err) => {
-          console.error("Lỗi khôi phục ASR Panel job status:", err);
-          setLoading(false);
-        });
-    }
+    if (!savedJobId) return;
+
+    let cancelled = false;
+    api.getJobStatus(savedJobId)
+      .then((status) => {
+        if (cancelled) return;
+        setJobStatus(status);
+        setLoading(false);
+        if (status.status !== "completed" && status.status !== "failed") {
+          setIsPolling(true);
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        console.error("Lỗi khôi phục ASR Panel job status:", err);
+        setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Job Polling Loop
@@ -118,9 +139,9 @@ export const ASRPanel: React.FC = () => {
           setIsPolling(false);
           setLoading(false);
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error("ASR job polling error:", err);
-        setErrorMsg(err.message || "Lỗi khi kiểm tra trạng thái tác vụ.");
+        setErrorMsg(getErrorMessage(err, "Lỗi khi kiểm tra trạng thái tác vụ."));
         setIsPolling(false);
         setLoading(false);
       }
@@ -165,18 +186,19 @@ export const ASRPanel: React.FC = () => {
       }
     }
 
-    let rawList: any[] = [];
+    let rawList: RawAlignmentItem[] = [];
     if (Array.isArray(alignmentData)) {
-      rawList = alignmentData;
+      rawList = alignmentData as RawAlignmentItem[];
     } else if (alignmentData && typeof alignmentData === "object") {
-      if (Array.isArray((alignmentData as any).words)) {
-        rawList = (alignmentData as any).words;
-      } else if (Array.isArray((alignmentData as any).chunks)) {
-        rawList = (alignmentData as any).chunks;
+      const container = alignmentData as AlignmentContainer;
+      if (Array.isArray(container.words)) {
+        rawList = container.words;
+      } else if (Array.isArray(container.chunks)) {
+        rawList = container.chunks;
       }
     }
 
-    return rawList.map((item: any) => {
+    return rawList.map((item: RawAlignmentItem) => {
       if (!item) return { word: "", start: 0, end: 0 };
       
       // Handle Hugging Face Whisper chunk format: { text: "...", timestamp: [start, end] }
@@ -242,11 +264,64 @@ export const ASRPanel: React.FC = () => {
     return segments;
   }, [alignmentList]);
 
-  // Audio playback authenticated URL
-  const authenticatedUrl = React.useMemo(() => {
-    if (!jobStatus) return "";
+  // Audio playback authenticated URL (loaded via Bearer header into Blob URL)
+  const protectedAudioUrl = React.useMemo(() => {
+    if (!jobStatus || jobStatus.status !== "completed") return "";
     return api.getASRAudioUrl(jobStatus.job_id);
   }, [jobStatus]);
+
+  useEffect(() => {
+    if (!protectedAudioUrl) {
+      return;
+    }
+
+    let cancelled = false;
+    let objectUrlToRevoke: string | null = null;
+
+    api.fetchProtectedAudioBlobUrl(protectedAudioUrl)
+      .then(({ blobUrl, isObjectUrl }) => {
+        if (cancelled) {
+          if (isObjectUrl) URL.revokeObjectURL(blobUrl);
+          return;
+        }
+        if (isObjectUrl) objectUrlToRevoke = blobUrl;
+        setAudioBlobUrl(blobUrl);
+      })
+      .catch((err: unknown) => {
+        console.error("Không thể tải audio ASR:", err);
+      });
+
+    return () => {
+      cancelled = true;
+      setAudioBlobUrl("");
+      if (objectUrlToRevoke) {
+        URL.revokeObjectURL(objectUrlToRevoke);
+      }
+    };
+  }, [protectedAudioUrl]);
+
+  const startPreciseTracking = React.useCallback(() => {
+    if (animationFrameRef.current) return;
+
+    const checkTime = () => {
+      if (audioRef.current) {
+        setCurrentTime(audioRef.current.currentTime);
+      }
+      animationFrameRef.current = requestAnimationFrame(checkTime);
+    };
+
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+    }
+    animationFrameRef.current = requestAnimationFrame(checkTime);
+  }, []);
+
+  const stopPreciseTracking = React.useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+  }, []);
 
   // Audio Event Bindings
   useEffect(() => {
@@ -299,7 +374,7 @@ export const ASRPanel: React.FC = () => {
       audio.removeEventListener("ended", handleEnded);
       stopPreciseTracking();
     };
-  }, [authenticatedUrl]);
+  }, [audioBlobUrl, startPreciseTracking, stopPreciseTracking]);
 
   // Speed Sync
   useEffect(() => {
@@ -330,30 +405,6 @@ export const ASRPanel: React.FC = () => {
     audio.currentTime = start;
     setCurrentTime(start);
     audio.play().catch(err => console.error(err));
-  };
-
-  // High precision time tracker
-  const startPreciseTracking = () => {
-    if (animationFrameRef.current) return;
-    
-    const checkTime = () => {
-      if (audioRef.current) {
-        setCurrentTime(audioRef.current.currentTime);
-      }
-      animationFrameRef.current = requestAnimationFrame(checkTime);
-    };
-
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-    }
-    animationFrameRef.current = requestAnimationFrame(checkTime);
-  };
-
-  const stopPreciseTracking = () => {
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
   };
 
   // Subtitle Helpers
@@ -545,7 +596,7 @@ export const ASRPanel: React.FC = () => {
           {/* Main Karaoke Stage */}
           {jobStatus?.status === "completed" && (
             <div className="bg-card border border-border rounded-2xl flex flex-col shadow-sm overflow-hidden animate-fadeIn">
-              <audio ref={audioRef} src={authenticatedUrl} />
+              <audio ref={audioRef} src={audioBlobUrl || undefined} />
 
               {/* Display Alignment Analytics Metrics */}
               <div className="bg-secondary/25 border-b border-border p-4 grid grid-cols-3 gap-4 text-center select-none">
@@ -706,7 +757,7 @@ export const ASRPanel: React.FC = () => {
                   <div className="animate-fadeIn">
                     {alignmentList.length > 0 ? (
                       <div className="flex flex-wrap gap-x-1.5 gap-y-2.5 items-center select-none">
-                        {alignmentList.map((item: any, index: number) => {
+                        {alignmentList.map((item, index: number) => {
                           const isActive = currentTime >= item.start && currentTime <= item.end;
                           const isPast = currentTime > item.end;
                           

@@ -106,7 +106,8 @@ def update_system_settings(payload: SettingsUpdateRequest, db: Session = Depends
         save_setting("kaggle_kernel_title", payload.kaggle_kernel_title)
         save_setting("kaggle_accelerator", payload.kaggle_accelerator)
         save_setting("kaggle_timeout_seconds", payload.kaggle_timeout_seconds)
-        save_setting("kaggle_worker_dir", payload.kaggle_worker_dir)
+        if current_user.is_admin:
+            save_setting("kaggle_worker_dir", payload.kaggle_worker_dir)
         db.commit()
         return {"status": "success", "message": "Cập nhật cấu hình thành công."}
     except Exception as e:

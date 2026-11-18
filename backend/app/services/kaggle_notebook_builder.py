@@ -112,7 +112,9 @@ class KaggleNotebookBuilder:
         worker_path = os.path.join(worker_dir, "omnivoice_worker.py")
         
         if not worker_token:
-            worker_token = settings.WORKER_TOKEN or "default_secure_worker_token_12345"
+            worker_token = settings.WORKER_TOKEN
+            if not worker_token:
+                raise ValueError("WORKER_TOKEN is not configured.")
 
         hf_token = ""
         if db:
@@ -1669,13 +1671,9 @@ if __name__ == '__main__':
         KaggleNotebookBuilder.generate_requirements(worker_dir_abs)
         KaggleNotebookBuilder.generate_metadata(worker_dir_abs, username, slug, title, accelerator)
         
-        # Resolve worker token as user API key if applicable
+        # Workers always authenticate using the gateway system WORKER_TOKEN (never user API keys)
+        _ = user_id
         worker_token = settings.WORKER_TOKEN
-        if user_id and db:
-            from app.models import User
-            user = db.query(User).filter(User.id == user_id).first()
-            if user and user.api_key:
-                worker_token = user.api_key
 
         # Generate worker script with embedded credentials and API URLs
         KaggleNotebookBuilder.generate_worker_code(worker_dir_abs, job, public_api_url, worker_token, is_daemon=is_daemon, db=db)

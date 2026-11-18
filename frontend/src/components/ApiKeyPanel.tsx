@@ -1,7 +1,6 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { KeyRound, Copy, Trash2, Eye, EyeOff, Check, RefreshCw, ShieldCheck, X, BookOpen } from "lucide-react";
-import { api } from "../api/client";
-import type { ApiKeyResponse } from "../api/client";
+import { api, getErrorMessage, type ApiKeyResponse } from "../api/client";
 
 interface ApiKeyPanelProps {
   isOpen: boolean;
@@ -16,7 +15,7 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
   const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
 
-  const fetchApiKeys = async () => {
+  const fetchApiKeys = useCallback(async () => {
     setLoading(true);
     try {
       const res = await api.getUserApiKeys();
@@ -26,28 +25,47 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    if (isOpen) {
-      fetchApiKeys();
-    }
+    if (!isOpen) return;
+    let active = true;
+    (async () => {
+      try {
+        const res = await api.getUserApiKeys();
+        if (active) setApiKeys(res);
+      } catch (err) {
+        console.error("Lỗi lấy danh sách API Keys:", err);
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, onClose]);
 
   const handleCreateApiKey = async () => {
     setCreatingKey(true);
     try {
-      // Auto-generate name based on date-time
       const now = new Date();
       const formattedDate = `${String(now.getDate()).padStart(2, "0")}/${String(now.getMonth() + 1).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
       const autoName = `Khóa API - ${formattedDate}`;
-      
+
       const newKey = await api.createUserApiKey(autoName);
-      // Automatically make it visible so they can copy it immediately
       setVisibleKeys((prev) => ({ ...prev, [newKey.id]: true }));
       await fetchApiKeys();
-    } catch (err: any) {
-      alert("Lỗi tạo API Key: " + err.message);
+    } catch (err: unknown) {
+      alert("Lỗi tạo API Key: " + getErrorMessage(err));
     } finally {
       setCreatingKey(false);
     }
@@ -58,8 +76,8 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
     try {
       await api.deleteUserApiKey(keyId);
       await fetchApiKeys();
-    } catch (err: any) {
-      alert("Lỗi xóa API Key: " + err.message);
+    } catch (err: unknown) {
+      alert("Lỗi xóa API Key: " + getErrorMessage(err));
     }
   };
 
@@ -74,17 +92,22 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
   if (!isOpen) return null;
 
   return (
-    <div 
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="api-key-modal-title"
       className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
       onClick={onClose}
     >
-      <div 
-        className="bg-card border border-border rounded-3xl p-6 max-w-2xl w-full flex flex-col gap-4 shadow-2xl relative animate-fadeIn max-h-[90vh] overflow-y-auto"
+      <div
+        className="bg-card border border-border rounded-[20px] p-6 max-w-2xl w-full flex flex-col gap-4 shadow-2xl relative animate-fadeIn max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <button
+          type="button"
+          aria-label="Đóng quản lý API Keys"
           onClick={onClose}
-          className="absolute right-5 top-5 text-muted-foreground hover:text-foreground cursor-pointer"
+          className="min-w-[40px] min-h-[40px] flex items-center justify-center absolute right-4 top-4 text-muted-foreground hover:text-foreground rounded-full hover:bg-muted cursor-pointer"
           title="Đóng"
         >
           <X className="w-4.5 h-4.5" />
@@ -95,7 +118,7 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
             <KeyRound className="w-5 h-5" />
           </div>
           <div>
-            <h3 className="font-bold text-foreground text-sm">Quản lý API Keys &amp; Tài liệu Tích hợp</h3>
+            <h3 id="api-key-modal-title" className="font-bold text-foreground text-sm">Quản lý API Keys &amp; Tài liệu Tích hợp</h3>
             <p className="text-[11px] text-muted-foreground mt-0.5">
               Tạo tự động các khóa API và xem hướng dẫn chi tiết cách nhúng giọng nói nhân bản AI.
             </p>
@@ -113,7 +136,7 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
               type="button"
               onClick={handleCreateApiKey}
               disabled={creatingKey}
-              className="bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs px-4 py-2 rounded-lg cursor-pointer transition-colors shadow-md shadow-primary/10 disabled:opacity-50 flex items-center gap-1.5"
+              className="min-h-[44px] bg-primary hover:bg-primary-hover text-primary-foreground font-bold text-xs px-4 py-2 rounded-xl cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-1.5"
             >
               <PlusIcon className="w-3.5 h-3.5" />
               <span>{creatingKey ? "Đang sinh khóa..." : "Tạo API Key mới"}</span>
@@ -213,7 +236,7 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
           <button
             type="button"
             onClick={onNavigateToDocs}
-            className="bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs px-4 py-2 rounded-lg cursor-pointer transition-colors shrink-0 flex items-center gap-1 shadow-md shadow-primary/10"
+            className="min-h-[44px] bg-primary hover:bg-primary-hover text-primary-foreground font-bold text-xs px-4 py-2 rounded-xl cursor-pointer transition-colors shrink-0 flex items-center gap-1.5"
           >
             <BookOpen className="w-3.5 h-3.5" />
             <span>Xem Tài liệu</span>

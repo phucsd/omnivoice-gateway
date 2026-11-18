@@ -9,6 +9,7 @@ from app.utils.ids import generate_id
 from app.config import settings
 import threading
 from sqlalchemy import or_, and_
+from app.services.audio_service import AudioService
 from app.services.kaggle_orchestrator import KaggleOrchestrator
 
 _job_allocation_lock = threading.Lock()
@@ -209,11 +210,14 @@ class JobService:
         if mode == "clone_voice":
             if not voice_sample_id:
                 raise ValueError("voice_sample_id là bắt buộc trong mode clone_voice")
-            
+
             sample = db.query(VoiceSample).filter(VoiceSample.id == voice_sample_id).first()
             if not sample:
                 raise ValueError(f"Không tìm thấy Voice Sample với ID {voice_sample_id}")
-            
+
+            if not sample.is_public and (not user_id or sample.user_id != user_id):
+                raise ValueError("Bạn không có quyền sử dụng mẫu giọng riêng tư này.")
+
             ref_audio_path = sample.file_path
             ref_text_val = ref_text if ref_text is not None else sample.ref_text
             if ref_text_val and normalize_text:
@@ -378,9 +382,21 @@ class JobService:
         if preview.status != "completed" or not preview.preview_audio_path or not os.path.exists(preview.preview_audio_path):
             raise ValueError(f"Bản nghe thử {preview_id} chưa sẵn sàng hoặc không tồn tại audio file.")
 
-        # Create new VoiceSample ID
         sample_id = f"vs_from_{preview_id}"
-        
+
+        # Idempotent return if this preview was already accepted earlier
+        if preview.accepted_sample_id:
+            existing_accepted = db.query(VoiceSample).filter(VoiceSample.id == preview.accepted_sample_id).first()
+            if existing_accepted:
+                return existing_accepted
+
+        existing_sample = db.query(VoiceSample).filter(VoiceSample.id == sample_id).first()
+        if existing_sample:
+            preview.accepted_sample_id = existing_sample.id
+            db.commit()
+            db.refresh(existing_sample)
+            return existing_sample
+
         # Determine paths
         AudioService.ensure_directories()
         dest_filename = f"{sample_id}.wav"

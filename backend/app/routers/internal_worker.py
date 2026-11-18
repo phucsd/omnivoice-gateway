@@ -19,6 +19,52 @@ from app.security import verify_worker_token
 from app.services.worker_session_service import WorkerSessionService
 from app.services.job_service import JobService
 from app.config import settings
+from app.utils.url_security import ensure_within_directory
+
+
+def _safe_extract_zip(
+    zip_path: str,
+    dest_dir: str,
+    *,
+    max_files: int = 500,
+    max_total_bytes: int = 1024 * 1024 * 1024,
+) -> None:
+    """Extract a ZIP archive securely preventing Zip-Slip, symlink writes, and Zip bombs."""
+    import stat
+    import zipfile
+
+    os.makedirs(dest_dir, exist_ok=True)
+    total_size = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        infos = zf.infolist()
+        if len(infos) > max_files:
+            raise ValueError(f"ZIP archive contains too many entries ({len(infos)} > {max_files}).")
+
+        for info in infos:
+            # Block symlinks inside ZIP archives
+            mode = info.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                raise ValueError(f"Blocked symlink entry in ZIP archive: {info.filename}")
+
+            member_name = info.filename.replace("\\", "/")
+            if not member_name or member_name.startswith("/") or ":" in member_name.split("/")[0]:
+                raise ValueError(f"Blocked unsafe absolute ZIP path: {info.filename}")
+
+            target_path = ensure_within_directory(dest_dir, os.path.join(dest_dir, member_name))
+            if info.is_dir():
+                os.makedirs(target_path, exist_ok=True)
+                continue
+
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            with zf.open(info, "r") as src, open(target_path, "wb") as dst:
+                while True:
+                    chunk = src.read(65536)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > max_total_bytes:
+                        raise ValueError("ZIP archive uncompressed payload exceeds allowed size limit.")
+                    dst.write(chunk)
 
 # Apply verify_worker_token to all endpoints in this router
 router = APIRouter(
@@ -56,22 +102,16 @@ def get_next_job(worker_id: str, request: Request, db: Session = Depends(get_db)
     Called by workers to pull the oldest pending job.
     Locks the job, updates its state, and compiles parameters (including ref audio downloads).
     """
-    # Resolve user from token
-    from app.models import User
-    user = db.query(User).filter(User.api_key == token).first()
-    user_id = user.id if user else None
-
-    job = JobService.get_next_job(db, worker_id, user_id=user_id)
+    _ = token
+    job = JobService.get_next_job(db, worker_id, user_id=None)
     if not job:
         return WorkerNextJobResponse(job=None, message="No pending job")
 
-    # Construct public ref audio URL if there is a sample ID or path associated
+    # Construct public ref audio URL safely without trusting arbitrary Host/X-Forwarded-Host headers
     ref_audio_url = None
-    base_url = settings.PUBLIC_API_BASE_URL
+    base_url = (settings.PUBLIC_API_BASE_URL or settings.API_BASE_URL or "").strip().rstrip("/")
     if not base_url:
-        proto = request.headers.get("x-forwarded-proto", str(request.base_url).split("://")[0])
-        host = request.headers.get("x-forwarded-host", str(request.base_url).split("://")[-1].rstrip("/"))
-        base_url = f"{proto}://{host}"
+        base_url = str(request.base_url).rstrip("/")
 
     if job.voice_sample_id:
         ref_audio_url = f"{base_url}/v1/internal/files/voice-samples/{job.voice_sample_id}"
@@ -161,25 +201,24 @@ async def upload_job_output(
 
         is_sep = job.job_type == "separate_audio"
         prefix = "sep_" if is_sep else "dub_"
-        dub_job_id = job_id.replace(prefix, "")
-        
+        dub_job_id = os.path.basename(job_id.replace(prefix, ""))
+
         dub_job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == dub_job_id).first()
         if not dub_job:
             raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng video tương ứng.")
 
-        job_dir = os.path.join(settings.dubbing_dir, dub_job_id)
+        job_dir = ensure_within_directory(settings.dubbing_dir, os.path.join(settings.dubbing_dir, dub_job_id))
         os.makedirs(job_dir, exist_ok=True)
-        zip_path = os.path.join(job_dir, f"{job_id}.zip")
+        zip_path = ensure_within_directory(job_dir, os.path.join(job_dir, f"{os.path.basename(job_id)}.zip"))
 
         try:
             with open(zip_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             
-            # Unzip contents
+            # Unzip contents safely
             if is_sep:
                 VideoDubbingService.log_to_job(dub_job_id, "[KAGGLE] Nhận tệp ZIP kết quả tách âm thanh từ Kaggle Worker. Tiến hành giải nén...")
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(job_dir)
+                _safe_extract_zip(zip_path, job_dir)
                 
                 # Check files exist
                 vocals_path = os.path.join(job_dir, "vocals.wav")
@@ -212,10 +251,8 @@ async def upload_job_output(
             else:
                 VideoDubbingService.log_to_job(dub_job_id, "[KAGGLE] Nhận tệp ZIP chứa các segment audio lồng tiếng từ Kaggle. Tiến hành giải nén...")
                 # final dubbing segments ZIP
-                segments_dir = os.path.join(job_dir, "segments")
-                os.makedirs(segments_dir, exist_ok=True)
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(segments_dir)
+                segments_dir = ensure_within_directory(job_dir, os.path.join(job_dir, "segments"))
+                _safe_extract_zip(zip_path, segments_dir)
 
                 dub_job.status = "mixing_audio"
                 dub_job.progress = 70

@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Mic, Wand2, Check, Heart, Lock, Globe, X, Play, Pause } from "lucide-react";
-import { api } from "../api/client";
+import { api, getErrorMessage } from "../api/client";
 import type { JobStatusResponse } from "../api/client";
 
 import { JobStatusCard } from "./JobStatusCard";
@@ -104,11 +104,24 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
       });
       setIsPolling(true);
       onJobCreatedOrUpdated?.();
-    } catch (err: any) {
-      setErrorMsg(err.message || "Không thể gửi yêu cầu thiết kế giọng nói.");
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, "Không thể gửi yêu cầu thiết kế giọng nói."));
       setLoading(false);
     }
   };
+
+  const stopPolling = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    setIsPolling(false);
+    setLoading(false);
+  }, []);
 
   const handleClearJob = () => {
     setJobId(null);
@@ -118,31 +131,39 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
     localStorage.removeItem("VITE_VOICE_DESIGN_PREVIEW_ID");
   };
 
+  const onJobUpdatedRef = useRef(onJobCreatedOrUpdated);
+  useEffect(() => {
+    onJobUpdatedRef.current = onJobCreatedOrUpdated;
+  }, [onJobCreatedOrUpdated]);
+
   useEffect(() => {
     const savedJobId = localStorage.getItem("VITE_VOICE_DESIGN_JOB_ID");
     const savedPreviewId = localStorage.getItem("VITE_VOICE_DESIGN_PREVIEW_ID");
-    if (savedJobId) {
-      setJobId(savedJobId);
-      if (savedPreviewId) setPreviewId(savedPreviewId);
-      setLoading(true);
-      api.getJobStatus(savedJobId)
-        .then((status) => {
-          setJobStatus(status);
-          setLoading(false);
-          if (status.status !== "completed" && status.status !== "failed") {
-            setIsPolling(true);
-          }
-        })
-        .catch((err) => {
-          console.error("Lỗi khôi phục Voice Design job status:", err);
-          setLoading(false);
-        });
-    }
+    if (!savedJobId) return;
+    let active = true;
+    (async () => {
+      try {
+        if (savedPreviewId && active) setPreviewId(savedPreviewId);
+        if (active) setJobId(savedJobId);
+        const status = await api.getJobStatus(savedJobId);
+        if (!active) return;
+        setJobStatus(status);
+        setLoading(false);
+        if (status.status !== "completed" && status.status !== "failed") {
+          setIsPolling(true);
+        }
+      } catch (err) {
+        console.error("Lỗi khôi phục Voice Design job status:", err);
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
     if (isPolling && jobId) {
-      // Poll every 2 seconds
       pollIntervalRef.current = window.setInterval(async () => {
         try {
           const status = await api.getJobStatus(jobId);
@@ -150,15 +171,14 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
 
           if (status.status === "completed" || status.status === "failed") {
             stopPolling();
-            onJobCreatedOrUpdated?.();
+            onJobUpdatedRef.current?.();
           }
-        } catch (err: any) {
-          setErrorMsg(`Lỗi khi thăm dò trạng thái: ${err.message}`);
+        } catch (err: unknown) {
+          setErrorMsg(`Lỗi khi thăm dò trạng thái: ${getErrorMessage(err)}`);
           stopPolling();
         }
       }, 2000);
 
-      // Set timeout after 15 minutes (900000 ms)
       timeoutRef.current = window.setTimeout(() => {
         setErrorMsg("Hết thời gian chờ xử lý (Timeout 15 phút).");
         stopPolling();
@@ -175,20 +195,7 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
         timeoutRef.current = null;
       }
     };
-  }, [isPolling, jobId]);
-
-  const stopPolling = () => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
-    }
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-    setIsPolling(false);
-    setLoading(false);
-  };
+  }, [isPolling, jobId, stopPolling]);
 
   const handleAccept = async () => {
     if (!previewId) return;
@@ -200,8 +207,8 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
       const res = await api.acceptPreview(previewId);
       setSuccessMsg(`Đã lưu giọng thiết kế làm mẫu thành công! ID: ${res.voice_sample_id}`);
       onAcceptSuccess(res.voice_sample_id);
-    } catch (err: any) {
-      setErrorMsg(err.message || "Lỗi khi chấp nhận giọng thiết kế.");
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, "Lỗi khi chấp nhận giọng thiết kế."));
     } finally {
       setAccepting(false);
     }
@@ -238,8 +245,8 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
       setTimeout(() => {
         setIsSaveModalOpen(false);
       }, 1500);
-    } catch (err: any) {
-      setSaveVoiceStatus(`Lỗi: ${err.message || "Không thể lưu giọng."}`);
+    } catch (err: unknown) {
+      setSaveVoiceStatus(`Lỗi: ${getErrorMessage(err, "Không thể lưu giọng.")}`);
     } finally {
       setIsSavingVoice(false);
     }
@@ -510,9 +517,9 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
         <button
           type="submit"
           disabled={loading || !voiceRequest || !previewText}
-          className={`w-full py-3 px-6 rounded-full font-bold text-sm transition-all duration-155 active:scale-[0.99] flex items-center justify-center gap-2 cursor-pointer shadow-md ${
+          className={`w-full min-h-[44px] py-3 px-6 rounded-xl font-bold text-sm transition-colors active:translate-y-[1px] flex items-center justify-center gap-2 cursor-pointer ${
             !loading && voiceRequest && previewText
-              ? "bg-gradient-to-r from-primary to-accent text-white border-none shadow-lg shadow-primary/15 hover:brightness-105"
+              ? "bg-primary hover:bg-primary-hover text-primary-foreground border-transparent"
               : "bg-muted text-muted-foreground cursor-not-allowed"
           }`}
         >
@@ -733,7 +740,7 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
                 type="button"
                 onClick={handleSaveVoiceSubmit}
                 disabled={isSavingVoice || !saveVoiceName || !saveVoiceRefText}
-                className="px-4 py-2 bg-gradient-to-r from-primary to-accent hover:brightness-105 disabled:bg-muted disabled:text-muted-foreground text-xs font-bold text-white rounded-lg cursor-pointer transition-colors border-none shadow-md shadow-primary/10"
+                className="min-h-[44px] px-4 py-2 bg-primary hover:bg-primary-hover disabled:bg-muted disabled:text-muted-foreground text-xs font-bold text-primary-foreground rounded-xl cursor-pointer transition-colors"
               >
                 {isSavingVoice ? "Đang lưu..." : "Xác nhận Lưu"}
               </button>

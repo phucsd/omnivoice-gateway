@@ -18,8 +18,12 @@ from app.models import TTSJob, User, VoiceSample
 from app.utils.auth import get_user_or_api_key
 from app.config import settings
 from app.utils.ids import generate_id
+from app.utils.url_security import fetch_external_bytes
 
 router = APIRouter(prefix="/v1/tts", tags=["Compatibility API"])
+
+MAX_COMPAT_AUDIO_BYTES = 25 * 1024 * 1024  # 25 MB
+
 
 def resolve_ref_audio(db: Session, ref_audio: str, user_id: str = None) -> tuple[Optional[str], Optional[str]]:
     """
@@ -28,45 +32,46 @@ def resolve_ref_audio(db: Session, ref_audio: str, user_id: str = None) -> tuple
     """
     if not ref_audio:
         return None, None
-        
+
     ref_audio = ref_audio.strip()
-    
-    # 1. Check if it is a public URL
+
+    # 1. Public HTTP/HTTPS URL with strict SSRF and size guards
     if ref_audio.startswith("http://") or ref_audio.startswith("https://"):
         try:
+            audio_bytes = fetch_external_bytes(ref_audio, max_bytes=MAX_COMPAT_AUDIO_BYTES, timeout=30.0)
             os.makedirs(os.path.join(settings.uploads_dir, "compat_ref_audios"), exist_ok=True)
             filename = f"url_{uuid.uuid4().hex}.wav"
             local_path = os.path.join(settings.uploads_dir, "compat_ref_audios", filename)
-            
-            with httpx.Client(timeout=30.0) as client:
-                response = client.get(ref_audio)
-                response.raise_for_status()
-                with open(local_path, "wb") as f:
-                    f.write(response.content)
+            with open(local_path, "wb") as f:
+                f.write(audio_bytes)
             return local_path, None
         except Exception as e:
             print(f"[Compat API] Failed to download ref_audio URL {ref_audio}: {e}")
             raise ValueError(f"Không thể tải ref_audio từ URL: {e}")
 
-    # 2. Check if it is Base64 data
+    # 2. Base64 audio payload with decoded byte-size cap
     is_base64 = False
     base64_payload = None
     if ref_audio.startswith("data:audio/"):
         try:
             if ";base64," in ref_audio:
-                base64_payload = ref_audio.split(";base64,")[1]
+                base64_payload = ref_audio.split(";base64,", 1)[1]
                 is_base64 = True
         except Exception:
             pass
     else:
-        # Check if it looks like raw base64 string (no whitespace, length multiple of 4, standard characters)
         if len(ref_audio) > 100 and re.match(r'^[A-Za-z0-9+/=]+$', ref_audio):
             base64_payload = ref_audio
             is_base64 = True
-            
+
     if is_base64 and base64_payload:
+        max_b64_chars = (MAX_COMPAT_AUDIO_BYTES * 4) // 3 + 16
+        if len(base64_payload) > max_b64_chars:
+            raise ValueError("Dữ liệu Base64 ref_audio vượt quá giới hạn tối đa 25MB.")
         try:
-            audio_bytes = base64.b64decode(base64_payload)
+            audio_bytes = base64.b64decode(base64_payload, validate=True)
+            if len(audio_bytes) > MAX_COMPAT_AUDIO_BYTES:
+                raise ValueError("Tệp ref_audio Base64 vượt quá giới hạn 25MB.")
             os.makedirs(os.path.join(settings.uploads_dir, "compat_ref_audios"), exist_ok=True)
             filename = f"b64_{uuid.uuid4().hex}.wav"
             local_path = os.path.join(settings.uploads_dir, "compat_ref_audios", filename)
@@ -77,21 +82,21 @@ def resolve_ref_audio(db: Session, ref_audio: str, user_id: str = None) -> tuple
             print(f"[Compat API] Failed to decode base64 ref_audio: {e}")
             raise ValueError(f"Không thể giải mã Base64 ref_audio: {e}")
 
-    # 3. Check if it matches a VoiceSample ID or Name
-    sample = db.query(VoiceSample).filter(
+    # 3. Match an authorized VoiceSample ID or Name (public or owned by caller)
+    sample_query = db.query(VoiceSample).filter(
         (VoiceSample.id == ref_audio) | (VoiceSample.name == ref_audio)
     )
     if user_id:
-        sample = sample.filter((VoiceSample.user_id == user_id) | (VoiceSample.is_public == True))
-    sample = sample.first()
+        sample_query = sample_query.filter((VoiceSample.user_id == user_id) | (VoiceSample.is_public == True))
+    else:
+        sample_query = sample_query.filter(VoiceSample.is_public == True)
+    sample = sample_query.first()
     if sample:
         return sample.file_path, sample.id
 
-    # 4. Check if it is a local file path that exists
-    if os.path.exists(ref_audio):
-        return ref_audio, None
-
-    raise ValueError(f"Không thể phân giải ref_audio: {ref_audio}. Không tìm thấy Voice Sample và không phải URL/Base64 hợp lệ.")
+    raise ValueError(
+        f"Không thể phân giải ref_audio: {ref_audio}. Chỉ chấp nhận Voice Sample ID/tên hợp lệ, URL công khai hoặc Base64."
+    )
 
 class CompatInferenceRequest(BaseModel):
     text: str
@@ -511,11 +516,8 @@ def list_voices_compat(
             elif "già" in t or "old" in t or "lớn tuổi" in t or "trung niên" in t:
                 age = "middle_aged"
                 
-        # For private voices, append authentication token to preview_url for direct browser playback
-        if not s.is_public and token_str:
-            preview_url = f"{base_url}/v1/voices/{s.id}/previews?token={token_str}"
-        else:
-            preview_url = f"{base_url}/v1/voices/{s.id}/previews"
+        # Never leak raw JWT/API keys in JSON preview_url responses
+        preview_url = f"{base_url}/v1/voices/{s.id}/previews"
             
         voices.append({
             "voice_id": s.id,
@@ -583,10 +585,7 @@ def get_voice_compat(
         elif "già" in t or "old" in t or "lớn tuổi" in t or "trung niên" in t:
             age = "middle_aged"
             
-    if not s.is_public and token_str:
-        preview_url = f"{base_url}/v1/voices/{s.id}/previews?token={token_str}"
-    else:
-        preview_url = f"{base_url}/v1/voices/{s.id}/previews"
+    preview_url = f"{base_url}/v1/voices/{s.id}/previews"
         
     return {
         "voice_id": s.id,

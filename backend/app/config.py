@@ -1,40 +1,53 @@
+import json
 import os
+import secrets
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
 
-def _get_google_client_id() -> str:
-    v = os.environ.get("GOOGLE_CLIENT_ID", "")
-    return v.strip() if v and v.strip() else "576483956315-5rlq09hagvvltj268u8gsbd6bgp1tv2m.apps.googleusercontent.com"
 
-def _get_google_client_secret() -> str:
-    v = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-    return v.strip() if v and v.strip() else ("GOCSPX-" + "CvVFrDa7Dw68rYqNu0NfoqmbGzr-")
+_WEAK_SECRET_KEYS = {
+    "",
+    "super_secret_omnivoice_gateway_key_9988",
+    "changeme",
+    "secret",
+}
+
+_WEAK_WORKER_TOKENS = {
+    "",
+    "default_secure_worker_token_12345",
+    "changeme",
+}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore"
+        extra="ignore",
     )
 
-    APP_ENV: str = "development"
+    APP_ENV: str = "production"
     WORKER_MODE: str = "kaggle"  # "mock" or "kaggle"
-    SECRET_KEY: str = "super_secret_omnivoice_gateway_key_9988"
+    SECRET_KEY: str = ""
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRATION_HOURS: int = 24
-    
+
     DATABASE_URL: str = "sqlite:///./storage/omnivoice_gateway.db"
     STORAGE_DIR: str = "./storage"
     ALLOW_REGISTRATION: bool = True
-    
+
     PUBLIC_API_BASE_URL: str = ""
-    FRONTEND_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173,https://omnivoice-gateway.pages.dev,https://voice.oloka.net,https://phucsd-oloka-voice.hf.space,https://phucsd-oloka-voice-studio.hf.space"
-    
-    WORKER_TOKEN: str = "default_secure_worker_token_12345"
+    API_BASE_URL: str = ""
+    FRONTEND_ORIGINS: str = (
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "https://omnivoice-gateway.pages.dev,https://voice.oloka.net,"
+        "https://phucsd-oloka-voice.hf.space,https://phucsd-oloka-voice-studio.hf.space"
+    )
+
+    WORKER_TOKEN: str = ""
     WORKER_IDLE_TIMEOUT_SECONDS: int = 300
     WORKER_POLL_INTERVAL_SECONDS: int = 1
-    
+
     KAGGLE_USERNAME: str = ""
     KAGGLE_KEY: str = ""
     KAGGLE_KERNEL_REF: str = ""
@@ -43,8 +56,9 @@ class Settings(BaseSettings):
     KAGGLE_ACCELERATOR: str = "NvidiaTeslaT4"
     KAGGLE_TIMEOUT_SECONDS: int = 3600
     KAGGLE_WORKER_DIR: str = "../kaggle_worker"
-    
+
     HF_TOKEN: str = ""
+    ENABLE_HF_AUDIO_CDN: bool = False
 
     # LLM Settings
     LLM_PROVIDER: str = "gemini"  # "gemini" or "openai" or "none"
@@ -59,21 +73,15 @@ class Settings(BaseSettings):
     SMTP_USERNAME: str = ""
     SMTP_PASSWORD: str = ""
     SMTP_FROM: str = "OmniVoice <no-reply@omnivoice.local>"
-    
-    # OAuth Settings
-    GOOGLE_CLIENT_ID: str = "576483956315-5rlq09hagvvltj268u8gsbd6bgp1tv2m.apps.googleusercontent.com"
-    GOOGLE_CLIENT_SECRET: str = "GOCSPX-" + "CvVFrDa7Dw68rYqNu0NfoqmbGzr-"
+
+    # OAuth Settings (must be supplied via environment / Secrets)
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
     GITHUB_CLIENT_ID: str = ""
     GITHUB_CLIENT_SECRET: str = ""
 
-    # Tailscale Settings
-    TAILSCALE_AUTHKEY: str = os.getenv("TAILSCALE_AUTHKEY", "tskey-auth-ksU5DoFSD421CNTRL-z12jPRmsZViP2SP1dWQxUizwT96h7JGBc")
-
-    def model_post_init(self, __context):
-        if not self.GOOGLE_CLIENT_ID or not self.GOOGLE_CLIENT_ID.strip():
-            self.GOOGLE_CLIENT_ID = "576483956315-5rlq09hagvvltj268u8gsbd6bgp1tv2m.apps.googleusercontent.com"
-        if not self.GOOGLE_CLIENT_SECRET or not self.GOOGLE_CLIENT_SECRET.strip():
-            self.GOOGLE_CLIENT_SECRET = "GOCSPX-" + "CvVFrDa7Dw68rYqNu0NfoqmbGzr-"
+    # Tailscale Settings (must be supplied via environment / Secrets)
+    TAILSCALE_AUTHKEY: str = ""
 
     LOG_LEVEL: str = "info"
 
@@ -103,6 +111,59 @@ class Settings(BaseSettings):
     def dubbing_dir(self) -> str:
         return os.path.join(self.STORAGE_DIR, "dubbing")
 
+
+def _ensure_runtime_secrets(cfg: Settings) -> None:
+    """Populate strong runtime secrets when unset or using legacy placeholders."""
+    need_jwt = (cfg.SECRET_KEY or "").strip() in _WEAK_SECRET_KEYS
+    need_worker = (cfg.WORKER_TOKEN or "").strip() in _WEAK_WORKER_TOKENS
+
+    if not need_jwt and not need_worker:
+        return
+
+    if (cfg.APP_ENV or "").lower() == "testing":
+        if need_jwt:
+            cfg.SECRET_KEY = secrets.token_urlsafe(48)
+        if need_worker:
+            cfg.WORKER_TOKEN = f"ovw_{secrets.token_urlsafe(32)}"
+        return
+
+    os.makedirs(cfg.STORAGE_DIR, exist_ok=True)
+    secrets_file = os.path.join(cfg.STORAGE_DIR, ".gateway_secrets.json")
+    stored: dict = {}
+    if os.path.exists(secrets_file):
+        try:
+            with open(secrets_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    stored = data
+        except Exception:
+            stored = {}
+
+    changed = False
+    if need_jwt:
+        if not stored.get("SECRET_KEY"):
+            stored["SECRET_KEY"] = secrets.token_urlsafe(48)
+            changed = True
+        cfg.SECRET_KEY = stored["SECRET_KEY"]
+
+    if need_worker:
+        if not stored.get("WORKER_TOKEN"):
+            stored["WORKER_TOKEN"] = f"ovw_{secrets.token_urlsafe(32)}"
+            changed = True
+        cfg.WORKER_TOKEN = stored["WORKER_TOKEN"]
+
+    if changed:
+        try:
+            with open(secrets_file, "w", encoding="utf-8") as f:
+                json.dump(stored, f, indent=2)
+            try:
+                os.chmod(secrets_file, 0o600)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[Config] Warning: failed to persist runtime secrets: {e}")
+
+
 settings = Settings()
 
 # Check for Hugging Face Spaces Persistent Storage (/data is mounted and writable)
@@ -116,3 +177,4 @@ if os.path.exists("/data") and os.access("/data", os.W_OK):
     settings.DATABASE_URL = "sqlite:////data/db/omnivoice_gateway.db"
     settings.STORAGE_DIR = "/data/storage"
 
+_ensure_runtime_secrets(settings)

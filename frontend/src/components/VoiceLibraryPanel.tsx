@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useMemo } from "react";
-import { Volume2, Lock, Globe, Trash2, Copy, Check, Search, Sparkles, Play, Pause, Pencil, X, Tag, ChevronDown, ChevronUp, Info } from "lucide-react";
-import { api } from "../api/client";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { Volume2, Lock, Globe, Trash2, Copy, Check, Search, Sparkles, Play, Pause, Pencil, X, Tag, ChevronDown, ChevronUp, Info, RefreshCw } from "lucide-react";
+import { api, getErrorMessage } from "../api/client";
 import type { VoiceSampleResponse, VoiceSampleUpdateRequest } from "../api/client";
 
 // Predefined tag categories for the filter bar
@@ -32,6 +32,7 @@ interface VoiceLibraryPanelProps {
   onPlayAudio: (url: string, title: string) => void;
   onTogglePlay: () => void;
   activeVoiceSampleId?: string | null;
+  currentUser?: { id: string; username: string; is_admin: boolean } | null;
 }
 
 export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
@@ -41,6 +42,7 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
   onPlayAudio,
   onTogglePlay,
   activeVoiceSampleId,
+  currentUser,
 }) => {
   const [voices, setVoices] = useState<VoiceSampleResponse[]>([]);
   const [filter, setFilter] = useState<"all" | "private" | "public">("all");
@@ -62,22 +64,46 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
   const [editStatus, setEditStatus] = useState<string | null>(null);
   const [showSourceData, setShowSourceData] = useState(false);
 
-  const fetchVoices = async () => {
+  const fetchVoices = useCallback(async () => {
     setLoading(true);
     setErrorMsg(null);
     try {
       const data = await api.listVoiceSamples();
       setVoices(data);
-    } catch (err: any) {
-      setErrorMsg(err.message || "Không thể tải danh sách giọng mẫu.");
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, "Không thể tải danh sách giọng mẫu."));
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchVoices();
+    let active = true;
+    (async () => {
+      try {
+        const data = await api.listVoiceSamples();
+        if (active) setVoices(data);
+      } catch (err: unknown) {
+        if (active) setErrorMsg(getErrorMessage(err, "Không thể tải danh sách giọng mẫu."));
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, []);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (deleteConfirmId) setDeleteConfirmId(null);
+        else if (editVoice) setEditVoice(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [deleteConfirmId, editVoice]);
 
   const handleCopyId = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -91,8 +117,8 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
       await api.deleteVoiceSample(id);
       setVoices(prev => prev.filter(v => v.id !== id));
       setDeleteConfirmId(null);
-    } catch (err: any) {
-      alert(`Lỗi khi xóa giọng: ${err.message || "Vui lòng thử lại sau."}`);
+    } catch (err: unknown) {
+      setErrorMsg(`Lỗi khi xóa giọng: ${getErrorMessage(err, "Vui lòng thử lại sau.")}`);
     }
   };
 
@@ -170,8 +196,8 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
       setVoices(prev => prev.map(v => v.id === updated.id ? updated : v));
       setEditStatus("Cập nhật thành công!");
       setTimeout(() => closeEditModal(), 1200);
-    } catch (err: any) {
-      setEditStatus(`Lỗi: ${err.message || "Không thể cập nhật."}`);
+    } catch (err: unknown) {
+      setEditStatus(`Lỗi: ${getErrorMessage(err, "Không thể cập nhật.")}`);
     } finally {
       setIsEditing(false);
     }
@@ -190,6 +216,15 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
             Quản lý các giọng nói được tải lên hoặc sinh từ thiết kế để sử dụng làm mẫu clone giọng.
           </p>
         </div>
+        <button
+          type="button"
+          onClick={fetchVoices}
+          disabled={loading}
+          className="min-h-[40px] flex items-center gap-1.5 px-3.5 py-2 bg-muted hover:bg-muted/80 text-foreground border border-border rounded-xl text-xs font-semibold transition-colors cursor-pointer shrink-0"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin text-primary" : ""}`} />
+          <span>Làm mới</span>
+        </button>
       </div>
 
       {/* Tag Filter Bar */}
@@ -431,10 +466,12 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
                   )}
                 </div>
 
-                {/* Bottom Actions */}
+                    {/* Bottom Actions */}
                 <div className="flex flex-col gap-3 pt-3 border-t border-border">
-                  <div className="flex gap-2 mt-1">
+                  <div className="flex gap-2 mt-1 items-center">
                     <button
+                      type="button"
+                      aria-label={currentPlayUrl === audioUrl && globalPlayerPlaying ? "Tạm dừng nghe thử" : "Nghe thử giọng"}
                       onClick={() => {
                         if (currentPlayUrl === audioUrl) {
                           onTogglePlay();
@@ -442,48 +479,50 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
                           onPlayAudio(audioUrl, voice.name || voice.id);
                         }
                       }}
-                      className={`p-2 border rounded-full transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+                      className={`min-w-[44px] min-h-[44px] p-2 border rounded-xl transition-colors cursor-pointer flex items-center justify-center shrink-0 ${
                         currentPlayUrl === audioUrl && globalPlayerPlaying
-                          ? "bg-primary text-white border-primary shadow-lg shadow-primary/20"
+                          ? "bg-primary text-primary-foreground border-primary"
                           : "border-border hover:border-primary/40 hover:bg-muted text-foreground"
                       }`}
                       title={currentPlayUrl === audioUrl && globalPlayerPlaying ? "Tạm dừng" : "Nghe thử"}
                     >
                       {currentPlayUrl === audioUrl && globalPlayerPlaying ? (
-                        <Pause className="w-3.5 h-3.5 fill-current" />
+                        <Pause className="w-4 h-4 fill-current" />
                       ) : (
-                        <Play className="w-3.5 h-3.5 fill-current ml-0.5" />
+                        <Play className="w-4 h-4 fill-current ml-0.5" />
                       )}
                     </button>
 
                     <button
+                      type="button"
                       onClick={() => onUseVoice(voice.id)}
-                      className="flex-grow h-10 bg-gradient-to-r from-primary to-accent text-white hover:brightness-105 font-bold text-fluid-sm rounded-full transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow-md shadow-primary/10 active:scale-[0.98]"
+                      className="flex-grow min-h-[44px] bg-primary hover:bg-primary-hover text-primary-foreground font-semibold text-sm rounded-xl transition-colors cursor-pointer flex items-center justify-center gap-1.5 active:translate-y-[1px]"
                     >
                       <Sparkles className="w-3.5 h-3.5 fill-current" />
                       <span>Sử dụng giọng này</span>
                     </button>
 
-                    {/* Edit button for user owned voices */}
-                    {!voice.is_public && (
-                      <button
-                        onClick={() => openEditModal(voice)}
-                        className="p-2 border border-border hover:border-primary/35 hover:bg-primary/5 text-muted-foreground hover:text-primary rounded-full transition-all cursor-pointer shrink-0"
-                        title="Chỉnh sửa"
-                      >
-                        <Pencil className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-
-                    {/* Only show delete button for user owned voices */}
-                    {!voice.is_public && (
-                      <button
-                        onClick={() => setDeleteConfirmId(voice.id)}
-                        className="p-2 border border-border hover:border-destructive/35 hover:bg-destructive/5 text-muted-foreground hover:text-destructive rounded-full transition-all cursor-pointer shrink-0"
-                        title="Xóa khỏi thư viện"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                    {(currentUser && (currentUser.is_admin || (voice.user_id && voice.user_id === currentUser.id))) && (
+                      <>
+                        <button
+                          type="button"
+                          aria-label="Chỉnh sửa giọng mẫu"
+                          onClick={() => openEditModal(voice)}
+                          className="min-w-[44px] min-h-[44px] p-2 border border-border hover:border-primary/40 hover:bg-primary/5 text-muted-foreground hover:text-primary rounded-xl transition-colors cursor-pointer shrink-0 flex items-center justify-center"
+                          title="Chỉnh sửa"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="Xóa giọng mẫu"
+                          onClick={() => setDeleteConfirmId(voice.id)}
+                          className="min-w-[44px] min-h-[44px] p-2 border border-border hover:border-destructive/40 hover:bg-destructive/5 text-muted-foreground hover:text-destructive rounded-xl transition-colors cursor-pointer shrink-0 flex items-center justify-center"
+                          title="Xóa khỏi thư viện"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -495,17 +534,22 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
 
       {/* Edit Voice Modal */}
       {editVoice && (
-        <div 
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="edit-voice-modal-title"
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fadeIn p-4 lg:pl-64"
           onClick={closeEditModal}
         >
-          <div 
+          <div
             className="bg-card dark:bg-[#1a1b1e] border border-border/80 dark:border-[#2d2e33] rounded-[var(--radius-card)] p-6 w-full max-w-lg flex flex-col gap-4 relative shadow-2xl max-h-[90vh] overflow-y-auto scrollbar-thin"
             onClick={(e) => e.stopPropagation()}
           >
             <button
+              type="button"
+              aria-label="Đóng cửa sổ chỉnh sửa"
               onClick={closeEditModal}
-              className="absolute top-4 right-4 p-1.5 hover:bg-muted rounded-full text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              className="min-w-[40px] min-h-[40px] flex items-center justify-center absolute top-3 right-3 p-1.5 hover:bg-muted rounded-full text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
             >
               <X className="w-5 h-5" />
             </button>
@@ -515,7 +559,7 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
                 <Pencil className="w-5 h-5" />
               </div>
               <div>
-                <h3 className="font-bold text-sm text-foreground">Chỉnh sửa Giọng mẫu</h3>
+                <h3 id="edit-voice-modal-title" className="font-bold text-sm text-foreground">Chỉnh sửa Giọng mẫu</h3>
                 <p className="text-[10px] text-muted-foreground font-semibold">Cập nhật tên, tags, văn bản tham khảo và chế độ chia sẻ</p>
               </div>
             </div>
@@ -695,7 +739,7 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
                 type="button"
                 onClick={handleEditSubmit}
                 disabled={isEditing || !editName}
-                className="px-5 py-2.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 disabled:bg-muted disabled:text-muted-foreground text-xs font-bold text-white rounded-lg cursor-pointer transition-colors shadow-md shadow-primary/10 border-none"
+                className="min-h-[44px] px-5 py-2.5 bg-primary hover:bg-primary-hover disabled:bg-muted disabled:text-muted-foreground text-xs font-bold text-primary-foreground rounded-xl cursor-pointer transition-colors"
               >
                 {isEditing ? "Đang lưu..." : "Lưu thay đổi"}
               </button>

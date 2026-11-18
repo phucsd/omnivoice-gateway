@@ -11,7 +11,7 @@ export const PageHeader: React.FC<PageHeaderProps> = ({ title, description, icon
     <div className="flex flex-col gap-1 select-none">
       <div className="flex items-center gap-2.5">
         {icon && (
-          <div className="bg-gradient-to-tr from-violet-600 via-indigo-600 to-accent p-1.5 rounded-lg text-white">
+          <div className="bg-primary text-primary-foreground p-2 rounded-xl">
             {icon}
           </div>
         )}
