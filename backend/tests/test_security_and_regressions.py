@@ -98,6 +98,14 @@ def test_security_headers_and_health_db_rbac():
     assert "permissions-policy" in res.headers
     assert "x-frame-options" not in res.headers
 
+    root_dist_index = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist", "index.html")
+    )
+    if os.path.exists(root_dist_index):
+        root_res = client.get("/")
+        assert root_res.status_code == 200
+        assert root_res.headers.get("cache-control") == "no-cache"
+
     for path in ("/health/db", "/v1/health/db"):
         unauth = client.get(path)
         assert unauth.status_code == 401

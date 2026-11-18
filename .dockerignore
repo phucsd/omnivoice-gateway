@@ -7,8 +7,9 @@ frontend/dist
 storage
 backend/storage
 backend/dubbing_jobs
-.env
-.env.*
+**/.env
+**/.env.*
+!**/.env.example
 kaggle.json
 cookies.txt
 *.cookies.txt

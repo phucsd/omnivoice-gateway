@@ -263,6 +263,13 @@ async def add_security_headers(request: Request, call_next):
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), geolocation=(), payment=()"
+
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("text/html") and "cache-control" not in response.headers:
+        response.headers["Cache-Control"] = "no-cache"
+    elif request.url.path.startswith("/assets/") and "cache-control" not in response.headers:
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+
     return response
 
 @app.middleware("http")

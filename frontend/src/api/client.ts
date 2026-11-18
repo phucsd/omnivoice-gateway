@@ -1,16 +1,13 @@
 export function getApiBaseUrl(): string {
   // Resolve API Base URL dynamically based on running environment
   if (typeof window !== "undefined") {
-    const hostname = window.location.hostname;
-    if (hostname === "localhost" || hostname === "127.0.0.1") {
+    if (import.meta.env.DEV) {
       const envUrl = import.meta.env.VITE_API_BASE_URL;
       if (envUrl && envUrl.startsWith("http")) {
         return envUrl.replace(/\/$/, "");
       }
       return "http://localhost:7860";
     }
-    
-    // Fallback in non-browser contexts
     return window.location.origin;
   }
 
