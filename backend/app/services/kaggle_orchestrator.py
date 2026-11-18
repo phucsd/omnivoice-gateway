@@ -237,6 +237,127 @@ class KaggleOrchestrator:
         threading.Thread(target=_bg_prewarm, daemon=True).start()
 
     @classmethod
+    def _release_wedged_kaggle_gpu_sessions(cls, db, user_id: str = None, job_id: str = None):
+        """
+        Inspects owned Kaggle omnivoice* worker kernels when Kaggle's 2-GPU batch session cap is reached
+        while 0 live workers are heartbeating with the Gateway, and cancels wedged QUEUED/zombie GPU sessions
+        by pushing a lightweight CPU-only (enable_gpu=False) release script.
+        """
+        import csv
+        import io
+        import json
+        import shutil
+        import sys
+        import tempfile
+
+        if os.environ.get("APP_ENV") == "testing":
+            return
+
+        username, key, _, _ = cls.get_credentials(db, user_id)
+        if not username or not key:
+            return
+
+        env = os.environ.copy()
+        env["KAGGLE_USERNAME"] = username
+        env["KAGGLE_KEY"] = key
+        env["KAGGLE_API_TOKEN"] = key
+        env["PYTHONUTF8"] = "1"
+
+        candidate_refs = [
+            f"{username}/omnivoice-worker-1",
+            f"{username}/omnivoice-worker-2",
+            f"{username}/omnivoice-worker",
+            f"{username}/omnivoice-dubbing-worker",
+        ]
+        try:
+            ls_res = subprocess.run(
+                [sys.executable, "-c", "from kaggle.cli import main; main()", "kernels", "list", "--mine", "--page-size", "20", "--csv"],
+                capture_output=True, env=env, text=True, timeout=20,
+            )
+            if ls_res.returncode == 0 and ls_res.stdout:
+                for row in csv.DictReader(io.StringIO(ls_res.stdout)):
+                    ref = (row.get("ref") or "").strip()
+                    if ref and "omnivoice" in ref.lower() and ref not in candidate_refs:
+                        candidate_refs.append(ref)
+        except Exception as ls_err:
+            print(f"[KaggleOrchestrator] Notice listing mine kernels: {ls_err}")
+
+        released = []
+        statuses_log = []
+        for k_ref in candidate_refs:
+            try:
+                st_res = subprocess.run(
+                    [sys.executable, "-c", "from kaggle.cli import main; main()", "kernels", "status", k_ref],
+                    capture_output=True, env=env, text=True, timeout=15,
+                )
+                st_out = (st_res.stdout or st_res.stderr or "").strip()
+                statuses_log.append(f"{k_ref}={st_out}")
+                st_low = st_out.lower()
+                if "queued" in st_low or "running" in st_low:
+                    tmp_d = tempfile.mkdtemp(prefix="kag_rel_")
+                    try:
+                        pull_r = subprocess.run(
+                            [sys.executable, "-c", "from kaggle.cli import main; main()", "kernels", "pull", "-m", "-p", tmp_d, k_ref],
+                            capture_output=True, env=env, text=True, timeout=20,
+                        )
+                        meta_p = os.path.join(tmp_d, "kernel-metadata.json")
+                        if pull_r.returncode == 0 and os.path.exists(meta_p):
+                            with open(meta_p, "r", encoding="utf-8") as mf:
+                                meta = json.load(mf)
+                        else:
+                            slug_part = k_ref.split("/")[-1]
+                            meta = {
+                                "id": k_ref,
+                                "title": slug_part.replace("-", " ").title(),
+                                "code_file": "omnivoice_worker.py",
+                                "language": "python",
+                                "kernel_type": "script",
+                                "is_private": True,
+                            }
+                        meta["enable_gpu"] = False
+                        meta["enable_internet"] = False
+                        meta.pop("accelerator", None)
+                        meta.pop("machine_shape", None)
+                        code_f = meta.get("code_file") or "omnivoice_worker.py"
+                        meta["code_file"] = code_f
+                        with open(meta_p, "w", encoding="utf-8") as mf:
+                            json.dump(meta, mf, indent=2)
+                        code_p = os.path.join(tmp_d, code_f)
+                        if code_f.endswith(".ipynb"):
+                            nb = {
+                                "cells": [{"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": ["print('Released wedged GPU session')\n"]}],
+                                "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}},
+                                "nbformat": 4, "nbformat_minor": 5,
+                            }
+                            with open(code_p, "w", encoding="utf-8") as cf:
+                                json.dump(nb, cf)
+                        else:
+                            with open(code_p, "w", encoding="utf-8") as cf:
+                                cf.write("print('Released wedged GPU session')\n")
+
+                        push_r = subprocess.run(
+                            [sys.executable, "-c", "from kaggle.cli import main; main()", "kernels", "push", "-p", tmp_d],
+                            capture_output=True, env=env, text=True, timeout=25,
+                        )
+                        p_out = (push_r.stdout or push_r.stderr or "").strip()
+                        print(f"[KaggleOrchestrator] CPU release push on {k_ref} -> rc={push_r.returncode}: {p_out}")
+                        released.append(f"{k_ref} ({p_out[:60]})")
+                    finally:
+                        shutil.rmtree(tmp_d, ignore_errors=True)
+            except Exception as rel_err:
+                print(f"[KaggleOrchestrator] Error checking/releasing {k_ref}: {rel_err}")
+
+        summary_msg = f"Checked Kaggle kernels [{'; '.join(statuses_log)}] -> Released: {released}"
+        print(f"[KaggleOrchestrator] {summary_msg}")
+        if job_id and job_id.startswith(("sep_", "asr_", "dub_")):
+            try:
+                from app.services.video_dubbing_service import VideoDubbingService
+                _, dub_id = job_id.split("_", 1)
+                VideoDubbingService.log_to_job(dub_id, f"[KAGGLE AUTO-HEAL] {summary_msg}")
+            except Exception:
+                pass
+
+    @classmethod
     def _failover_or_retry_worker(cls, db, job, status_output: str, reason_label: str):
         """
         Handles worker failures (COMPLETE after grace, ERROR, CANCELLED, push failure)
@@ -280,6 +401,12 @@ class KaggleOrchestrator:
             if wait_cycles < 15:
                 cls._quota_wait_cycles[job.id] = wait_cycles + 1
                 cls._boot_attempts[job.id] = 0
+                if not cls.has_live_worker(db) and wait_cycles in (1, 4, 8):
+                    threading.Thread(
+                        target=cls._release_wedged_kaggle_gpu_sessions,
+                        args=(None, job.user_id, job.id),
+                        daemon=True,
+                    ).start()
                 cls._push_cooldown_until = _time.monotonic() + 15.0
                 print(
                     f"[KaggleOrchestrator] Kaggle GPU session limit (2) active for job {job.id} "
