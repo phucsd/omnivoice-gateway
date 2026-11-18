@@ -584,18 +584,28 @@ def run_dubbing_pipeline(job_id: str):
 
             VideoDubbingService.log_to_job(job_id, f"[GPU WORKER] Tạo sub-job tách nhạc 'sep_{job_id}' trong hàng đợi...")
 
-            # We create a special separate_audio job in the queue
-            # Set the reference audio url to allow the worker to pull the extracted WAV
-            parent_tts_job = TTSJob(
-                id=f"sep_{job_id}",
-                user_id=job.user_id,
-                job_type="separate_audio",
-                ref_audio_path=orig_audio_path,
-                status="queued",
-                progress=0,
-                message="Đang chờ GPU Worker nhận tác vụ tách nhạc...",
-            )
-            db.add(parent_tts_job)
+            # Upsert separate_audio sub-job cleanly so retries never hit UNIQUE constraint errors
+            existing_sep = db.query(TTSJob).filter(TTSJob.id == f"sep_{job_id}").first()
+            if existing_sep:
+                existing_sep.user_id = job.user_id
+                existing_sep.job_type = "separate_audio"
+                existing_sep.ref_audio_path = orig_audio_path
+                existing_sep.status = "queued"
+                existing_sep.progress = 0
+                existing_sep.worker_id = None
+                existing_sep.error_message = None
+                existing_sep.message = "Đang chờ GPU Worker nhận tác vụ tách nhạc..."
+            else:
+                parent_tts_job = TTSJob(
+                    id=f"sep_{job_id}",
+                    user_id=job.user_id,
+                    job_type="separate_audio",
+                    ref_audio_path=orig_audio_path,
+                    status="queued",
+                    progress=0,
+                    message="Đang chờ GPU Worker nhận tác vụ tách nhạc...",
+                )
+                db.add(parent_tts_job)
             db.commit()
             VideoDubbingService.log_to_job(job_id, "[GPU WORKER] Đã đưa sub-job tách nhạc vào hàng đợi, chờ GPU Worker xử lý...")
             
@@ -628,18 +638,30 @@ def trigger_transcription_stage(dub_job_id: str, db: Session):
     
     VideoDubbingService.log_to_job(dub_job_id, f"[KAGGLE] Kênh vocals đã sẵn sàng. Tạo sub-job Whisper ASR 'asr_{dub_job_id}' trong hàng đợi...")
 
-    # Create an ASR job
-    asr_job = TTSJob(
-        id=f"asr_{dub_job_id}",
-        user_id=job.user_id,
-        job_type="asr",
-        ref_audio_path=job.vocals_audio_path,
-        status="queued",
-        progress=0,
-        message="Đang gửi tệp vocals lên Kaggle để nhận diện chữ...",
-        with_alignment=True
-    )
-    db.add(asr_job)
+    # Upsert ASR sub-job cleanly so retries never hit UNIQUE constraint errors
+    existing_asr = db.query(TTSJob).filter(TTSJob.id == f"asr_{dub_job_id}").first()
+    if existing_asr:
+        existing_asr.user_id = job.user_id
+        existing_asr.job_type = "asr"
+        existing_asr.ref_audio_path = job.vocals_audio_path
+        existing_asr.status = "queued"
+        existing_asr.progress = 0
+        existing_asr.worker_id = None
+        existing_asr.error_message = None
+        existing_asr.message = "Đang gửi tệp vocals lên Kaggle để nhận diện chữ..."
+        existing_asr.with_alignment = True
+    else:
+        asr_job = TTSJob(
+            id=f"asr_{dub_job_id}",
+            user_id=job.user_id,
+            job_type="asr",
+            ref_audio_path=job.vocals_audio_path,
+            status="queued",
+            progress=0,
+            message="Đang gửi tệp vocals lên Kaggle để nhận diện chữ...",
+            with_alignment=True
+        )
+        db.add(asr_job)
     db.commit()
     VideoDubbingService.log_to_job(dub_job_id, "[KAGGLE] Đã đưa sub-job Whisper ASR vào hàng đợi, chờ GPU Worker xử lý...")
 
@@ -932,8 +954,8 @@ def retry_dubbing_job(
     if not job:
         raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
 
-    if job.status not in ["failed", "downloading", "queued"]:
-        raise HTTPException(status_code=400, detail="Chỉ có thể thử lại tác vụ đang lỗi hoặc bị gián đoạn tải xuống.")
+    if job.status not in ["failed", "downloading", "queued", "separating_audio", "transcribing"]:
+        raise HTTPException(status_code=400, detail="Chỉ có thể thử lại tác vụ đang lỗi hoặc bị kẹt ở bước tải/tách âm thanh/nhận diện.")
 
     if payload.preferred_quality:
         job.preferred_quality = payload.preferred_quality

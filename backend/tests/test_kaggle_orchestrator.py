@@ -18,6 +18,7 @@ def setup_test_db():
     Base.metadata.create_all(bind=engine)
     # Reset KaggleOrchestrator class states
     KaggleOrchestrator._boot_attempts.clear()
+    KaggleOrchestrator._boot_started_at.clear()
     KaggleOrchestrator._complete_grace_count.clear()
     KaggleOrchestrator._unknown_status_count.clear()
     KaggleOrchestrator._consecutive_poll_failures.clear()
@@ -217,3 +218,118 @@ def test_max_boot_attempts_exhausted(mock_creds, db):
 def test_ensure_worker_running():
     # Should not raise exception
     KaggleOrchestrator.ensure_worker_running()
+
+
+@patch.object(KaggleOrchestrator, "get_credentials")
+def test_trigger_push_stdout_error_with_zero_exit_code_triggers_failover(mock_creds, db):
+    mock_creds.return_value = ("testuser", "testkey", "testuser/omnivoice-worker-1", "/tmp/worker")
+    job = create_mock_job(db, status="starting_worker", worker_id="worker_1")
+
+    with patch("subprocess.Popen") as mock_popen, \
+         patch("app.services.kaggle_notebook_builder.KaggleNotebookBuilder.prepare_all"):
+        # Kaggle CLI returns exit code 0 even when stdout reports "Kernel push error: ..."
+        process_cli_err = MagicMock()
+        process_cli_err.communicate.return_value = ("Kernel push error: Maximum batch GPU session count of 2 reached.", "")
+        process_cli_err.returncode = 0
+
+        process_ok = MagicMock()
+        process_ok.communicate.return_value = ("Kernel version 12 successfully pushed.", "")
+        process_ok.returncode = 0
+
+        mock_popen.side_effect = [process_cli_err, process_ok]
+
+        KaggleOrchestrator._trigger_daemon_worker(db, job)
+        db.refresh(job)
+
+        assert job.worker_id == "worker_2"
+        assert job.status == "queued_kaggle"
+
+
+@patch.object(KaggleOrchestrator, "get_credentials")
+def test_poll_running_boot_timeout_triggers_failover(mock_creds, db):
+    import time as _time
+    mock_creds.return_value = ("testuser", "testkey", "testuser/omnivoice-worker-1", "/tmp/worker")
+    job = create_mock_job(db, status="starting_worker", worker_id="worker_1")
+    KaggleOrchestrator._boot_started_at[job.id] = _time.monotonic() - 305.0
+
+    with patch("subprocess.run") as mock_run, \
+         patch.object(KaggleOrchestrator, "_trigger_daemon_worker") as mock_trigger:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='testuser/omnivoice-worker-1 has status "KernelWorkerStatus.RUNNING"'
+        )
+        KaggleOrchestrator._poll_booting_worker(db, job)
+        db.refresh(job)
+
+        assert job.worker_id == "worker_2"
+        assert job.status == "starting_worker"
+        assert mock_trigger.called
+
+
+def test_notebook_builder_avoids_fuse_dataset_and_generates_valid_ast(tmp_path):
+    import ast
+    import json
+    from app.services.kaggle_notebook_builder import KaggleNotebookBuilder
+
+    wdir = str(tmp_path / "worker_ast_check")
+    KaggleNotebookBuilder.ensure_worker_dir(wdir)
+    meta_path = KaggleNotebookBuilder.generate_metadata(wdir, "testuser", "omnivoice-worker-1", "Omnivoice Worker 1", "NvidiaTeslaT4")
+    meta = json.loads(open(meta_path, encoding="utf-8").read())
+    assert meta["dataset_sources"] == []
+
+    code_path = KaggleNotebookBuilder.generate_worker_code(
+        wdir,
+        job={"worker_id": "worker_1"},
+        public_api_url="https://example.hf.space",
+        worker_token="tok_test_123",
+        is_daemon=True,
+    )
+    code_src = open(code_path, encoding="utf-8").read()
+    ast.parse(code_src)
+    assert "import numpy as np" in code_src
+    assert "start_heartbeat_daemon()" in code_src
+    assert "get_asr_whisper_model()" in code_src
+
+
+def test_any_ready_worker_claims_booting_job_and_syncs_dubbing_failure(db):
+    from app.models import VideoDubbingJob
+    from app.services.job_service import JobService
+
+    dub = VideoDubbingJob(
+        id="vd_sync123",
+        user_id="test_user",
+        status="separating_audio",
+        progress=30,
+        message="Waiting...",
+        source_type="youtube",
+        target_language="Vietnamese",
+    )
+    db.add(dub)
+    sub = TTSJob(
+        id="sep_vd_sync123",
+        user_id="test_user",
+        job_type="separate_audio",
+        status="starting_worker",
+        worker_id="worker_1",
+        message="Booting worker_1...",
+    )
+    db.add(sub)
+    db.commit()
+
+    # worker_2 is ready first and should immediately claim sep_vd_sync123
+    claimed = JobService.get_next_job(db, "worker_2")
+    assert claimed is not None
+    assert claimed.id == "sep_vd_sync123"
+    assert claimed.worker_id == "worker_2"
+
+    # Progress update syncs to VideoDubbingJob
+    JobService.update_job_status(db, "sep_vd_sync123", "separating_audio", "Đang chạy Demucs...", 65)
+    db.refresh(dub)
+    assert dub.progress > 30
+    assert "Demucs" in dub.message
+
+    # Failure update marks VideoDubbingJob as failed instead of leaving it stuck
+    JobService.update_job_status(db, "sep_vd_sync123", "failed", "Lỗi Demucs", 100, "CUDA OOM")
+    db.refresh(dub)
+    assert dub.status == "failed"
+    assert "CUDA OOM" in (dub.error_message or "")

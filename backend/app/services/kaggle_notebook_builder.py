@@ -23,41 +23,10 @@ class KaggleNotebookBuilder:
         """Generates or updates kernel-metadata.json from configurations."""
         metadata_path = os.path.join(worker_dir, "kernel-metadata.json")
         
+        # IMPORTANT: Do NOT attach Kaggle Datasets (e.g. omnivoice-original-2) to dataset_sources!
+        # On Kaggle GPU containers, /kaggle/input is backed by gcsfuse; random safetensors mmap() page-faults
+        # over FUSE stall model loading for 21-23 minutes (vs ~15 seconds downloading directly from HF Hub / ModelScope to local SSD).
         dataset_sources = []
-        # Check settings for Kaggle credentials to dynamically check datasets
-        if settings.KAGGLE_USERNAME and settings.KAGGLE_KEY:
-            try:
-                # Set temporary env variables for the kaggle library
-                os.environ["KAGGLE_USERNAME"] = settings.KAGGLE_USERNAME
-                os.environ["KAGGLE_KEY"] = settings.KAGGLE_KEY
-                os.environ["KAGGLE_API_TOKEN"] = settings.KAGGLE_KEY
-                
-                from kaggle.api.kaggle_api_extended import KaggleApi
-                api = KaggleApi()
-                api.authenticate()
-                
-                # Check which of the target datasets is available and accessible
-                candidates = [
-                    "phcnguynhukendykerry/omnivoice-original-2",
-                    "phcnguynhukendykerry/omnivoice-original",
-                    f"{username}/omnivoice-model",
-                    f"{username}/omnivoice"
-                ]
-                for dataset_ref in candidates:
-                    try:
-                        status = api.dataset_status(dataset_ref)
-                        if status:
-                            dataset_sources.append(dataset_ref)
-                            print(f"[KaggleNotebookBuilder] Auto-detected Kaggle dataset: {dataset_ref} (status: {status}). Adding to dataset_sources.")
-                            break
-                    except Exception:
-                        continue
-            except Exception as ex:
-                print(f"[KaggleNotebookBuilder] Info: Kaggle API dataset status check skipped: {ex}")
-                
-        # If no dataset was found via API, fallback to default
-        if not dataset_sources:
-            dataset_sources = ["phcnguynhukendykerry/omnivoice-original-2"]
 
         # Build metadata structure
         metadata = {
@@ -98,7 +67,7 @@ class KaggleNotebookBuilder:
     def generate_requirements(worker_dir: str) -> str:
         """Generates or updates the requirements.txt file."""
         req_path = os.path.join(worker_dir, "requirements.txt")
-        req_content = "omnivoice @ git+https://github.com/k2-fsa/OmniVoice.git\nsoundfile\nrequests\nfaster-whisper\nnum2words\n"
+        req_content = "omnivoice @ git+https://github.com/k2-fsa/OmniVoice.git\nsoundfile\nnumpy\nrequests\nfaster-whisper\ndemucs\nnum2words\n"
         
         with open(req_path, "w", encoding="utf-8") as f:
             f.write(req_content)
@@ -161,6 +130,7 @@ import shutil
 import zipfile
 import json
 import subprocess
+import threading
 from urllib.parse import urlparse
 
 os.environ["CUDA_MODULE_LOADING"] = "LAZY"
@@ -168,6 +138,8 @@ os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TQDM_DISABLE"] = "1"
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "15"
 os.environ["HF_TOKEN"] = {repr(hf_token)}
 os.environ["HUGGING_FACE_HUB_TOKEN"] = {repr(hf_token)}
@@ -207,6 +179,10 @@ def ensure_dependencies():
         import faster_whisper
     except ImportError:
         missing.append("faster-whisper")
+    try:
+        import demucs
+    except ImportError:
+        missing.append("demucs")
         
     import subprocess
     packages_to_install = []
@@ -215,7 +191,7 @@ def ensure_dependencies():
     packages_to_install.extend(missing)
 
     if packages_to_install:
-        print(f"Installing missing dependencies: {{', '.join(packages_to_install)}}")
+        print(f"Installing missing dependencies: {{', '.join(packages_to_install)}}", flush=True)
         try:
             # Install packages silently with fast flags
             subprocess.check_call([
@@ -223,10 +199,10 @@ def ensure_dependencies():
                 "--no-cache-dir", "--prefer-binary", 
                 "--no-warn-script-location"
             ] + packages_to_install)
-            print("Dependencies installed successfully.")
+            print("Dependencies installed successfully.", flush=True)
         except Exception as e:
             if need_omnivoice_upgrade:
-                print(f"Notice: Batch install failed ({{e}}), falling back to omnivoice[tn]...")
+                print(f"Notice: Batch install failed ({{e}}), falling back to omnivoice[tn]...", flush=True)
                 try:
                     fallback_packages = ["omnivoice[tn]"] + missing
                     subprocess.check_call([
@@ -234,17 +210,18 @@ def ensure_dependencies():
                         "--no-cache-dir", "--prefer-binary",
                         "--no-warn-script-location"
                     ] + fallback_packages)
-                    print("Fallback dependencies installed successfully.")
+                    print("Fallback dependencies installed successfully.", flush=True)
                 except Exception as fb_err:
-                    print(f"Failed to install fallback dependencies: {{fb_err}}")
+                    print(f"Failed to install fallback dependencies: {{fb_err}}", flush=True)
                     sys.exit(1)
             else:
-                print(f"Failed to install dependencies: {{e}}")
+                print(f"Failed to install dependencies: {{e}}", flush=True)
                 sys.exit(1)
 
 # Ensure dependencies are available before anything else runs
 ensure_dependencies()
 
+import numpy as np
 import torch
 import soundfile as sf
 from omnivoice import OmniVoice
@@ -259,12 +236,18 @@ POLL_INTERVAL = {poll_interval}
 
 HEADERS = {{
     "Authorization": f"Bearer {{WORKER_TOKEN}}",
-    "X-Worker-Version": "2.1.0"
+    "X-Worker-Version": "2.2.0"
+}}
+
+WORKER_STATE = {{
+    "status": "starting",
+    "current_job_id": None,
+    "message": "OmniVoice worker starting up...",
+    "stop": False,
 }}
 
 def log(msg: str):
-    print(f"[{{time.strftime('%Y-%m-%d %H:%M:%S')}}] [Worker-{{WORKER_ID}}] {{msg}}")
-    sys.stdout.flush()
+    print(f"[{{time.strftime('%Y-%m-%d %H:%M:%S')}}] [Worker-{{WORKER_ID}}] {{msg}}", flush=True)
 
 def make_request(method: str, path: str, **kwargs) -> requests.Response:
     url = f"{{PUBLIC_API_BASE_URL}}{{path}}"
@@ -272,9 +255,40 @@ def make_request(method: str, path: str, **kwargs) -> requests.Response:
         kwargs["headers"].update(HEADERS)
     else:
         kwargs["headers"] = HEADERS.copy()
+    kwargs.setdefault("timeout", (15, 180))
     return requests.request(method, url, **kwargs)
 
+def set_worker_state(status: str, current_job_id=None, message: str = ""):
+    WORKER_STATE["status"] = status
+    WORKER_STATE["current_job_id"] = current_job_id
+    WORKER_STATE["message"] = message
+
+def start_heartbeat_daemon():
+    def _hb_loop():
+        while not WORKER_STATE.get("stop"):
+            time.sleep(25)
+            if WORKER_STATE.get("stop"):
+                break
+            try:
+                make_request(
+                    "POST",
+                    "/v1/internal/workers/heartbeat",
+                    json={{
+                        "worker_id": WORKER_ID,
+                        "status": WORKER_STATE["status"],
+                        "current_job_id": WORKER_STATE["current_job_id"],
+                        "message": WORKER_STATE["message"],
+                    }},
+                    timeout=(10, 20),
+                )
+            except Exception as hb_err:
+                log(f"Notice: background heartbeat warning: {{hb_err}}")
+    t = threading.Thread(target=_hb_loop, daemon=True)
+    t.start()
+    return t
+
 WHISPER_MODEL = None
+ASR_WHISPER_MODEL = None
 
 ONES_MAP = {{
     "0": "không", "1": "một", "2": "hai", "3": "ba", "4": "bốn",
@@ -304,10 +318,18 @@ def levenshtein_ratio(s1, s2):
     return 1.0 - (matrix[len(s1)][len(s2)] / max_len)
 
 def resample_to_16k(audio_arr, orig_sr=24000):
-    if orig_sr == 16000:
+    if hasattr(audio_arr, "detach"):
+        audio_arr = audio_arr.detach().cpu().numpy()
+    audio_arr = np.asarray(audio_arr, dtype=np.float32)
+    if audio_arr.ndim > 1:
+        if audio_arr.shape[-1] <= 8:
+            audio_arr = audio_arr.mean(axis=-1)
+        else:
+            audio_arr = audio_arr.mean(axis=0)
+    if orig_sr == 16000 or len(audio_arr) == 0:
         return audio_arr.astype(np.float32)
     orig_len = len(audio_arr)
-    target_len = int(orig_len * 16000 / orig_sr)
+    target_len = max(1, int(orig_len * 16000 / orig_sr))
     orig_idx = np.linspace(0, orig_len, orig_len, endpoint=False)
     target_idx = np.linspace(0, orig_len, target_len, endpoint=False)
     return np.interp(target_idx, orig_idx, audio_arr).astype(np.float32)
@@ -317,28 +339,41 @@ def get_whisper_model():
     if WHISPER_MODEL is None:
         log("Loading Whisper model for word alignment...")
         from faster_whisper import WhisperModel
-        import torch
         
-        # Try GPU first
         if torch.cuda.is_available():
             try:
-                log("Attempting to load WhisperModel on GPU (cuda)...")
+                log("Attempting to load WhisperModel ('small') on GPU (cuda)...")
                 WHISPER_MODEL = WhisperModel("small", device="cuda", compute_type="float16")
-                log("Whisper model loaded on GPU successfully.")
+                log("Whisper model ('small') loaded on GPU successfully.")
                 return WHISPER_MODEL
             except Exception as gpu_err:
                 log(f"Warning: Failed to load WhisperModel on GPU: {{gpu_err}}. Falling back to CPU...")
                 
-        # Fallback to CPU
         try:
-            log("Attempting to load WhisperModel on CPU...")
+            log("Attempting to load WhisperModel ('small') on CPU...")
             WHISPER_MODEL = WhisperModel("small", device="cpu", compute_type="int8")
-            log("Whisper model loaded on CPU successfully.")
+            log("Whisper model ('small') loaded on CPU successfully.")
         except Exception as cpu_err:
             log(f"Error: Failed to load WhisperModel on CPU: {{cpu_err}}")
             raise cpu_err
             
     return WHISPER_MODEL
+
+def get_asr_whisper_model():
+    global ASR_WHISPER_MODEL
+    if ASR_WHISPER_MODEL is None:
+        from faster_whisper import WhisperModel
+        if torch.cuda.is_available():
+            for m_name in ("large-v3-turbo", "small"):
+                try:
+                    log(f"Loading faster-whisper '{{m_name}}' on GPU for full-length ASR...")
+                    ASR_WHISPER_MODEL = WhisperModel(m_name, device="cuda", compute_type="float16")
+                    log(f"faster-whisper '{{m_name}}' loaded on GPU successfully.")
+                    return ASR_WHISPER_MODEL
+                except Exception as err:
+                    log(f"Warning: Could not load faster-whisper '{{m_name}}' on GPU: {{err}}")
+        ASR_WHISPER_MODEL = get_whisper_model()
+    return ASR_WHISPER_MODEL
 
 def align_words(original_words, transcribed_words, audio_duration):
     n = len(original_words)
@@ -514,108 +549,93 @@ def align_words(original_words, transcribed_words, audio_duration):
                 
     return aligned
 
+def _copy_dataset_to_local_ssd(src_root: str) -> str:
+    \"\"\"Copies a mounted /kaggle/input model directory sequentially onto local SSD (/tmp) to avoid 20+ min gcsfuse mmap stalls.\"\"\"
+    dst_root = os.path.join(tempfile.gettempdir(), "omnivoice_local_weights")
+    if os.path.exists(dst_root):
+        shutil.rmtree(dst_root, ignore_errors=True)
+    os.makedirs(dst_root, exist_ok=True)
+    for rel_root, dirs, files in os.walk(src_root):
+        if "/.cache" in rel_root.replace("\\\\", "/"):
+            continue
+        rel_sub = os.path.relpath(rel_root, src_root)
+        target_dir = dst_root if rel_sub == "." else os.path.join(dst_root, rel_sub)
+        os.makedirs(target_dir, exist_ok=True)
+        for fname in files:
+            if fname.endswith(".metadata"):
+                continue
+            s_file = os.path.join(rel_root, fname)
+            d_file = os.path.join(target_dir, fname)
+            with open(s_file, "rb") as fsrc, open(d_file, "wb") as fdst:
+                shutil.copyfileobj(fsrc, fdst, length=16 * 1024 * 1024)
+    for filename in ["tokenizer.json", "tokenizer_config.json"]:
+        dst_file = os.path.join(dst_root, filename)
+        if not os.path.exists(dst_file):
+            try:
+                res = requests.get(f"https://huggingface.co/k2-fsa/OmniVoice/resolve/main/{{filename}}", timeout=20)
+                if res.status_code == 200:
+                    with open(dst_file, "wb") as out_f:
+                        out_f.write(res.content)
+            except Exception:
+                pass
+    return dst_root
+
 def main():
     if not PUBLIC_API_BASE_URL:
-        print("ERROR: PUBLIC_API_BASE_URL is not set. Exiting.")
+        print("ERROR: PUBLIC_API_BASE_URL is not set. Exiting.", flush=True)
         sys.exit(1)
 
     log(f"Starting Kaggle Worker Daemon. Gateway: {{PUBLIC_API_BASE_URL}}")
     
-    # 1. Register starting
+    # 1. Register starting & launch background heartbeat thread so Gateway never times out during long tasks
     try:
+        set_worker_state("starting", None, "OmniVoice worker starting up...")
         make_request(
             "POST", 
             "/v1/internal/workers/register", 
             json={{"worker_id": WORKER_ID, "status": "starting", "message": "OmniVoice worker starting up..."}}
         )
     except Exception as e:
-        print(f"Failed to register startup with gateway: {{e}}")
+        print(f"Failed to register startup with gateway: {{e}}", flush=True)
         sys.exit(1)
 
-    # 2. Load OmniVoice
-    log("Loading OmniVoice model into memory...")
+    start_heartbeat_daemon()
+
+    # 2. Load OmniVoice onto local SSD -> GPU VRAM (~15s from HF Hub; avoids 22-min /kaggle/input gcsfuse mmap stall)
+    log("Loading OmniVoice model into GPU VRAM...")
     try:
-        # Send heartbeat reporting loading_model status
+        set_worker_state("loading_model", None, "Loading OmniVoice weights into GPU VRAM...")
         make_request(
             "POST", 
             "/v1/internal/workers/heartbeat", 
-            json={{"worker_id": WORKER_ID, "status": "loading_model", "message": "Loading model weights..."}}
+            json={{"worker_id": WORKER_ID, "status": "loading_model", "message": "Loading OmniVoice weights into GPU VRAM..."}}
         )
 
-        model_dir = None
+        model = None
         model_loaded = False
-        
-        # 1. First priority: Mounted Kaggle Dataset (Instant offline load from NVMe/SSD, ~3-5s)
-        if os.path.exists("/kaggle/input"):
-            for root, dirs, files in os.walk("/kaggle/input"):
-                if "model.safetensors" in files and "config.json" in files:
-                    if not root.endswith("audio_tokenizer"):
-                        model_dir = root
-                        log(f"Found mounted model weights at: {{model_dir}}. Loading instantly from local disk...")
-                        break
 
-        if model_dir:
-            try:
-                # Check if tokenizer files are missing from model_dir
-                tokenizer_json = os.path.join(model_dir, "tokenizer.json")
-                tokenizer_config = os.path.join(model_dir, "tokenizer_config.json")
-                load_path = model_dir
-                if not os.path.exists(tokenizer_json) or not os.path.exists(tokenizer_config):
-                    log("Tokenizer files missing from mounted dataset. Symlinking to temp directory...")
-                    temp_model_dir = tempfile.mkdtemp()
-                    for f in os.listdir(model_dir):
-                        src_file = os.path.join(model_dir, f)
-                        dst_file = os.path.join(temp_model_dir, f)
-                        if os.path.isfile(src_file):
-                            try:
-                                os.symlink(src_file, dst_file)
-                            except Exception:
-                                shutil.copy2(src_file, dst_file)
-                    for filename in ["tokenizer.json", "tokenizer_config.json"]:
-                        dst_file = os.path.join(temp_model_dir, filename)
-                        if not os.path.exists(dst_file):
-                            try:
-                                res = requests.get(f"https://huggingface.co/k2-fsa/OmniVoice/resolve/main/{{filename}}", timeout=15)
-                                if res.status_code == 200:
-                                    with open(dst_file, "wb") as out_f:
-                                        out_f.write(res.content)
-                            except Exception:
-                                pass
-                    load_path = temp_model_dir
+        # 1. First priority: Hugging Face Hub directly onto container local SSD (~15s total on Kaggle 10Gbps link)
+        try:
+            t_load0 = time.time()
+            log("Downloading & loading OmniVoice from Hugging Face Hub onto local SSD...")
+            model = OmniVoice.from_pretrained(
+                "k2-fsa/OmniVoice",
+                device_map="cuda:0",
+                dtype=torch.float16,
+                load_asr=True,
+            )
+            log(f"OmniVoice model loaded from Hugging Face Hub in {{time.time() - t_load0:.1f}}s.")
+            model_loaded = True
+        except Exception as hf_err:
+            log(f"Warning: Hugging Face Hub load failed ({{hf_err}}). Trying ModelScope fallback...")
+            model_loaded = False
 
-                model = OmniVoice.from_pretrained(
-                    load_path,
-                    device_map="cuda:0",
-                    dtype=torch.float16,
-                    load_asr=True,
-                )
-                log(f"OmniVoice model loaded successfully from local disk: {{load_path}}.")
-                model_loaded = True
-            except Exception as local_err:
-                log(f"Warning: Failed to load from local mounted dataset ({{local_err}}). Falling back to Hugging Face...")
-                model_loaded = False
-
-        # 2. Second priority: Original Hugging Face Hub (Online fallback)
-        if not model_loaded:
-            try:
-                log("Attempting to load model from Hugging Face Hub...")
-                model = OmniVoice.from_pretrained(
-                    "k2-fsa/OmniVoice",
-                    device_map="cuda:0",
-                    dtype=torch.float16,
-                    load_asr=True,
-                )
-                log("OmniVoice model loaded successfully from Hugging Face Hub.")
-                model_loaded = True
-            except Exception as hf_err:
-                log(f"Warning: Failed to load from Hugging Face Hub (CDN issue?): {{hf_err}}")
-                model_loaded = False
-
-        # 3. Third priority: ModelScope fallback (Stable alternative source if HF is down)
+        # 2. Second priority: ModelScope fallback onto local SSD
         if not model_loaded:
             try:
                 from modelscope import snapshot_download
-                log("Falling back to ModelScope to download model weights...")
+                t_ms0 = time.time()
+                log("Downloading model weights via ModelScope onto local SSD...")
                 ms_dir = snapshot_download("k2-fsa/OmniVoice")
                 model = OmniVoice.from_pretrained(
                     ms_dir,
@@ -623,28 +643,50 @@ def main():
                     dtype=torch.float16,
                     load_asr=True,
                 )
-                log(f"OmniVoice model loaded successfully via ModelScope from: {{ms_dir}}")
+                log(f"OmniVoice model loaded via ModelScope in {{time.time() - t_ms0:.1f}}s.")
                 model_loaded = True
             except Exception as ms_err:
-                log(f"CRITICAL: Failed to download from ModelScope: {{ms_err}}")
-                raise ms_err
+                log(f"Warning: ModelScope fallback failed ({{ms_err}}). Checking mounted /kaggle/input...")
+                model_loaded = False
 
-        log("OmniVoice model loaded successfully.")
+        # 3. Third priority: Mounted Kaggle Dataset (MUST copy sequentially to /tmp local SSD first, NEVER mmap on /kaggle/input!)
+        if not model_loaded and os.path.exists("/kaggle/input"):
+            mounted_dir = None
+            for root, dirs, files in os.walk("/kaggle/input"):
+                if "model.safetensors" in files and "config.json" in files and not root.endswith("audio_tokenizer"):
+                    mounted_dir = root
+                    break
+            if mounted_dir:
+                log(f"Copying mounted weights from {{mounted_dir}} to local /tmp SSD...")
+                local_ssd_dir = _copy_dataset_to_local_ssd(mounted_dir)
+                model = OmniVoice.from_pretrained(
+                    local_ssd_dir,
+                    device_map="cuda:0",
+                    dtype=torch.float16,
+                    load_asr=True,
+                )
+                log(f"OmniVoice model loaded from local SSD copy: {{local_ssd_dir}}.")
+                model_loaded = True
 
-        # Background preload Whisper model so first alignment job does not wait ~27s
-        import threading
+        if not model_loaded or model is None:
+            raise RuntimeError("Could not load OmniVoice model from Hugging Face Hub, ModelScope, or local dataset.")
+
+        log("OmniVoice model ready in GPU memory.")
+
+        # Background preload faster-whisper so ASR & alignment run with zero cold-start delay
         def preload_whisper():
             try:
-                log("Background preloading Whisper model for fast word alignment...")
+                log("Background preloading faster-whisper model...")
                 get_whisper_model()
-                log("Background Whisper model preloaded successfully.")
+                log("Background faster-whisper model preloaded successfully.")
             except Exception as wp_err:
-                log(f"Notice: Whisper background preload deferred: {{wp_err}}")
+                log(f"Notice: faster-whisper background preload deferred: {{wp_err}}")
 
         threading.Thread(target=preload_whisper, daemon=True).start()
 
     except Exception as e:
         log(f"CRITICAL ERROR loading OmniVoice model: {{e}}")
+        WORKER_STATE["stop"] = True
         try:
             make_request(
                 "POST", 
@@ -656,6 +698,7 @@ def main():
         sys.exit(1)
 
     # Register as Ready
+    set_worker_state("ready", None, "OmniVoice model ready for requests.")
     make_request(
         "POST", 
         "/v1/internal/workers/register", 
@@ -667,7 +710,7 @@ def main():
     
     while True:
         try:
-            # Send heartbeat
+            set_worker_state("idle", None, f"Worker polling. Idle time: {{idle_seconds}}s")
             make_request(
                 "POST",
                 "/v1/internal/workers/heartbeat",
@@ -690,11 +733,11 @@ def main():
             job = data.get("job")
 
             if not job:
-                # No job available
                 time.sleep(POLL_INTERVAL)
                 idle_seconds += POLL_INTERVAL
                 if idle_seconds >= IDLE_TIMEOUT:
                     log(f"Idle timeout of {{IDLE_TIMEOUT}}s reached. Initiating shutdown.")
+                    WORKER_STATE["stop"] = True
                     make_request(
                         "POST", 
                         "/v1/internal/workers/shutdown", 
@@ -709,18 +752,19 @@ def main():
             job_type = job["job_type"]
             log(f"Processing job {{job_id}} ({{job_type}})")
 
-            # Report busy status
+            # Report busy status (also maintained continuously by background heartbeat daemon)
+            set_worker_state("busy", job_id, f"Running {{job_type}}")
             make_request(
                 "POST",
                 "/v1/internal/workers/heartbeat",
                 json={{"worker_id": WORKER_ID, "status": "busy", "current_job_id": job_id, "message": f"Running {{job_type}}"}}
             )
 
-            # Update job status: loading_model
+            # Update job status
             make_request(
                 "POST",
                 f"/v1/internal/jobs/{{job_id}}/status",
-                json={{"status": "loading_model", "message": "Đang tải OmniVoice...", "progress": 30}}
+                json={{"status": "loading_model", "message": f"GPU Worker ({{WORKER_ID}}) đã nhận tác vụ {{job_type}}...", "progress": 35}}
             )
 
             # Process job based on type
@@ -732,22 +776,22 @@ def main():
                     make_request(
                         "POST",
                         f"/v1/internal/jobs/{{job_id}}/status",
-                        json={{"status": "preparing_input", "message": "Đang tải tệp âm thanh...", "progress": 45}}
+                        json={{"status": "preparing_input", "message": "Đang tải tệp âm thanh lên GPU Worker...", "progress": 45}}
                     )
                     
-                    # Securely download voice sample file using the parsed URL path
                     parsed_ref = urlparse(ref_audio_url)
                     ref_path = parsed_ref.path
                     if parsed_ref.query:
                         ref_path = ref_path + "?" + parsed_ref.query
-                    res = make_request("GET", ref_path, stream=True)
+                    res = make_request("GET", ref_path, stream=True, timeout=(15, 300))
                     if res.status_code == 200:
                         temp_fd, local_ref_path = tempfile.mkstemp(suffix=".wav")
                         os.close(temp_fd)
                         with open(local_ref_path, "wb") as f:
-                            for chunk in res.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                        log(f"Downloaded audio to {{local_ref_path}}")
+                            for chunk in res.iter_content(chunk_size=65536):
+                                if chunk:
+                                    f.write(chunk)
+                        log(f"Downloaded audio to {{local_ref_path}} ({{os.path.getsize(local_ref_path)}} bytes)")
                     else:
                         raise Exception(f"Failed to download audio from gateway: {{res.status_code}} - {{res.text}}")
 
@@ -756,36 +800,39 @@ def main():
                     make_request(
                         "POST",
                         f"/v1/internal/jobs/{{job_id}}/status",
-                        json={{"status": "separating_audio", "message": "Đang chạy Demucs tách nhạc và lời...", "progress": 60}}
+                        json={{"status": "separating_audio", "message": "Đang chạy Demucs GPU tách giọng nói và nhạc nền...", "progress": 65}}
                     )
                     
                     vocals_path = "vocals.wav"
                     bgm_path = "bgm.wav"
                     
                     try:
-                        import subprocess
-                        import sys
-                        
-                        # Try importing demucs or install
                         try:
                             import demucs
                         except ImportError:
                             log("Installing demucs dynamically...")
-                            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "demucs"])
+                            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--prefer-binary", "demucs"])
                             
-                        # Run demucs
-                        log(f"Running demucs on {{local_ref_path}}...")
-                        demucs_cmd = [sys.executable, "-m", "demucs", "--two-stems=vocals", "-o", "demucs_out", local_ref_path]
-                        try:
-                            subprocess.run(demucs_cmd, check=True)
-                        except Exception:
+                        demucs_device = "cuda" if torch.cuda.is_available() else "cpu"
+                        log(f"Running Demucs (--two-stems=vocals, device={{demucs_device}}) on {{local_ref_path}}...")
+                        t_sep0 = time.time()
+                        demucs_cmd = [
+                            sys.executable, "-m", "demucs",
+                            "--two-stems=vocals",
+                            "-d", demucs_device,
+                            "-o", "demucs_out",
+                            local_ref_path,
+                        ]
+                        proc_sep = subprocess.run(demucs_cmd, capture_output=True, text=True)
+                        if proc_sep.returncode != 0:
+                            log(f"Demucs module invocation exited {{proc_sep.returncode}}: {{proc_sep.stderr[-400:]}}. Retrying CLI entrypoint...")
                             subprocess.run([
                                 "demucs", "--two-stems=vocals",
+                                "-d", demucs_device,
                                 "-o", "demucs_out",
                                 local_ref_path
                             ], check=True)
                         
-                        # Find the output files
                         extracted_vocals = None
                         extracted_no_vocals = None
                         for root, dirs, files in os.walk("demucs_out"):
@@ -801,35 +848,49 @@ def main():
                         if extracted_vocals and extracted_no_vocals:
                             shutil.copy2(extracted_vocals, vocals_path)
                             shutil.copy2(extracted_no_vocals, bgm_path)
-                            log(f"Demucs audio separation successful. Vocals: {{extracted_vocals}}, BGM: {{extracted_no_vocals}}")
+                            log(f"Demucs separation finished in {{time.time() - t_sep0:.1f}}s. Vocals: {{extracted_vocals}}, BGM: {{extracted_no_vocals}}")
                         else:
                             raise Exception(f"Could not locate demucs output files (vocals={{extracted_vocals}}, no_vocals={{extracted_no_vocals}})")
                             
                     except Exception as sep_err:
-                        log(f"Warning: Audio separation failed: {{sep_err}}. Falling back to mock separation.")
+                        log(f"Warning: Demucs separation failed ({{sep_err}}). Using center-channel vocal attenuation fallback so speech never bleeds into BGM.")
                         shutil.copy2(local_ref_path, vocals_path)
-                        shutil.copy2(local_ref_path, bgm_path)
+                        try:
+                            raw_wav, raw_sr = sf.read(local_ref_path, dtype="float32")
+                            if raw_wav.ndim == 2 and raw_wav.shape[1] >= 2:
+                                side = (raw_wav[:, 0] - raw_wav[:, 1]) * 0.5
+                                bgm_arr = np.stack([side, side], axis=1)
+                            else:
+                                bgm_arr = np.zeros_like(raw_wav)
+                            sf.write(bgm_path, bgm_arr, raw_sr, format="WAV", subtype="PCM_16")
+                        except Exception:
+                            shutil.copy2(local_ref_path, bgm_path)
+
+                    make_request(
+                        "POST",
+                        f"/v1/internal/jobs/{{job_id}}/status",
+                        json={{"status": "separating_audio", "message": "Đang đóng gói và tải kết quả tách nhạc về Gateway...", "progress": 90}}
+                    )
 
                     # Zip vocals and bgm
                     zip_path = "separation.zip"
-                    with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
                         zipf.write(vocals_path, "vocals.wav")
                         zipf.write(bgm_path, "bgm.wav")
                         
-                    # Clean up
                     for path_to_del in [vocals_path, bgm_path, local_ref_path]:
                         if path_to_del and os.path.exists(path_to_del):
                             os.remove(path_to_del)
                     if os.path.exists("demucs_out"):
                         shutil.rmtree("demucs_out")
                         
-                    # Upload zip
                     with open(zip_path, "rb") as zip_f:
                         files = {{"file": ("separation.zip", zip_f, "application/zip")}}
                         upload_res = make_request(
                             "POST",
                             f"/v1/internal/jobs/{{job_id}}/output",
-                            files=files
+                            files=files,
+                            timeout=(15, 300),
                         )
                         
                     if upload_res.status_code == 200:
@@ -846,13 +907,13 @@ def main():
                     make_request(
                         "POST",
                         f"/v1/internal/jobs/{{job_id}}/status",
-                        json={{"status": "generating_tts", "message": "Đang sinh giọng lồng tiếng từng phân đoạn...", "progress": 60}}
+                        json={{"status": "generating_tts", "message": "Đang trích xuất đặc trưng giọng mẫu (VoiceClonePrompt)...", "progress": 55}}
                     )
                     
                     segments = json.loads(job["text"])
                     zip_path = "dubbed_segments.zip"
-                    
                     created_files = []
+                    total_segs = max(1, len(segments))
                     
                     # Pre-compute VoiceClonePrompt ONCE for all segments to save massive processing time
                     voice_clone_prompt = None
@@ -875,8 +936,24 @@ def main():
                         start_t = float(seg.get("start", 0.0)) if isinstance(seg, dict) else 0.0
                         end_t = float(seg.get("end", start_t + 3.0)) if isinstance(seg, dict) else (start_t + 3.0)
                         target_dur = max(0.5, end_t - start_t)
+
+                        if idx == 0 or (idx + 1) % 3 == 0 or (idx + 1) == total_segs:
+                            seg_pct = min(92, 60 + int(((idx + 1) / total_segs) * 32))
+                            set_worker_state("busy", job_id, f"Dubbing segment {{idx+1}}/{{total_segs}}")
+                            try:
+                                make_request(
+                                    "POST",
+                                    f"/v1/internal/jobs/{{job_id}}/status",
+                                    json={{
+                                        "status": "generating_tts",
+                                        "message": f"Đang sinh giọng clone phân đoạn {{idx + 1}}/{{total_segs}}...",
+                                        "progress": seg_pct,
+                                    }},
+                                )
+                            except Exception:
+                                pass
                         
-                        log(f"Dubbing segment {{seg_id}}: '{{seg_text}}' (target duration: {{target_dur}}s)")
+                        log(f"Dubbing segment {{seg_id}} ({{idx+1}}/{{total_segs}}): '{{seg_text[:60]}}' (target: {{target_dur:.2f}}s)")
                         if job.get("normalize_text", True) and seg_text:
                             seg_text = normalize_vietnamese_text(seg_text)
                         
@@ -886,7 +963,6 @@ def main():
                         elif local_ref_path and os.path.exists(local_ref_path):
                             gen_kwargs["ref_audio"] = local_ref_path
                         
-                        # Generate first try
                         try:
                             audio_res = model.generate(**gen_kwargs)
                         except (TypeError, ImportError, Exception) as t_err:
@@ -898,14 +974,12 @@ def main():
                             else:
                                 raise
                         
-                        # Check duration
                         synth_dur = len(audio_res[0]) / 24000.0
-                        log(f"Segment {{seg_id}} synthesized duration: {{synth_dur}}s")
+                        log(f"Segment {{seg_id}} synthesized duration: {{synth_dur:.2f}}s")
                         
-                        # If too long, speed it up
                         if synth_dur > target_dur + 0.2:
                             speed_val = min(2.5, max(1.1, synth_dur / target_dur))
-                            log(f"Re-generating segment {{seg_id}} with speed={{speed_val}}...")
+                            log(f"Re-generating segment {{seg_id}} with speed={{speed_val:.2f}}...")
                             gen_kwargs["speed"] = speed_val
                             try:
                                 audio_res = model.generate(**gen_kwargs)
@@ -922,25 +996,23 @@ def main():
                         sf.write(seg_wav_name, audio_res[0], 24000, format='WAV', subtype='PCM_16')
                         created_files.append(seg_wav_name)
                         
-                    # Zip all
-                    with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
                         for f_name in created_files:
                             zipf.write(f_name, f_name)
                             
-                    # Clean up
                     for f_name in created_files:
                         if os.path.exists(f_name):
                             os.remove(f_name)
                     if local_ref_path and os.path.exists(local_ref_path):
                         os.remove(local_ref_path)
                         
-                    # Upload
                     with open(zip_path, "rb") as zip_f:
                         files = {{"file": ("dubbed_segments.zip", zip_f, "application/zip")}}
                         upload_res = make_request(
                             "POST",
                             f"/v1/internal/jobs/{{job_id}}/output",
-                            files=files
+                            files=files,
+                            timeout=(15, 300),
                         )
                         
                     if upload_res.status_code == 200:
@@ -952,30 +1024,103 @@ def main():
                         os.remove(zip_path)
                     continue
 
-                # Handle ASR job type directly
+                # Handle ASR job type directly (uses faster-whisper CTranslate2 for arbitrary-length audio + word timestamps)
                 if job_type == "asr":
                     make_request(
                         "POST",
                         f"/v1/internal/jobs/{{job_id}}/status",
-                        json={{"status": "transcribing", "message": "Đang nhận dạng giọng nói...", "progress": 70}}
+                        json={{"status": "transcribing", "message": "Đang nhận dạng giọng nói & mốc thời gian bằng Whisper GPU...", "progress": 70}}
                     )
                     
-                    log(f"Transcribing audio {{local_ref_path}}...")
-                    asr_res = model._asr_pipe(local_ref_path, return_timestamps="word")
-                    transcribed_text = asr_res.get("text", "").strip()
-                    chunks = asr_res.get("chunks", [])
+                    log(f"Transcribing audio {{local_ref_path}} with faster-whisper word timestamps...")
+                    t_asr0 = time.time()
+                    transcribed_text = ""
+                    chunks = []
+                    audio_dur_sec = None
+
+                    try:
+                        raw_audio, raw_sr = sf.read(local_ref_path, dtype="float32")
+                        audio_16k = resample_to_16k(raw_audio, orig_sr=raw_sr)
+                        audio_dur_sec = round(float(len(audio_16k) / 16000.0), 3)
+                        asr_model = get_asr_whisper_model()
+                        seg_iter, asr_info = asr_model.transcribe(
+                            audio_16k,
+                            word_timestamps=True,
+                            vad_filter=True,
+                            vad_parameters=dict(min_silence_duration_ms=400),
+                        )
+                        seg_list = list(seg_iter)
+                        text_parts = []
+                        for seg_obj in seg_list:
+                            if seg_obj.text and seg_obj.text.strip():
+                                text_parts.append(seg_obj.text.strip())
+                            if seg_obj.words:
+                                for w in seg_obj.words:
+                                    w_str = (w.word or "").strip()
+                                    if not w_str:
+                                        continue
+                                    s_val = round(float(w.start), 3)
+                                    e_val = round(float(w.end), 3)
+                                    chunks.append({{
+                                        "word": w_str,
+                                        "text": w_str,
+                                        "start": s_val,
+                                        "end": e_val,
+                                        "timestamp": [s_val, e_val],
+                                    }})
+                            elif seg_obj.text and seg_obj.text.strip():
+                                s_val = round(float(seg_obj.start), 3)
+                                e_val = round(float(seg_obj.end), 3)
+                                seg_words = seg_obj.text.strip().split()
+                                step_w = max(0.05, (e_val - s_val) / max(1, len(seg_words)))
+                                for wi, sw in enumerate(seg_words):
+                                    ws = round(s_val + wi * step_w, 3)
+                                    we = round(min(e_val, ws + step_w), 3)
+                                    chunks.append({{
+                                        "word": sw,
+                                        "text": sw,
+                                        "start": ws,
+                                        "end": we,
+                                        "timestamp": [ws, we],
+                                    }})
+                        transcribed_text = " ".join(text_parts).strip()
+                        log(f"faster-whisper ASR completed in {{time.time() - t_asr0:.1f}}s ({{len(chunks)}} words, lang={{getattr(asr_info, 'language', 'auto')}}).")
+                    except Exception as fw_asr_err:
+                        log(f"Warning: faster-whisper ASR failed ({{fw_asr_err}}). Falling back to chunked HF pipeline...")
+                        asr_res = model._asr_pipe(local_ref_path, chunk_length_s=30, return_timestamps=True)
+                        transcribed_text = (asr_res.get("text") or "").strip()
+                        raw_chunks = asr_res.get("chunks") or []
+                        for rc in raw_chunks:
+                            c_txt = (rc.get("text") or "").strip()
+                            ts = rc.get("timestamp") or [0.0, 0.0]
+                            cs = float(ts[0]) if ts[0] is not None else 0.0
+                            ce = float(ts[1]) if (len(ts) > 1 and ts[1] is not None) else (cs + 2.0)
+                            c_words = c_txt.split()
+                            step_w = max(0.05, (ce - cs) / max(1, len(c_words)))
+                            for wi, sw in enumerate(c_words):
+                                ws = round(cs + wi * step_w, 3)
+                                we = round(min(ce, ws + step_w), 3)
+                                chunks.append({{
+                                    "word": sw,
+                                    "text": sw,
+                                    "start": ws,
+                                    "end": we,
+                                    "timestamp": [ws, we],
+                                }})
                     
                     chunks_json = json.dumps(chunks)
-                    
-                    log(f"ASR complete. Text: {{transcribed_text}}")
+                    log(f"ASR complete. Text preview: {{transcribed_text[:120]}}")
                     
                     if local_ref_path and os.path.exists(local_ref_path):
                         os.remove(local_ref_path)
                         
+                    asr_payload = {{"text": transcribed_text, "alignment": chunks_json}}
+                    if audio_dur_sec is not None:
+                        asr_payload["duration"] = audio_dur_sec
                     upload_res = make_request(
                         "POST",
                         f"/v1/internal/jobs/{{job_id}}/asr",
-                        json={{"text": transcribed_text, "alignment": chunks_json}}
+                        json=asr_payload
                     )
                     if upload_res.status_code == 200:
                         log(f"Successfully uploaded job {{job_id}} ASR results.")
@@ -1387,85 +1532,27 @@ def main():
     print("Loading OmniVoice model...")
     sys.stdout.flush()
     try:
-        model_dir = None
         model_loaded = False
         
-        # 1. First priority: Mounted Kaggle Dataset (Instant offline load from NVMe/SSD, ~3-5s)
-        if os.path.exists("/kaggle/input"):
-            for root, dirs, files in os.walk("/kaggle/input"):
-                if "model.safetensors" in files and "config.json" in files:
-                    if not root.endswith("audio_tokenizer"):
-                        model_dir = root
-                        print(f"Found mounted model weights at: {{model_dir}}. Loading instantly from local disk...")
-                        sys.stdout.flush()
-                        break
+        # 1. First priority: Hugging Face Hub onto local SSD (~15s total; avoids 22-min /kaggle/input gcsfuse mmap stall)
+        try:
+            print("Attempting to load model from Hugging Face Hub...")
+            sys.stdout.flush()
+            model = OmniVoice.from_pretrained(
+                "k2-fsa/OmniVoice",
+                device_map="cuda:0",
+                dtype=torch.float16,
+                load_asr=True,
+            )
+            print("OmniVoice model loaded successfully from Hugging Face Hub.")
+            sys.stdout.flush()
+            model_loaded = True
+        except Exception as hf_err:
+            print(f"Warning: Failed to load from Hugging Face Hub (CDN issue?): {{hf_err}}")
+            sys.stdout.flush()
+            model_loaded = False
 
-        if model_dir:
-            try:
-                # Check if tokenizer files are missing from model_dir
-                tokenizer_json = os.path.join(model_dir, "tokenizer.json")
-                tokenizer_config = os.path.join(model_dir, "tokenizer_config.json")
-                load_path = model_dir
-                if not os.path.exists(tokenizer_json) or not os.path.exists(tokenizer_config):
-                    print("Tokenizer files missing from mounted dataset. Symlinking to temp directory...")
-                    sys.stdout.flush()
-                    import tempfile
-                    import shutil
-                    temp_model_dir = tempfile.mkdtemp()
-                    for f in os.listdir(model_dir):
-                        src_file = os.path.join(model_dir, f)
-                        dst_file = os.path.join(temp_model_dir, f)
-                        if os.path.isfile(src_file):
-                            try:
-                                os.symlink(src_file, dst_file)
-                            except Exception:
-                                shutil.copy2(src_file, dst_file)
-                    for filename in ["tokenizer.json", "tokenizer_config.json"]:
-                        dst_file = os.path.join(temp_model_dir, filename)
-                        if not os.path.exists(dst_file):
-                            try:
-                                res = requests.get(f"https://huggingface.co/k2-fsa/OmniVoice/resolve/main/{{filename}}", timeout=15)
-                                if res.status_code == 200:
-                                    with open(dst_file, "wb") as out_f:
-                                        out_f.write(res.content)
-                            except Exception:
-                                pass
-                    load_path = temp_model_dir
-
-                model = OmniVoice.from_pretrained(
-                    load_path,
-                    device_map="cuda:0",
-                    dtype=torch.float16,
-                    load_asr=True,
-                )
-                print(f"OmniVoice model loaded successfully from local disk: {{load_path}}.")
-                sys.stdout.flush()
-                model_loaded = True
-            except Exception as local_err:
-                print(f"Warning: Failed to load from local mounted dataset ({{local_err}}). Falling back to Hugging Face...")
-                sys.stdout.flush()
-                model_loaded = False
-
-        # 2. Second priority: Original Hugging Face Hub (Online fallback)
-        if not model_loaded:
-            try:
-                print("Attempting to load model from Hugging Face Hub...")
-                sys.stdout.flush()
-                model = OmniVoice.from_pretrained(
-                    "k2-fsa/OmniVoice",
-                    device_map="cuda:0",
-                    dtype=torch.float16,
-                    load_asr=True,
-                )
-                print("OmniVoice model loaded successfully from Hugging Face Hub.")
-                sys.stdout.flush()
-                model_loaded = True
-            except Exception as hf_err:
-                print(f"Warning: Failed to load from Hugging Face Hub (CDN issue?): {{hf_err}}")
-                sys.stdout.flush()
-                model_loaded = False
-
-        # 3. Third priority: ModelScope fallback (Stable alternative source if HF is down)
+        # 2. Second priority: ModelScope fallback (Stable alternative source if HF is down)
         if not model_loaded:
             try:
                 from modelscope import snapshot_download

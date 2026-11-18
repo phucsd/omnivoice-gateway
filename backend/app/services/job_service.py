@@ -269,19 +269,11 @@ class JobService:
 
     @staticmethod
     def get_next_job(db: Session, worker_id: str, user_id: str = None) -> Optional[TTSJob]:
-        """Locks the oldest queued job for the requested worker and updates status to preparing_input."""
+        """Locks the oldest queued or booting job for any ready worker and updates status to preparing_input."""
         with _job_allocation_lock:
-            # Find jobs that are:
-            # - General queued (no worker_id/starting restriction) OR
-            # - Assigned to this specific worker during its booting state
+            # Allow any ready worker to immediately claim queued or booting jobs (even if another slot initiated boot)
             query = db.query(TTSJob).filter(
-                or_(
-                    TTSJob.status == "queued",
-                    and_(
-                        TTSJob.status.in_(["starting_worker", "queued_kaggle"]),
-                        TTSJob.worker_id == worker_id
-                    )
-                )
+                TTSJob.status.in_(["queued", "starting_worker", "queued_kaggle"])
             )
             if user_id:
                 query = query.filter(TTSJob.user_id == user_id)
@@ -294,7 +286,7 @@ class JobService:
             # Lock the job
             job.status = "preparing_input"
             job.worker_id = worker_id
-            job.message = "Đang chuẩn bị dữ liệu đầu vào trên Worker..."
+            job.message = f"GPU Worker ({worker_id}) đang chuẩn bị dữ liệu đầu vào..."
             job.started_at = datetime.utcnow()
             db.commit()
             db.refresh(job)
@@ -302,7 +294,7 @@ class JobService:
 
     @staticmethod
     def update_job_status(db: Session, job_id: str, status: str, message: str = None, progress: int = 0, error_message: str = None) -> TTSJob:
-        """Updates a job's status parameters, synchronizing it with previews if applicable."""
+        """Updates a job's status parameters, synchronizing it with previews and parent VideoDubbingJob if applicable."""
         job = db.query(TTSJob).filter(TTSJob.id == job_id).first()
         if not job:
             raise ValueError(f"Không tìm thấy Job {job_id}")
@@ -327,6 +319,41 @@ class JobService:
                     preview.status = "completed"
                 else:
                     preview.status = "processing"
+
+        # Sync VideoDubbingJob progress, console logs, and failure states so dubbing jobs never hang silently
+        if job_id.startswith(("sep_", "asr_", "dub_")):
+            try:
+                from app.models import VideoDubbingJob
+                from app.services.video_dubbing_service import VideoDubbingService
+
+                prefix, dub_job_id = job_id.split("_", 1)
+                dub_job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == dub_job_id).first()
+                if dub_job:
+                    if status == "failed":
+                        err_summary = (error_message or message or "GPU Worker thất bại").splitlines()[0][:240]
+                        dub_job.status = "failed"
+                        dub_job.progress = 100
+                        dub_job.error_message = error_message or message or "Lỗi xử lý trên GPU Worker."
+                        dub_job.message = f"Lỗi GPU Worker ({prefix}): {err_summary}"
+                        VideoDubbingService.log_to_job(dub_job_id, f"❌ [GPU WORKER ERROR] Sub-job '{job_id}' thất bại: {err_summary}")
+                    elif status != "completed":
+                        pct = max(0, min(100, int(progress or 0)))
+                        if prefix == "sep" and dub_job.status == "separating_audio":
+                            dub_job.progress = max(dub_job.progress or 30, 30 + int(pct * 0.18))
+                            if message:
+                                dub_job.message = message
+                        elif prefix == "asr" and dub_job.status == "transcribing":
+                            dub_job.progress = max(dub_job.progress or 50, 50 + int(pct * 0.22))
+                            if message:
+                                dub_job.message = message
+                        elif prefix == "dub" and dub_job.status == "generating_tts":
+                            dub_job.progress = max(dub_job.progress or 20, 20 + int(pct * 0.48))
+                            if message:
+                                dub_job.message = message
+                        if message:
+                            VideoDubbingService.log_to_job(dub_job_id, f"[GPU WORKER] ({status} {pct}%) {message}")
+            except Exception as sync_err:
+                print(f"[JobService] Warning syncing VideoDubbingJob status for {job_id}: {sync_err}")
 
         db.commit()
         db.refresh(job)

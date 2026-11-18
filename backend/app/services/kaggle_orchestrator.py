@@ -98,6 +98,7 @@ class KaggleOrchestrator:
     _unknown_status_count = {}
     _complete_grace_count = {}
     _boot_attempts = {}
+    _boot_started_at = {}
 
     @classmethod
     def _cleanup_job_tracking(cls, job_id: str):
@@ -106,6 +107,7 @@ class KaggleOrchestrator:
         cls._unknown_status_count.pop(job_id, None)
         cls._complete_grace_count.pop(job_id, None)
         cls._boot_attempts.pop(job_id, None)
+        cls._boot_started_at.pop(job_id, None)
 
     @classmethod
     def ensure_worker_running(cls, db=None):
@@ -269,7 +271,9 @@ class KaggleOrchestrator:
     @classmethod
     def _trigger_daemon_worker(cls, db, job):
         """Prepares daemon worker code and pushes it to Kaggle."""
+        import time as _time
         cls._boot_attempts[job.id] = cls._boot_attempts.get(job.id, 0) + 1
+        cls._boot_started_at[job.id] = _time.monotonic()
         current_attempt = cls._boot_attempts[job.id]
         print(f"[KaggleOrchestrator] Triggering daemon worker for job context {job.id} on slot {job.worker_id} (attempt {current_attempt}/4)")
         
@@ -375,14 +379,25 @@ class KaggleOrchestrator:
             )
             stdout, stderr = process.communicate()
             
-            if process.returncode == 0:
-                print(f"[KaggleOrchestrator] Daemon worker kernel pushed successfully on {job.worker_id}. Output: {stdout.strip()}")
+            stdout_clean = (stdout or "").strip()
+            stderr_clean = (stderr or "").strip()
+            stdout_lower = stdout_clean.lower()
+            has_cli_push_error = (
+                "kernel push error" in stdout_lower
+                or stdout_lower.startswith("error:")
+                or "maximum batch gpu session count" in stdout_lower
+                or "403 - forbidden" in stdout_lower
+                or "401 - unauthorized" in stdout_lower
+            )
+
+            if process.returncode == 0 and not has_cli_push_error:
+                print(f"[KaggleOrchestrator] Daemon worker kernel pushed successfully on {job.worker_id}. Output: {stdout_clean}")
                 job.status = "queued_kaggle"
                 job.message = f"Khởi động máy chủ Kaggle ({job.worker_id}). Đang chờ hàng đợi..."
                 job.progress = 10
                 db.commit()
             else:
-                err_msg = stderr.strip() or stdout.strip() or "Unknown error."
+                err_msg = stderr_clean or stdout_clean or "Unknown error."
                 print(f"[KaggleOrchestrator] Daemon pushing failed on {job.worker_id}: {err_msg}")
                 cls._failover_or_retry_worker(db, job, err_msg, "Push failed")
         except Exception as e:
@@ -441,10 +456,22 @@ class KaggleOrchestrator:
             elif "running" in status_lower:
                 cls._unknown_status_count.pop(job.id, None)
                 cls._complete_grace_count.pop(job.id, None)
-                job.status = "starting_worker"
-                job.message = f"Kaggle Worker ({job.worker_id}) đang tải môi trường chạy và mô hình..."
-                job.progress = 25
-                db.commit()
+                import time as _time
+                boot_t0 = cls._boot_started_at.get(job.id)
+                if boot_t0 is None:
+                    cls._boot_started_at[job.id] = _time.monotonic()
+                    boot_elapsed = 0.0
+                else:
+                    boot_elapsed = _time.monotonic() - boot_t0
+
+                if boot_elapsed > 300:
+                    print(f"[KaggleOrchestrator] Worker {job.worker_id} stuck booting for {boot_elapsed:.0f}s without claiming job {job.id}. Triggering failover...")
+                    cls._failover_or_retry_worker(db, job, f"Boot timeout ({int(boot_elapsed)}s)", "Worker Boot Timeout")
+                else:
+                    job.status = "starting_worker"
+                    job.message = f"Kaggle Worker ({job.worker_id}) đang tải môi trường chạy và mô hình..."
+                    job.progress = 25
+                    db.commit()
             elif "error" in status_lower or "failed" in status_lower:
                 cls._unknown_status_count.pop(job.id, None)
                 cls._complete_grace_count.pop(job.id, None)

@@ -120,6 +120,7 @@ import zipfile
 import subprocess
 import requests
 import soundfile as sf
+import numpy as np
 import torch
 
 {DubbingNotebookBuilder.get_normalizer_code()}
