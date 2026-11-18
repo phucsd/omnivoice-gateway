@@ -174,6 +174,10 @@ class VideoDubbingJob(Base):
     
     source_type = Column(String(50), nullable=False)  # "upload" | "youtube"
     source_url = Column(Text, nullable=True)
+    video_title = Column(Text, nullable=True)
+    video_thumbnail = Column(Text, nullable=True)
+    video_duration = Column(Float, nullable=True)
+    preferred_quality = Column(String(20), default="1080p", nullable=True)
     target_language = Column(String(50), nullable=False)
     llm_profile_id = Column(String(50), nullable=True)
     

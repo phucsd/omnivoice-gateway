@@ -79,9 +79,18 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str = ""
     GITHUB_CLIENT_ID: str = ""
     GITHUB_CLIENT_SECRET: str = ""
+    YOUTUBE_OAUTH_CLIENT_ID: str = ""
+    YOUTUBE_OAUTH_CLIENT_SECRET: str = ""
 
     # Tailscale Settings (must be supplied via environment / Secrets)
     TAILSCALE_AUTHKEY: str = ""
+
+    # Remote Windows YouTube Bridge & Cloudflare R2 Staging
+    YT_BRIDGE_URL: str = ""
+    YT_BRIDGE_SECRET: str = ""
+    YT_R2_GATEWAY_URL: str = ""
+    CF_ACCESS_CLIENT_ID: str = ""
+    CF_ACCESS_CLIENT_SECRET: str = ""
 
     LOG_LEVEL: str = "info"
 

@@ -249,6 +249,11 @@ class VideoDubbingJobResponse(BaseModel):
     message: Optional[str] = None
     source_type: str
     source_url: Optional[str] = None
+    video_title: Optional[str] = None
+    video_thumbnail: Optional[str] = None
+    video_duration: Optional[float] = None
+    preferred_quality: Optional[str] = "1080p"
+    has_source_video: bool = False
     target_language: str
     llm_profile_id: Optional[str] = None
     original_subtitles: Optional[List[SubtitleSegment]] = None
@@ -267,6 +272,28 @@ class VideoDubbingJobListResponse(BaseModel):
     page: int
     page_size: int
     jobs: List[VideoDubbingJobResponse]
+
+class YouTubeVideoInfoRequest(BaseModel):
+    url: str
+
+class YouTubeVideoInfoResponse(BaseModel):
+    video_id: str
+    canonical_url: str
+    title: str
+    channel: Optional[str] = None
+    duration: Optional[float] = None
+    thumbnail_url: Optional[str] = None
+    available_qualities: List[str] = ["1080p", "720p", "480p", "360p"]
+    is_live: bool = False
+
+class YouTubePreDownloadRequest(BaseModel):
+    url: str
+    preferred_quality: str = "1080p"
+    target_language: str = "Vietnamese"
+
+class DubbingRetryPipelineRequest(BaseModel):
+    preferred_quality: Optional[str] = None
+    download_only: bool = False
 
 class DubbingRetryTranslationRequest(BaseModel):
     llm_profile_id: Optional[str] = None

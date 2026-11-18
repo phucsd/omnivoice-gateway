@@ -6,7 +6,7 @@ import shutil
 import zipfile
 from typing import Optional, List
 import concurrent.futures
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks, Body
 from fastapi.responses import FileResponse
 from datetime import datetime
 from pydantic import BaseModel
@@ -23,6 +23,10 @@ from app.schemas import (
     ShortenSubtitleResponse,
     RemixDubbingRequest,
     LLMProfilePublicResponse,
+    YouTubeVideoInfoRequest,
+    YouTubeVideoInfoResponse,
+    YouTubePreDownloadRequest,
+    DubbingRetryPipelineRequest,
 )
 from app.utils.auth import get_user_or_api_key
 from app.routers.admin import get_admin_user
@@ -133,17 +137,7 @@ def debug_log(admin: User = Depends(get_admin_user)):
 @router.get("/cookie-status")
 def get_cookie_status(admin: User = Depends(get_admin_user)):
     _ = admin
-    storage_cookies = os.path.join(os.path.abspath(settings.STORAGE_DIR), "cookies.txt")
-    legacy_storage_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "cookies.txt"))
-
-    for ck in [storage_cookies, legacy_storage_cookies]:
-        if os.path.exists(ck) and os.path.getsize(ck) > 0:
-            return {
-                "has_cookies": True,
-                "size_bytes": os.path.getsize(ck),
-                "modified_at": os.path.getmtime(ck)
-            }
-    return {"has_cookies": False, "size_bytes": 0}
+    return VideoDubbingService.inspect_cookie_status()
 
 @router.post("/upload-cookies")
 async def upload_cookies(
@@ -152,10 +146,6 @@ async def upload_cookies(
     admin: User = Depends(get_admin_user),
 ):
     _ = admin
-    storage_dir = os.path.abspath(settings.STORAGE_DIR)
-    os.makedirs(storage_dir, exist_ok=True)
-    target_path = os.path.join(storage_dir, "cookies.txt")
-
     content = ""
     if file:
         content_bytes = await file.read(MAX_COOKIE_UPLOAD_BYTES + 1)
@@ -169,48 +159,19 @@ async def upload_cookies(
     else:
         raise HTTPException(status_code=400, detail="Cần cung cấp file cookies.txt hoặc nội dung cookie.")
 
-    # Auto-convert raw header or key=value cookies into Netscape format if not already in Netscape format
-    if content and "# Netscape" not in content and "\t" not in content:
-        import re
-        raw = content.strip()
-        cookie_match = re.search(r'(?:[-–]H\s+[\'"][Cc]ookie:\s*|[Cc]ookie:\s*)([^\r\n\'"]+)', raw)
-        if cookie_match:
-            raw = cookie_match.group(1)
-
-        lines = [
-            "# Netscape HTTP Cookie File",
-            "# http://curl.haxx.se/rfc/cookie_spec.html",
-            "# Converted by OmniVoice Gateway"
-        ]
-        count = 0
-        for part in raw.replace('\r', '').replace('\n', ' ').split(';'):
-            part = part.strip()
-            if '=' in part:
-                k, v = part.split('=', 1)
-                k = k.strip()
-                v = v.strip()
-                if k:
-                    lines.append(f".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}")
-                    count += 1
-        if count > 0:
-            content = "\n".join(lines) + "\n"
-
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    return {"status": "success", "message": f"Đã lưu cookies.txt thành công ({len(content)} ký tự)", "size_bytes": len(content)}
+    saved = VideoDubbingService.save_cookies_content(content)
+    return {
+        "status": "success",
+        "message": f"Đã lưu cookies.txt thành công ({saved['cookie_count']} cookie, auth={'có' if saved['is_authenticated'] else 'ẩn danh'})",
+        "size_bytes": saved["size_bytes"],
+        "cookie_count": saved["cookie_count"],
+        "is_authenticated": saved["is_authenticated"],
+    }
 
 @router.delete("/delete-cookies")
 def delete_cookies(admin: User = Depends(get_admin_user)):
     _ = admin
-    storage_cookies = os.path.join(os.path.abspath(settings.STORAGE_DIR), "cookies.txt")
-    legacy_storage_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "cookies.txt"))
-    for ck in [storage_cookies, legacy_storage_cookies]:
-        if os.path.exists(ck):
-            try:
-                os.remove(ck)
-            except Exception:
-                pass
+    VideoDubbingService.delete_cookies_all()
     return {"status": "success", "message": "Đã xóa file cookies."}
 
 class OAuthPollRequest(BaseModel):
@@ -381,11 +342,106 @@ def delete_proxy(admin: User = Depends(get_admin_user)):
     VideoDubbingService.delete_youtube_proxy()
     return {"status": "success", "message": "Đã xóa cấu hình Proxy."}
 
+def _make_throttled_progress_callback(job_id: str, min_pct: int, max_pct: int, min_interval: float = 0.8):
+    """Creates a thread-safe progress callback that persists download progress to DB without spamming commits."""
+    state = {"last_ts": 0.0, "last_pct": -1}
+
+    def _callback(raw_pct: float, message: str):
+        now = time.monotonic()
+        clamped = max(0.0, min(100.0, float(raw_pct)))
+        mapped_pct = min(max_pct, max(min_pct, int(min_pct + (clamped / 100.0) * (max_pct - min_pct))))
+        if clamped < 100.0 and (now - state["last_ts"] < min_interval) and mapped_pct == state["last_pct"]:
+            return
+        state["last_ts"] = now
+        state["last_pct"] = mapped_pct
+
+        pdb = SessionLocal()
+        try:
+            j = pdb.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
+            if j:
+                j.progress = mapped_pct
+                j.message = message
+                pdb.commit()
+        except Exception:
+            pdb.rollback()
+        finally:
+            pdb.close()
+
+    return _callback
+
+
+def run_youtube_predownload(job_id: str):
+    """Background task to pre-download a YouTube video for preview/save before dubbing."""
+    db = SessionLocal()
+    try:
+        job = None
+        for _ in range(10):
+            job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
+            if job:
+                break
+            time.sleep(0.3)
+        if not job:
+            return
+
+        job_dir = ensure_within_directory(settings.dubbing_dir, os.path.join(settings.dubbing_dir, job_id))
+        os.makedirs(job_dir, exist_ok=True)
+        log_path = os.path.join(job_dir, "process.log")
+
+        job.status = "downloading"
+        job.progress = 2
+        job.error_message = None
+        job.message = "Đang bắt đầu tải video từ YouTube..."
+        db.commit()
+
+        VideoDubbingService.log_to_job(job_id, f"Tải trước video YouTube: {job.source_url} (chất lượng: {job.preferred_quality or '1080p'})")
+        meta_out = {}
+        progress_cb = _make_throttled_progress_callback(job_id, 2, 99, min_interval=0.8)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                VideoDubbingService.download_youtube_video,
+                job.source_url,
+                job_dir,
+                log_file=log_path,
+                preferred_quality=job.preferred_quality or "1080p",
+                progress_callback=progress_cb,
+                metadata_out=meta_out,
+            )
+            try:
+                video_path, title = future.result(timeout=300)
+            except concurrent.futures.TimeoutError:
+                raise Exception("Tải video từ YouTube vượt quá 5 phút. Vui lòng thử chất lượng thấp hơn hoặc dùng video MP4.")
+
+        db.refresh(job)
+        job.input_file_path = video_path
+        job.video_title = meta_out.get("title") or title or job.video_title
+        job.video_thumbnail = meta_out.get("thumbnail") or job.video_thumbnail
+        job.video_duration = meta_out.get("duration") if meta_out.get("duration") is not None else job.video_duration
+        job.status = "uploaded"
+        job.progress = 100
+        job.error_message = None
+        job.message = "Đã tải xong video từ YouTube, sẵn sàng xem trước hoặc lồng tiếng."
+        db.commit()
+        VideoDubbingService.log_to_job(job_id, f"Tải trước video YouTube thành công: '{job.video_title}' -> {video_path}")
+    except Exception as e:
+        err_msg = str(e).strip() or repr(e) or type(e).__name__
+        VideoDubbingService.log_to_job(job_id, f"LỖI TẢI VIDEO YOUTUBE: {err_msg}")
+        db.rollback()
+        job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
+        if job:
+            job.status = "failed"
+            job.progress = 100
+            job.error_message = err_msg
+            job.message = f"Lỗi tải YouTube: {err_msg[:100]}"
+            db.commit()
+    finally:
+        db.close()
+
+
 def run_dubbing_pipeline(job_id: str):
     """Background task to run the video dubbing stages (Download -> Extract Audio -> Separate -> Transcribe -> Translate)."""
     db = SessionLocal()
     try:
-        import time
         job = None
         for _ in range(10):
             job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
@@ -400,26 +456,52 @@ def run_dubbing_pipeline(job_id: str):
         VideoDubbingService.log_to_job(job_id, f"Khởi chạy pipeline lồng tiếng video. Trạng thái ban đầu: {job.status}")
 
         job_dir = os.path.join(settings.dubbing_dir, job_id)
-        # Stage 1: Download video if YouTube
-        if job.source_type == "youtube":
-            job.status = "downloading"
-            job.progress = 10
-            job.message = "Đang tải video từ YouTube..."
-            db.commit()
-            
-            VideoDubbingService.log_to_job(job_id, f"Tải video từ YouTube URL: {job.source_url}")
+        os.makedirs(job_dir, exist_ok=True)
+        log_path = os.path.join(job_dir, "process.log")
 
-            import concurrent.futures
+        # Stage 1: Download video if YouTube and not yet pre-downloaded
+        need_download = (
+            job.source_type == "youtube"
+            and (
+                not job.input_file_path
+                or not os.path.exists(job.input_file_path)
+                or os.path.getsize(job.input_file_path) == 0
+            )
+        )
+        if need_download:
+            job.status = "downloading"
+            job.progress = 5
+            job.message = "Đang chuẩn bị tải video từ YouTube..."
+            db.commit()
+
+            VideoDubbingService.log_to_job(job_id, f"Tải video từ YouTube URL: {job.source_url} (chất lượng: {job.preferred_quality or '1080p'})")
+            meta_out = {}
+            progress_cb = _make_throttled_progress_callback(job_id, 5, 24, min_interval=1.0)
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(VideoDubbingService.download_youtube_video, job.source_url, job_dir)
+                future = executor.submit(
+                    VideoDubbingService.download_youtube_video,
+                    job.source_url,
+                    job_dir,
+                    log_file=log_path,
+                    preferred_quality=job.preferred_quality or "1080p",
+                    progress_callback=progress_cb,
+                    metadata_out=meta_out,
+                )
                 try:
                     video_path, title = future.result(timeout=300)
                 except concurrent.futures.TimeoutError:
                     raise Exception("Tải video từ YouTube vượt quá 5 phút. Vui lòng thử lại hoặc dùng video MP4.")
-                
+
+            db.refresh(job)
             job.input_file_path = video_path
+            job.video_title = meta_out.get("title") or title or job.video_title
+            job.video_thumbnail = meta_out.get("thumbnail") or job.video_thumbnail
+            job.video_duration = meta_out.get("duration") if meta_out.get("duration") is not None else job.video_duration
             db.commit()
-            VideoDubbingService.log_to_job(job_id, f"Tải video thành công. File: {video_path}")
+            VideoDubbingService.log_to_job(job_id, f"Tải video thành công: '{job.video_title}'. File: {video_path}")
+        elif job.source_type == "youtube" and job.input_file_path and os.path.exists(job.input_file_path):
+            VideoDubbingService.log_to_job(job_id, f"Sử dụng video YouTube đã tải sẵn: {job.input_file_path}")
 
         # Stage 2: Extract audio from video
         job.status = "separating_audio"
@@ -677,6 +759,209 @@ def trigger_translation_stage(dub_job_id: str, text: str, alignment_str: str, db
     job.message = "Đang chờ người dùng kiểm tra và xác nhận phụ đề dịch."
     db.commit()
 
+def _format_dubbing_job_response(job: VideoDubbingJob) -> VideoDubbingJobResponse:
+    orig_subs = []
+    if job.original_subtitles:
+        try:
+            orig_subs = json.loads(job.original_subtitles)
+        except Exception:
+            pass
+
+    trans_subs = []
+    if job.translated_subtitles:
+        try:
+            trans_subs = json.loads(job.translated_subtitles)
+        except Exception:
+            pass
+
+    has_output = bool(job.status == "completed" or (job.output_video_path and os.path.exists(job.output_video_path)))
+    output_video_url = f"/v1/video-dubbing/jobs/{job.id}/output" if has_output else None
+    has_source_video = bool(job.input_file_path and os.path.exists(job.input_file_path) and os.path.getsize(job.input_file_path) > 0)
+
+    return VideoDubbingJobResponse(
+        id=job.id,
+        status=job.status,
+        progress=job.progress,
+        message=job.message,
+        source_type=job.source_type,
+        source_url=job.source_url,
+        video_title=getattr(job, "video_title", None),
+        video_thumbnail=getattr(job, "video_thumbnail", None),
+        video_duration=getattr(job, "video_duration", None),
+        preferred_quality=getattr(job, "preferred_quality", None) or "1080p",
+        has_source_video=has_source_video,
+        target_language=job.target_language,
+        llm_profile_id=getattr(job, "llm_profile_id", None),
+        original_subtitles=orig_subs,
+        translated_subtitles=trans_subs,
+        vocals_audio_path=job.vocals_audio_path,
+        bgm_audio_path=job.bgm_audio_path,
+        vocals_volume=getattr(job, "vocals_volume", 1.0) or 1.0,
+        bgm_volume=getattr(job, "bgm_volume", 0.4) or 0.4,
+        output_video_url=output_video_url,
+        error_message=job.error_message,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+    )
+
+
+@router.post("/youtube/info", response_model=YouTubeVideoInfoResponse)
+def get_youtube_video_info(
+    req: YouTubeVideoInfoRequest,
+    current_user: User = Depends(get_user_or_api_key),
+):
+    """Kiểm tra link YouTube và trả về metadata (tiêu đề, kênh, thời lượng, thumbnail, chất lượng)."""
+    _ = current_user
+    try:
+        info = VideoDubbingService.get_youtube_video_info(req.url)
+        return YouTubeVideoInfoResponse(**info)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Không thể lấy thông tin video YouTube: {e}")
+
+
+@router.post("/youtube/download", response_model=VideoDubbingJobResponse)
+def pre_download_youtube_video(
+    req: YouTubePreDownloadRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
+):
+    """Tải trước video YouTube về máy chủ để xem trước / tải MP4 hoặc tiếp tục lồng tiếng."""
+    try:
+        video_id, canonical_url = VideoDubbingService.normalize_youtube_url(req.url)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    job_id = f"vd_{uuid.uuid4().hex[:8]}"
+    job_dir = ensure_within_directory(settings.dubbing_dir, os.path.join(settings.dubbing_dir, job_id))
+    os.makedirs(job_dir, exist_ok=True)
+
+    job = VideoDubbingJob(
+        id=job_id,
+        user_id=current_user.id,
+        status="downloading",
+        progress=2,
+        message="Đang bắt đầu tải video từ YouTube...",
+        source_type="youtube",
+        source_url=canonical_url,
+        video_thumbnail=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        preferred_quality=req.preferred_quality or "1080p",
+        target_language=req.target_language or "Vietnamese",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    import threading
+    t = threading.Thread(target=run_youtube_predownload, args=(job_id,), daemon=True)
+    t.start()
+
+    return _format_dubbing_job_response(job)
+
+
+@router.get("/bridge-status")
+def get_youtube_bridge_status(admin: User = Depends(get_admin_user)):
+    """Kiểm tra trạng thái kết nối Windows YouTube Bridge (Cloudflare Tunnel + R2)."""
+    _ = admin
+    from app.services.r2_bridge_client import RemoteYouTubeBridgeClient
+    return RemoteYouTubeBridgeClient.get_bridge_diagnostics()
+
+
+@router.post("/test-youtube")
+def test_youtube_connection(
+    payload: Optional[YouTubeVideoInfoRequest] = Body(default=None),
+    admin: User = Depends(get_admin_user),
+):
+    """Kiểm tra nhanh khả năng kết nối & phân giải video YouTube trên máy chủ."""
+    _ = admin
+    from app.services.r2_bridge_client import RemoteYouTubeBridgeClient
+
+    target_url = (payload.url if payload and payload.url else "https://www.youtube.com/watch?v=_HA6-A8itVY")
+    t0 = time.perf_counter()
+    cookie_status = VideoDubbingService.inspect_cookie_status()
+    oauth_connected = bool(VideoDubbingService.refresh_oauth_token_if_needed())
+    proxy_count = len(VideoDubbingService.get_youtube_proxies())
+    bridge_diag = RemoteYouTubeBridgeClient.get_bridge_diagnostics()
+
+    bridge_note = ""
+    if bridge_diag.get("configured"):
+        bridge_note = (
+            f" | Tunnel Bridge: {'Online' if bridge_diag.get('bridge_online') else 'Offline'}"
+            f" | R2 Cache: {'Online' if bridge_diag.get('r2_online') else 'Offline'}"
+        )
+
+    try:
+        info = VideoDubbingService.get_youtube_video_info(target_url)
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        return {
+            "status": "success",
+            "latency_ms": latency_ms,
+            "title": info.get("title"),
+            "available_qualities": info.get("available_qualities", []),
+            "cookie_status": cookie_status,
+            "oauth_connected": oauth_connected,
+            "proxy_count": proxy_count,
+            "bridge": bridge_diag,
+            "message": f"Kết nối YouTube thành công ({latency_ms}ms): {info.get('title')}{bridge_note}",
+        }
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        return {
+            "status": "error",
+            "latency_ms": latency_ms,
+            "title": None,
+            "available_qualities": [],
+            "cookie_status": cookie_status,
+            "oauth_connected": oauth_connected,
+            "proxy_count": proxy_count,
+            "bridge": bridge_diag,
+            "message": f"Kiểm tra YouTube thất bại ({latency_ms}ms): {e}{bridge_note}",
+        }
+
+
+@router.post("/jobs/{job_id}/retry", response_model=VideoDubbingJobResponse)
+def retry_dubbing_job(
+    job_id: str,
+    payload: DubbingRetryPipelineRequest = Body(default=DubbingRetryPipelineRequest()),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
+):
+    """Thử lại tải video YouTube hoặc khởi chạy lại pipeline cho tác vụ bị lỗi/gián đoạn."""
+    job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id, VideoDubbingJob.user_id == current_user.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ lồng tiếng.")
+
+    if job.status not in ["failed", "downloading", "queued"]:
+        raise HTTPException(status_code=400, detail="Chỉ có thể thử lại tác vụ đang lỗi hoặc bị gián đoạn tải xuống.")
+
+    if payload.preferred_quality:
+        job.preferred_quality = payload.preferred_quality
+    job.error_message = None
+
+    import threading
+    if payload.download_only:
+        job.status = "downloading"
+        job.progress = 5
+        job.message = "Đang thử tải lại video từ YouTube..."
+        db.commit()
+        db.refresh(job)
+        VideoDubbingService.log_to_job(job.id, f"Người dùng yêu cầu tải lại video YouTube (chất lượng: {job.preferred_quality or '1080p'}).")
+        t = threading.Thread(target=run_youtube_predownload, args=(job.id,), daemon=True)
+        t.start()
+    else:
+        job.status = "queued"
+        job.progress = 5
+        job.message = "Đang khởi chạy lại quy trình lồng tiếng..."
+        db.commit()
+        db.refresh(job)
+        VideoDubbingService.log_to_job(job.id, f"Người dùng yêu cầu chạy lại pipeline (chất lượng: {job.preferred_quality or '1080p'}).")
+        t = threading.Thread(target=run_dubbing_pipeline, args=(job.id,), daemon=True)
+        t.start()
+
+    return _format_dubbing_job_response(job)
+
+
 @router.post("/upload", response_model=VideoDubbingJobResponse)
 async def upload_dubbing_video(
     file: UploadFile = File(...),
@@ -703,6 +988,7 @@ async def upload_dubbing_video(
         progress=100,
         message="Đã tải lên video gốc, sẵn sàng để lồng tiếng.",
         source_type="upload",
+        video_title=filename,
         target_language="Vietnamese",  # Default to Vietnamese
         input_file_path=input_file_path
     )
@@ -710,7 +996,7 @@ async def upload_dubbing_video(
     db.commit()
     db.refresh(job)
 
-    return job
+    return _format_dubbing_job_response(job)
 
 @router.get("/jobs/{job_id}/log")
 def get_dubbing_log(
@@ -743,6 +1029,10 @@ async def create_dubbing_job(
     uploaded_job_id: Optional[str] = Form(None),
     llm_profile_id: Optional[str] = Form(None),
     oauth_token: Optional[str] = Form(None),
+    preferred_quality: str = Form("1080p"),
+    video_title: Optional[str] = Form(None),
+    video_thumbnail: Optional[str] = Form(None),
+    video_duration: Optional[float] = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key)
 ):
@@ -761,9 +1051,10 @@ async def create_dubbing_job(
             detail="Bạn cần cung cấp video tải lên, link YouTube hoặc ID video đã tải lên trước."
         )
 
+    yt_video_id = None
     if youtube_url:
         try:
-            youtube_url = validate_safe_external_url(youtube_url)
+            yt_video_id, youtube_url = VideoDubbingService.normalize_youtube_url(youtube_url)
         except ValueError as ve:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -781,6 +1072,9 @@ async def create_dubbing_job(
         job.target_language = target_language
         if llm_profile_id:
             job.llm_profile_id = llm_profile_id
+        if preferred_quality:
+            job.preferred_quality = preferred_quality
+        job.error_message = None
         job.status = "queued"
         job.progress = 5
         job.message = "Khởi tạo tác vụ lồng tiếng..."
@@ -794,7 +1088,7 @@ async def create_dubbing_job(
         t = threading.Thread(target=run_dubbing_pipeline, args=(job.id,), daemon=True)
         t.start()
 
-        return job
+        return _format_dubbing_job_response(job)
 
     job_id = f"vd_{uuid.uuid4().hex[:8]}"
     job_dir = ensure_within_directory(settings.dubbing_dir, os.path.join(settings.dubbing_dir, job_id))
@@ -811,6 +1105,10 @@ async def create_dubbing_job(
         input_file_path = ensure_within_directory(job_dir, os.path.join(job_dir, f"input_video{ext}"))
         await save_upload_with_limit(file, input_file_path, max_bytes=MAX_VIDEO_UPLOAD_BYTES)
         VideoDubbingService.log_to_job(job_id, f"Upload video thành công. File lưu tại: {input_file_path}")
+        if not video_title:
+            video_title = filename
+
+    default_thumb = f"https://i.ytimg.com/vi/{yt_video_id}/hqdefault.jpg" if yt_video_id else None
 
     job = VideoDubbingJob(
         id=job_id,
@@ -820,6 +1118,10 @@ async def create_dubbing_job(
         message="Khởi tạo tác vụ lồng tiếng...",
         source_type=source_type,
         source_url=youtube_url,
+        video_title=video_title,
+        video_thumbnail=video_thumbnail or default_thumb,
+        video_duration=video_duration,
+        preferred_quality=preferred_quality or "1080p",
         target_language=target_language,
         llm_profile_id=llm_profile_id,
         input_file_path=input_file_path
@@ -833,46 +1135,7 @@ async def create_dubbing_job(
     t = threading.Thread(target=run_dubbing_pipeline, args=(job_id,), daemon=True)
     t.start()
 
-    return job
-
-def _format_dubbing_job_response(job: VideoDubbingJob) -> VideoDubbingJobResponse:
-    # Parse subtitles JSON into Pydantic models
-    orig_subs = []
-    if job.original_subtitles:
-        try:
-            orig_subs = json.loads(job.original_subtitles)
-        except Exception:
-            pass
-            
-    trans_subs = []
-    if job.translated_subtitles:
-        try:
-            trans_subs = json.loads(job.translated_subtitles)
-        except Exception:
-            pass
-
-    output_video_url = f"/v1/video-dubbing/jobs/{job.id}/output" if job.status == "completed" else None
-
-    return VideoDubbingJobResponse(
-        id=job.id,
-        status=job.status,
-        progress=job.progress,
-        message=job.message,
-        source_type=job.source_type,
-        source_url=job.source_url,
-        target_language=job.target_language,
-        llm_profile_id=getattr(job, "llm_profile_id", None),
-        original_subtitles=orig_subs,
-        translated_subtitles=trans_subs,
-        vocals_audio_path=job.vocals_audio_path,
-        bgm_audio_path=job.bgm_audio_path,
-        vocals_volume=getattr(job, "vocals_volume", 1.0) or 1.0,
-        bgm_volume=getattr(job, "bgm_volume", 0.4) or 0.4,
-        output_video_url=output_video_url,
-        error_message=job.error_message,
-        created_at=job.created_at,
-        updated_at=job.updated_at
-    )
+    return _format_dubbing_job_response(job)
 
 @router.get("/jobs", response_model=VideoDubbingJobListResponse)
 def list_dubbing_jobs(
@@ -1031,7 +1294,7 @@ def delete_dubbing_job(
         
     # Dọn dẹp thư mục lưu trữ cục bộ nếu có
     try:
-        job_dir = os.path.join(settings.STORAGE_DIR, "dubbing", job_id)
+        job_dir = ensure_within_directory(settings.dubbing_dir, os.path.join(settings.dubbing_dir, job_id))
         if os.path.exists(job_dir):
             shutil.rmtree(job_dir, ignore_errors=True)
     except Exception as e:
@@ -1241,26 +1504,7 @@ def re_edit_dubbing_job(
     db.commit()
     db.refresh(job)
     VideoDubbingService.log_to_job(job_id, "Người dùng đã mở lại chế độ biên tập phụ đề và hòa âm (Step 3).")
-    return VideoDubbingJobResponse(
-        id=job.id,
-        status=job.status,
-        progress=job.progress,
-        message=job.message,
-        source_type=job.source_type,
-        source_url=job.source_url,
-        target_language=job.target_language,
-        llm_profile_id=job.llm_profile_id,
-        original_subtitles=json.loads(job.original_subtitles or "[]"),
-        translated_subtitles=json.loads(job.translated_subtitles or "[]"),
-        vocals_audio_path=job.vocals_audio_path,
-        bgm_audio_path=job.bgm_audio_path,
-        vocals_volume=job.vocals_volume,
-        bgm_volume=job.bgm_volume,
-        output_video_url=f"/v1/video-dubbing/jobs/{job.id}/output" if job.output_video_path and os.path.exists(job.output_video_path) else None,
-        error_message=job.error_message,
-        created_at=job.created_at,
-        updated_at=job.updated_at
-    )
+    return _format_dubbing_job_response(job)
 
 @router.post("/jobs/{job_id}/shorten-subtitle", response_model=ShortenSubtitleResponse)
 def shorten_subtitle_segment(
@@ -1401,11 +1645,14 @@ def _resolve_owned_dubbing_asset(
 @router.get("/jobs/{job_id}/video")
 def get_original_video(
     job_id: str,
+    download: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key),
 ):
     """Tải xuống hoặc stream video gốc."""
     safe_path = _resolve_owned_dubbing_asset(job_id, "input_file_path", "Không tìm thấy video gốc.", db, current_user)
+    if download:
+        return FileResponse(safe_path, media_type="video/mp4", filename=f"youtube_{job_id}.mp4", content_disposition_type="attachment")
     return FileResponse(safe_path, media_type="video/mp4", content_disposition_type="inline")
 
 

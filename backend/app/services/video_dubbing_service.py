@@ -5,25 +5,61 @@ import subprocess
 import shutil
 import json
 import re
+import socket
+import tempfile
+import uuid
+import urllib.parse
 import requests
 import soundfile as sf
 import numpy as np
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Callable
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import LLMProfile, SystemSetting
-
-
-
+from app.utils.url_security import validate_safe_external_url
 
 
 _GOOGLE_SCOPES = 'https://gdata.youtube.com https://www.googleapis.com/auth/youtube'
+
+_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+}
+
+_AUTH_COOKIE_KEYS = {
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "SAPISID",
+    "LOGIN_INFO",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "__Secure-1PAPISID",
+    "__Secure-3PAPISID",
+}
+
+_QUALITY_HEIGHT_MAP = {
+    "1080p": 1080,
+    "720p": 720,
+    "480p": 480,
+    "360p": 360,
+}
+
+_YOUTUBE_ID_RE = re.compile(r"^[0-9A-Za-z_-]{11}$")
+_YTDLP_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%(.*)")
+
 
 class VideoDubbingService:
     @staticmethod
     def log_to_job(job_id: str, message: str):
         """Prints a detailed log message to server console and appends to process.log in job directory."""
-        import time
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         log_line = f"[{timestamp}] {message}"
         try:
@@ -33,7 +69,7 @@ class VideoDubbingService:
                 print(f"[VideoDubbing][{job_id}] {message.encode('ascii', 'replace').decode('ascii')}", flush=True)
             except Exception:
                 pass
-        
+
         try:
             job_dir = os.path.join(settings.dubbing_dir, job_id)
             os.makedirs(job_dir, exist_ok=True)
@@ -44,108 +80,256 @@ class VideoDubbingService:
             print(f"[VideoDubbingService] Failed to write log: {e}", flush=True)
 
     @staticmethod
-    def ensure_dependencies():
-        """Dynamically ensures pytubefix, yt-dlp, curl_cffi, and POT provider are installed."""
-        try:
-            import pytubefix
-            import yt_dlp
-        except ImportError:
-            print("[VideoDubbingService] Installing youtube download dependencies...")
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "pytubefix", "curl_cffi", "yt-dlp[default,curl-cffi]", "bgutil-ytdlp-pot-provider"])
-            except Exception:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "-U", "pytubefix", "curl_cffi", "yt-dlp[default,curl-cffi]", "bgutil-ytdlp-pot-provider"])
-
-    @staticmethod
-    def _fetch_visitor_data() -> str:
-        """
-        Fetches fresh YouTube visitorData token using curl_cffi via /youtubei/v1/visitor_id.
-        Bypasses 'Sign in to confirm you are not a bot' error on datacenter IPs (AWS / HF Spaces).
-        """
-        try:
-            from curl_cffi import requests as curl_requests
-            from curl_cffi.curl import CurlOpt
-            payload = {
-                'context': {
-                    'client': {
-                        'clientName': 'WEB',
-                        'clientVersion': '2.20240201.00.00'
-                    }
-                }
-            }
-            r = curl_requests.post('https://www.youtube.com/youtubei/v1/visitor_id', json=payload, impersonate='chrome', timeout=5, verify=False, curl_options={CurlOpt.IPRESOLVE: 1})
-            if r.status_code == 200:
-                vdata = r.json().get('responseContext', {}).get('visitorData', '')
-                if vdata:
-                    return vdata
-        except Exception as e:
-            print(f"[VideoDubbingService] Failed to fetch visitorData via curl_cffi: {e}", flush=True)
-        return ""
-
-    @staticmethod
-    def _generate_visitor_cookies(cookie_file_path: str, video_url: Optional[str] = None) -> bool:
-        """
-        Generates fresh Netscape format YouTube visitor cookies using curl_cffi.
-        Pre-fetches YouTube homepage and target video URL to warm up TLS session & cookies.
-        Bypasses bot detection on datacenter IPs (AWS / Hugging Face Spaces).
-        """
-        try:
-            try:
-                from curl_cffi import requests as curl_requests
-                from curl_cffi.curl import CurlOpt
-                sess = curl_requests.Session(impersonate='chrome', verify=False, curl_options={CurlOpt.IPRESOLVE: 1})
-            except Exception:
-                import requests
-                sess = requests.Session()
-                sess.headers.update({
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                    'Accept-Language': 'en-US,en;q=0.9'
-                })
-            
-            sess.get('https://m.youtube.com', timeout=5, verify=False)
-            
-            os.makedirs(os.path.dirname(cookie_file_path), exist_ok=True)
-            with open(cookie_file_path, 'w', encoding='utf-8') as f:
-                f.write('# Netscape HTTP Cookie File\n')
-                if hasattr(sess.cookies, 'items'):
-                    for name, val in sess.cookies.items():
-                        f.write(f'.youtube.com\tTRUE\t/\tTRUE\t2147483647\t{name}\t{val}\n')
-                else:
-                    for c in sess.cookies:
-                        domain = getattr(c, 'domain', '.youtube.com')
-                        flag = 'TRUE' if domain.startswith('.') else 'FALSE'
-                        path = getattr(c, 'path', '/')
-                        secure = 'TRUE' if getattr(c, 'secure', False) else 'FALSE'
-                        expiry = str(getattr(c, 'expires', None) or 2147483647)
-                        name = c.name
-                        val = c.value
-                        f.write(f'{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{val}\n')
-            return True
-        except Exception as e:
-            print(f"[VideoDubbingService] Failed to generate visitor cookies: {e}", flush=True)
-            return False
-
-    @staticmethod
-    def get_oauth_storage_path() -> str:
-        storage_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage"))
-        os.makedirs(storage_dir, exist_ok=True)
-        return os.path.join(storage_dir, "youtube_oauth.json")
-
-    @staticmethod
-    def get_oauth_cache_dir() -> str:
-        storage_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "yt_dlp_cache"))
+    def _get_storage_dir() -> str:
+        storage_dir = os.path.abspath(settings.STORAGE_DIR)
         os.makedirs(storage_dir, exist_ok=True)
         return storage_dir
 
     @staticmethod
-    def get_oauth_token() -> Optional[dict]:
-        token_path = VideoDubbingService.get_oauth_storage_path()
-        if os.path.exists(token_path):
+    def _get_legacy_storage_dir() -> str:
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage"))
+
+    @staticmethod
+    def _include_legacy_storage() -> bool:
+        return (settings.APP_ENV or "").lower() != "testing"
+
+    @staticmethod
+    def _read_system_setting(key: str) -> Optional[str]:
+        db = None
+        try:
+            from app.database import SessionLocal
+            db = SessionLocal()
+            entry = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+            return entry.value if entry and entry.value else None
+        except Exception:
+            return None
+        finally:
+            if db is not None:
+                db.close()
+
+    @staticmethod
+    def _write_system_setting(key: str, value: Optional[str]) -> None:
+        db = None
+        try:
+            from app.database import SessionLocal
+            db = SessionLocal()
+            entry = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+            if value is None:
+                if entry:
+                    db.delete(entry)
+            elif not entry:
+                db.add(SystemSetting(key=key, value=value))
+            else:
+                entry.value = value
+            db.commit()
+        except Exception:
+            pass
+        finally:
+            if db is not None:
+                db.close()
+
+    @staticmethod
+    def ensure_dependencies():
+        """Dynamically ensures pytubefix, yt-dlp, and curl_cffi are installed."""
+        try:
+            import pytubefix  # noqa: F401
+            import yt_dlp  # noqa: F401
+        except ImportError:
+            print("[VideoDubbingService] Installing youtube download dependencies...")
+            pkgs = ["pytubefix", "curl_cffi", "yt-dlp[default,curl-cffi]"]
             try:
-                with open(token_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if all(k in data for k in ('access_token', 'refresh_token', 'expires')):
-                        return data
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", *pkgs])
+            except Exception:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "-U", *pkgs])
+
+    @staticmethod
+    def normalize_youtube_url(url: str) -> Tuple[str, str]:
+        """Validates a YouTube URL (with SSRF checks) and returns (video_id, canonical_watch_url)."""
+        raw = validate_safe_external_url(url)
+        parsed = urllib.parse.urlparse(raw)
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        if hostname not in _YOUTUBE_HOSTS:
+            raise ValueError("Chỉ hỗ trợ đường dẫn video từ YouTube (youtube.com, youtu.be, YouTube Shorts).")
+
+        video_id: Optional[str] = None
+        path_parts = [p for p in parsed.path.split("/") if p]
+
+        if hostname in {"youtu.be", "www.youtu.be"}:
+            if path_parts:
+                video_id = path_parts[0]
+        else:
+            qs = urllib.parse.parse_qs(parsed.query)
+            v_vals = qs.get("v")
+            if v_vals and v_vals[0]:
+                video_id = v_vals[0].strip()
+            elif len(path_parts) >= 2 and path_parts[0] in {"shorts", "live", "embed", "v"}:
+                video_id = path_parts[1].strip()
+
+        if not video_id or not _YOUTUBE_ID_RE.match(video_id):
+            raise ValueError("Không tìm thấy mã video YouTube hợp lệ trong đường dẫn.")
+
+        return video_id, f"https://www.youtube.com/watch?v={video_id}"
+
+    @staticmethod
+    def _convert_to_netscape_cookies(content: str) -> str:
+        """Converts raw HTTP Cookie header / curl snippet into Netscape HTTP Cookie File format."""
+        if content and "# Netscape" not in content and "\t" not in content:
+            raw = content.strip()
+            cookie_match = re.search(r'(?:[-–]H\s+[\'"][Cc]ookie:\s*|[Cc]ookie:\s*)([^\r\n\'"]+)', raw)
+            if cookie_match:
+                raw = cookie_match.group(1)
+
+            lines = [
+                "# Netscape HTTP Cookie File",
+                "# http://curl.haxx.se/rfc/cookie_spec.html",
+                "# Converted by OmniVoice Gateway",
+            ]
+            count = 0
+            for part in raw.replace("\r", "").replace("\n", " ").split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if k:
+                        lines.append(f".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}")
+                        count += 1
+            if count > 0:
+                return "\n".join(lines) + "\n"
+        return content
+
+    @staticmethod
+    def _parse_cookie_stats(content: str) -> Tuple[int, bool]:
+        """Counts valid Netscape cookie entries and detects authenticated YouTube session cookies."""
+        cookie_count = 0
+        is_authenticated = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookie_count += 1
+                if parts[5].strip() in _AUTH_COOKIE_KEYS and parts[6].strip():
+                    is_authenticated = True
+        return cookie_count, is_authenticated
+
+    @staticmethod
+    def get_cookie_file_path() -> Optional[str]:
+        """Resolves cookies.txt in settings.STORAGE_DIR (or legacy storage / DB backup)."""
+        primary = os.path.join(VideoDubbingService._get_storage_dir(), "cookies.txt")
+        if os.path.exists(primary) and os.path.getsize(primary) > 0:
+            return primary
+
+        if VideoDubbingService._include_legacy_storage():
+            legacy = os.path.join(VideoDubbingService._get_legacy_storage_dir(), "cookies.txt")
+            if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
+                return legacy
+
+        db_cookies = VideoDubbingService._read_system_setting("youtube_cookies_txt")
+        if db_cookies and db_cookies.strip():
+            try:
+                with open(primary, "w", encoding="utf-8") as f:
+                    f.write(db_cookies)
+                return primary
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def inspect_cookie_status() -> Dict[str, Any]:
+        """Returns structured cookie presence, count, and authentication status."""
+        ck = VideoDubbingService.get_cookie_file_path()
+        if not ck or not os.path.exists(ck):
+            return {
+                "has_cookies": False,
+                "is_authenticated": False,
+                "cookie_count": 0,
+                "size_bytes": 0,
+                "modified_at": None,
+            }
+        try:
+            with open(ck, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            cookie_count, is_authenticated = VideoDubbingService._parse_cookie_stats(content)
+            return {
+                "has_cookies": cookie_count > 0 or os.path.getsize(ck) > 0,
+                "is_authenticated": is_authenticated,
+                "cookie_count": cookie_count,
+                "size_bytes": os.path.getsize(ck),
+                "modified_at": os.path.getmtime(ck),
+            }
+        except Exception:
+            return {
+                "has_cookies": False,
+                "is_authenticated": False,
+                "cookie_count": 0,
+                "size_bytes": 0,
+                "modified_at": None,
+            }
+
+    @staticmethod
+    def save_cookies_content(content: str) -> Dict[str, Any]:
+        """Normalizes and persists cookies.txt to settings.STORAGE_DIR and SystemSetting backup."""
+        normalized = VideoDubbingService._convert_to_netscape_cookies(content)
+        target_path = os.path.join(VideoDubbingService._get_storage_dir(), "cookies.txt")
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(normalized)
+        VideoDubbingService._write_system_setting("youtube_cookies_txt", normalized)
+        cookie_count, is_authenticated = VideoDubbingService._parse_cookie_stats(normalized)
+        return {
+            "path": target_path,
+            "size_bytes": len(normalized.encode("utf-8")),
+            "cookie_count": cookie_count,
+            "is_authenticated": is_authenticated,
+        }
+
+    @staticmethod
+    def delete_cookies_all() -> None:
+        """Removes cookies.txt from primary/legacy storage and SystemSetting backup."""
+        candidates = [os.path.join(VideoDubbingService._get_storage_dir(), "cookies.txt")]
+        if VideoDubbingService._include_legacy_storage():
+            candidates.append(os.path.join(VideoDubbingService._get_legacy_storage_dir(), "cookies.txt"))
+        for ck in candidates:
+            if os.path.exists(ck):
+                try:
+                    os.remove(ck)
+                except Exception:
+                    pass
+        VideoDubbingService._write_system_setting("youtube_cookies_txt", None)
+
+    @staticmethod
+    def get_oauth_storage_path() -> str:
+        return os.path.join(VideoDubbingService._get_storage_dir(), "youtube_oauth.json")
+
+    @staticmethod
+    def get_oauth_cache_dir() -> str:
+        cache_dir = os.path.join(VideoDubbingService._get_storage_dir(), "yt_dlp_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    @staticmethod
+    def get_oauth_token() -> Optional[dict]:
+        candidates = [VideoDubbingService.get_oauth_storage_path()]
+        if VideoDubbingService._include_legacy_storage():
+            candidates.append(os.path.join(VideoDubbingService._get_legacy_storage_dir(), "youtube_oauth.json"))
+        for token_path in candidates:
+            if os.path.exists(token_path):
+                try:
+                    with open(token_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if all(k in data for k in ("access_token", "refresh_token", "expires")):
+                            return data
+                except Exception:
+                    pass
+
+        raw_db = VideoDubbingService._read_system_setting("youtube_oauth_token")
+        if raw_db:
+            try:
+                data = json.loads(raw_db)
+                if isinstance(data, dict) and all(k in data for k in ("access_token", "refresh_token", "expires")):
+                    VideoDubbingService.save_oauth_token(data)
+                    return data
             except Exception:
                 pass
         return None
@@ -155,14 +339,15 @@ class VideoDubbingService:
         token_path = VideoDubbingService.get_oauth_storage_path()
         with open(token_path, "w", encoding="utf-8") as f:
             json.dump(token_data, f, indent=2)
+        VideoDubbingService._write_system_setting("youtube_oauth_token", json.dumps(token_data))
         cache_dir = VideoDubbingService.get_oauth_cache_dir()
         try:
             import yt_dlp
             from yt_dlp.cache import Cache
-            for ydl_inst in [yt_dlp.YoutubeDL({'cachedir': cache_dir}), yt_dlp.YoutubeDL()]:
+            for ydl_inst in [yt_dlp.YoutubeDL({"cachedir": cache_dir})]:
                 try:
                     c = Cache(ydl_inst)
-                    c.store('youtube-oauth2', 'token_data', token_data)
+                    c.store("youtube-oauth2", "token_data", token_data)
                 except Exception:
                     pass
         except Exception as e:
@@ -170,20 +355,22 @@ class VideoDubbingService:
 
     @staticmethod
     def delete_oauth_token():
-        token_path = VideoDubbingService.get_oauth_storage_path()
-        if os.path.exists(token_path):
-            try: os.remove(token_path)
-            except Exception: pass
+        candidates = [VideoDubbingService.get_oauth_storage_path()]
+        if VideoDubbingService._include_legacy_storage():
+            candidates.append(os.path.join(VideoDubbingService._get_legacy_storage_dir(), "youtube_oauth.json"))
+        for token_path in candidates:
+            if os.path.exists(token_path):
+                try:
+                    os.remove(token_path)
+                except Exception:
+                    pass
+        VideoDubbingService._write_system_setting("youtube_oauth_token", None)
         cache_dir = VideoDubbingService.get_oauth_cache_dir()
         try:
             import yt_dlp
             from yt_dlp.cache import Cache
-            for ydl_inst in [yt_dlp.YoutubeDL({'cachedir': cache_dir}), yt_dlp.YoutubeDL()]:
-                try:
-                    c = Cache(ydl_inst)
-                    c.remove('youtube-oauth2', 'token_data')
-                except Exception:
-                    pass
+            c = Cache(yt_dlp.YoutubeDL({"cachedir": cache_dir}))
+            c.remove("youtube-oauth2", "token_data")
         except Exception:
             pass
 
@@ -197,6 +384,29 @@ class VideoDubbingService:
     def hash_proxy_url(proxy_url: str) -> str:
         import hashlib
         return hashlib.md5(proxy_url.strip().encode('utf-8')).hexdigest()[:12]
+
+    @staticmethod
+    def _normalize_single_proxy(raw: str) -> str:
+        """Normalizes proxy strings including Webshare's host:port:user:pass format."""
+        p = (raw or "").strip()
+        if not p:
+            return ""
+        if "://" not in p and "@" not in p and "[" not in p:
+            parts = p.split(":", 3)
+            if len(parts) == 4 and parts[0] and parts[1].isdigit() and parts[2]:
+                host, port, user, password = parts
+                u_enc = urllib.parse.quote(user, safe="")
+                p_enc = urllib.parse.quote(password, safe="")
+                return f"http://{u_enc}:{p_enc}@{host}:{port}"
+        if not (
+            p.startswith("http://")
+            or p.startswith("https://")
+            or p.startswith("socks5://")
+            or p.startswith("socks5h://")
+            or p.startswith("socks4://")
+        ):
+            p = f"http://{p}"
+        return p
 
     @staticmethod
     def get_youtube_proxy() -> Optional[str]:
@@ -213,72 +423,62 @@ class VideoDubbingService:
             if val and val.strip():
                 proxies.append(val.strip())
 
-        # 2. File storage storage/youtube_proxies.txt
-        pool_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "youtube_proxies.txt"))
-        if os.path.exists(pool_file):
+        # 2. Primary storage file youtube_proxies.txt
+        primary_pool_file = os.path.join(VideoDubbingService._get_storage_dir(), "youtube_proxies.txt")
+        if os.path.exists(primary_pool_file):
             try:
-                with open(pool_file, "r", encoding="utf-8") as f:
+                with open(primary_pool_file, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith("#"):
                             proxies.append(line)
             except Exception:
                 pass
+        elif VideoDubbingService._include_legacy_storage():
+            legacy_pool_file = os.path.join(VideoDubbingService._get_legacy_storage_dir(), "youtube_proxies.txt")
+            if os.path.exists(legacy_pool_file):
+                try:
+                    with open(legacy_pool_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                proxies.append(line)
+                except Exception:
+                    pass
 
         # 3. DB SystemSetting (youtube_proxy_pool)
-        db = None
-        try:
-            from app.database import SessionLocal
-            from app.models import SystemSetting
-            db = SessionLocal()
-            entry = db.query(SystemSetting).filter(SystemSetting.key == "youtube_proxy_pool").first()
-            if entry and entry.value:
-                parsed = json.loads(entry.value)
+        raw_pool = VideoDubbingService._read_system_setting("youtube_proxy_pool")
+        if raw_pool:
+            try:
+                parsed = json.loads(raw_pool)
                 if isinstance(parsed, list):
                     for item in parsed:
                         if isinstance(item, str) and item.strip():
                             proxies.append(item.strip())
-        except Exception:
-            pass
-        finally:
-            if db is not None:
-                db.close()
-
-        # 4. Fallback legacy storage/youtube_proxy.txt and single DB key
-        legacy_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "youtube_proxy.txt"))
-        if os.path.exists(legacy_file):
-            try:
-                with open(legacy_file, "r", encoding="utf-8") as f:
-                    val = f.read().strip()
-                    if val and not val.startswith("#"):
-                        proxies.append(val)
             except Exception:
                 pass
 
-        db = None
-        try:
-            from app.database import SessionLocal
-            from app.models import SystemSetting
-            db = SessionLocal()
-            legacy_entry = db.query(SystemSetting).filter(SystemSetting.key == "youtube_proxy").first()
-            if legacy_entry and legacy_entry.value and legacy_entry.value.strip():
-                proxies.append(legacy_entry.value.strip())
-        except Exception:
-            pass
-        finally:
-            if db is not None:
-                db.close()
+        # 4. Legacy single-proxy fallback (only when primary pool file absent)
+        if not os.path.exists(primary_pool_file) and VideoDubbingService._include_legacy_storage():
+            legacy_file = os.path.join(VideoDubbingService._get_legacy_storage_dir(), "youtube_proxy.txt")
+            if os.path.exists(legacy_file):
+                try:
+                    with open(legacy_file, "r", encoding="utf-8") as f:
+                        val = f.read().strip()
+                        if val and not val.startswith("#"):
+                            proxies.append(val)
+                except Exception:
+                    pass
+            legacy_single = VideoDubbingService._read_system_setting("youtube_proxy")
+            if legacy_single and legacy_single.strip():
+                proxies.append(legacy_single.strip())
 
         # Normalize format and deduplicate preserving order
         seen = set()
         clean_proxies: List[str] = []
-        for p in proxies:
-            p = p.strip()
-            if not p:
-                continue
-            if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://") or p.startswith("socks5h://")):
-                p = f"http://{p}"
-            if p not in seen:
+        for raw_p in proxies:
+            p = VideoDubbingService._normalize_single_proxy(raw_p)
+            if p and p not in seen:
                 seen.add(p)
                 clean_proxies.append(p)
 
@@ -288,41 +488,43 @@ class VideoDubbingService:
     def save_youtube_proxy_pool(proxies: List[str]):
         seen = set()
         clean: List[str] = []
-        for p in proxies:
-            p = p.strip()
-            if not p:
-                continue
-            if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://") or p.startswith("socks5h://")):
-                p = f"http://{p}"
-            if p not in seen:
+        for raw_p in proxies:
+            p = VideoDubbingService._normalize_single_proxy(raw_p)
+            if p and p not in seen:
                 seen.add(p)
                 clean.append(p)
 
-        # 1. Save to storage/youtube_proxies.txt
-        pool_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "youtube_proxies.txt"))
-        os.makedirs(os.path.dirname(pool_file), exist_ok=True)
+        # 1. Save to primary storage/youtube_proxies.txt
+        pool_file = os.path.join(VideoDubbingService._get_storage_dir(), "youtube_proxies.txt")
         with open(pool_file, "w", encoding="utf-8") as f:
             f.write("\n".join(clean))
+
+        # Remove stale legacy files if different from primary so deleted proxies cannot reappear
+        if VideoDubbingService._include_legacy_storage():
+            legacy_dir = VideoDubbingService._get_legacy_storage_dir()
+            for fname in ("youtube_proxy.txt", "youtube_proxies.txt"):
+                candidate = os.path.join(legacy_dir, fname)
+                if os.path.abspath(candidate) != os.path.abspath(pool_file) and os.path.exists(candidate):
+                    try:
+                        os.remove(candidate)
+                    except Exception:
+                        pass
 
         # 2. Save to DB SystemSetting
         db = None
         try:
             from app.database import SessionLocal
-            from app.models import SystemSetting
             db = SessionLocal()
             entry = db.query(SystemSetting).filter(SystemSetting.key == "youtube_proxy_pool").first()
             if not entry:
-                entry = SystemSetting(key="youtube_proxy_pool", value=json.dumps(clean))
-                db.add(entry)
+                db.add(SystemSetting(key="youtube_proxy_pool", value=json.dumps(clean)))
             else:
                 entry.value = json.dumps(clean)
 
-            # Sync legacy youtube_proxy key with primary proxy
             single_entry = db.query(SystemSetting).filter(SystemSetting.key == "youtube_proxy").first()
             first_val = clean[0] if clean else ""
             if not single_entry:
-                single_entry = SystemSetting(key="youtube_proxy", value=first_val)
-                db.add(single_entry)
+                db.add(SystemSetting(key="youtube_proxy", value=first_val))
             else:
                 single_entry.value = first_val
 
@@ -335,8 +537,7 @@ class VideoDubbingService:
 
     @staticmethod
     def save_youtube_proxy(proxy_url: str):
-        # Backward compatibility: saves single proxy by adding/replacing primary in pool
-        p = proxy_url.strip()
+        p = VideoDubbingService._normalize_single_proxy(proxy_url)
         if not p:
             VideoDubbingService.delete_youtube_proxy()
             return
@@ -348,13 +549,12 @@ class VideoDubbingService:
     @staticmethod
     def add_to_proxy_pool(raw_text: str) -> List[Dict[str, Any]]:
         current = VideoDubbingService.get_youtube_proxies()
-        # Parse newline or comma separated
         new_items = []
         for line in raw_text.replace(",", "\n").splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
                 new_items.append(line)
-        
+
         combined = current + new_items
         VideoDubbingService.save_youtube_proxy_pool(combined)
         return VideoDubbingService.get_proxy_pool_info()
@@ -376,7 +576,6 @@ class VideoDubbingService:
 
     @staticmethod
     def get_proxy_pool_info() -> List[Dict[str, Any]]:
-        import urllib.parse
         proxies = VideoDubbingService.get_youtube_proxies()
         results = []
         for p in proxies:
@@ -402,16 +601,13 @@ class VideoDubbingService:
 
     @staticmethod
     def test_single_proxy(proxy_url: str, timeout: int = 8) -> Dict[str, Any]:
-        import time, requests as py_requests
-        p = proxy_url.strip()
-        if not (p.startswith("http://") or p.startswith("https://") or p.startswith("socks5://") or p.startswith("socks5h://")):
-            p = f"http://{p}"
+        p = VideoDubbingService._normalize_single_proxy(proxy_url)
         h = VideoDubbingService.hash_proxy_url(p)
         masked = VideoDubbingService.mask_proxy_url(p)
         t0 = time.perf_counter()
         try:
             proxies = {"http": p, "https": p}
-            r = py_requests.get("https://ipinfo.io/json", proxies=proxies, timeout=timeout)
+            r = requests.get("https://ipinfo.io/json", proxies=proxies, timeout=timeout)
             latency_ms = int((time.perf_counter() - t0) * 1000)
             if r.status_code == 200:
                 data = r.json()
@@ -426,14 +622,13 @@ class VideoDubbingService:
                     "org": data.get("org"),
                     "message": f"Online ({latency_ms}ms) - IP: {data.get('ip')} [{data.get('country', 'N/A')}]"
                 }
-            else:
-                return {
-                    "hash": h,
-                    "masked": masked,
-                    "status": "offline",
-                    "latency_ms": latency_ms,
-                    "message": f"HTTP {r.status_code}: {r.text[:80]}"
-                }
+            return {
+                "hash": h,
+                "masked": masked,
+                "status": "offline",
+                "latency_ms": latency_ms,
+                "message": f"HTTP {r.status_code}: {r.text[:80]}"
+            }
         except Exception as e:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             err_str = str(e)
@@ -450,8 +645,33 @@ class VideoDubbingService:
                 "latency_ms": latency_ms,
                 "message": err_clean
             }
+
+    @staticmethod
+    def _get_youtube_oauth_client() -> Tuple[str, str, str, bool]:
+        """Returns (client_id, client_secret, scopes, use_yt_tv_endpoints)."""
+        yt_id = (settings.YOUTUBE_OAUTH_CLIENT_ID or "").strip()
+        yt_secret = (settings.YOUTUBE_OAUTH_CLIENT_SECRET or "").strip()
+        if yt_id and yt_secret:
+            return yt_id, yt_secret, _GOOGLE_SCOPES, False
+
+        try:
+            from yt_dlp_plugins.extractor import youtubeoauth as yt_oauth_plugin
+            cid = getattr(yt_oauth_plugin, "_CLIENT_ID", "")
+            csec = getattr(yt_oauth_plugin, "_CLIENT_SECRET", "")
+            cscope = getattr(yt_oauth_plugin, "_SCOPES", _GOOGLE_SCOPES)
+            if cid and csec:
+                return cid, csec, cscope, True
         except Exception:
             pass
+
+        g_id = (settings.GOOGLE_CLIENT_ID or "").strip()
+        g_secret = (settings.GOOGLE_CLIENT_SECRET or "").strip()
+        if g_id and g_secret:
+            return g_id, g_secret, _GOOGLE_SCOPES, False
+
+        raise ValueError(
+            "Chưa cấu hình YouTube OAuth client trên máy chủ. Bạn có thể dùng tab 'Proxy Dân Cư' hoặc 'Dán Cookies.txt'."
+        )
 
     @staticmethod
     def refresh_oauth_token_if_needed() -> Optional[dict]:
@@ -464,18 +684,30 @@ class VideoDubbingService:
         refresh_token = token_data.get('refresh_token')
         if not refresh_token:
             return None
-        client_id = (settings.GOOGLE_CLIENT_ID or "").strip()
-        client_secret = (settings.GOOGLE_CLIENT_SECRET or "").strip()
-        if not client_id or not client_secret:
-            return None
         try:
-            import requests as py_requests
-            r = py_requests.post('https://oauth2.googleapis.com/token', data={
-                'client_id': client_id,
-                'client_secret': client_secret,
-                'refresh_token': refresh_token,
-                'grant_type': 'refresh_token'
-            }, timeout=10)
+            client_id, client_secret, _, use_yt_tv = VideoDubbingService._get_youtube_oauth_client()
+            if use_yt_tv:
+                r = requests.post(
+                    "https://www.youtube.com/o/oauth2/token",
+                    json={
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "refresh_token": refresh_token,
+                        "grant_type": "refresh_token",
+                    },
+                    timeout=10,
+                )
+            else:
+                r = requests.post(
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "refresh_token": refresh_token,
+                        "grant_type": "refresh_token",
+                    },
+                    timeout=10,
+                )
             res = r.json()
             if 'access_token' in res:
                 token_data['access_token'] = res['access_token']
@@ -490,29 +722,60 @@ class VideoDubbingService:
 
     @staticmethod
     def start_oauth_device_flow() -> dict:
-        import requests as py_requests
-        client_id = (settings.GOOGLE_CLIENT_ID or "").strip()
-        if not client_id:
-            raise ValueError("Chưa cấu hình GOOGLE_CLIENT_ID trên máy chủ.")
-        r = py_requests.post('https://oauth2.googleapis.com/device/code', data={
-            'client_id': client_id,
-            'scope': _GOOGLE_SCOPES
-        }, timeout=10)
-        return r.json()
+        client_id, _, scopes, use_yt_tv = VideoDubbingService._get_youtube_oauth_client()
+        if use_yt_tv:
+            r = requests.post(
+                "https://www.youtube.com/o/oauth2/device/code",
+                json={
+                    "client_id": client_id,
+                    "scope": scopes,
+                    "device_id": uuid.uuid4().hex,
+                    "device_model": "ytlr::",
+                },
+                timeout=10,
+            )
+        else:
+            r = requests.post(
+                "https://oauth2.googleapis.com/device/code",
+                data={"client_id": client_id, "scope": scopes},
+                timeout=10,
+            )
+
+        res = r.json() if r.content else {}
+        verification_url = res.get("verification_url") or res.get("verification_uri")
+        if not res.get("user_code") or not res.get("device_code") or not verification_url:
+            err_msg = res.get("error_description") or res.get("error") or f"HTTP {r.status_code}"
+            raise ValueError(
+                f"Không thể khởi tạo phiên đăng nhập Google/YouTube ({err_msg}). Bạn có thể dùng tab 'Cookies.txt' hoặc 'Proxy Dân Cư'."
+            )
+        res["verification_url"] = verification_url
+        return res
 
     @staticmethod
     def poll_oauth_device_flow(device_code: str) -> dict:
-        import requests as py_requests
-        client_id = (settings.GOOGLE_CLIENT_ID or "").strip()
-        client_secret = (settings.GOOGLE_CLIENT_SECRET or "").strip()
-        if not client_id or not client_secret:
-            raise ValueError("Chưa cấu hình GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET trên máy chủ.")
-        r = py_requests.post('https://oauth2.googleapis.com/token', data={
-            'client_id': client_id,
-            'client_secret': client_secret,
-            'device_code': device_code,
-            'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
-        }, timeout=10)
+        client_id, client_secret, _, use_yt_tv = VideoDubbingService._get_youtube_oauth_client()
+        if use_yt_tv:
+            r = requests.post(
+                "https://www.youtube.com/o/oauth2/token",
+                json={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+                timeout=10,
+            )
+        else:
+            r = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+                timeout=10,
+            )
         res = r.json()
         if 'access_token' in res:
             token_data = {
@@ -533,238 +796,703 @@ class VideoDubbingService:
             return {'status': 'error', 'error': res.get('error_description') or res.get('error', 'Lỗi xác thực')}
 
     @staticmethod
-    def download_youtube_video(url: str, output_dir: str, log_file: Optional[str] = None) -> Tuple[str, str]:
+    def _detect_js_runtimes() -> Tuple[str, Dict[str, Dict[str, Optional[str]]]]:
+        """Detects Deno / Node.js runtimes for yt-dlp JavaScript challenge extraction."""
+        cli_names: List[str] = []
+        ydl_dict: Dict[str, Dict[str, Optional[str]]] = {}
+
+        deno_path = shutil.which("deno")
+        if not deno_path:
+            home_deno = os.path.join(os.path.expanduser("~"), ".deno", "bin", "deno.exe" if os.name == "nt" else "deno")
+            if os.path.exists(home_deno):
+                deno_path = home_deno
+        if deno_path:
+            cli_names.append("deno")
+            ydl_dict["deno"] = {"path": deno_path}
+
+        node_path = shutil.which("node")
+        if node_path:
+            cli_names.append("node")
+            ydl_dict["node"] = {"path": node_path}
+
+        return ",".join(cli_names), ydl_dict
+
+    @staticmethod
+    def _should_disable_pot_ping() -> bool:
+        """Returns True when local bgutil POT HTTP server (127.0.0.1:4416) is unreachable."""
+        try:
+            with socket.create_connection(("127.0.0.1", 4416), timeout=0.15):
+                return False
+        except OSError:
+            return True
+
+    @staticmethod
+    def _build_format_selector(preferred_quality: str = "1080p") -> str:
+        max_h = _QUALITY_HEIGHT_MAP.get((preferred_quality or "1080p").strip().lower(), 1080)
+        return (
+            f"bestvideo[height<={max_h}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={max_h}]+bestaudio/"
+            f"best[height<={max_h}][ext=mp4]/best[height<={max_h}]/18/best"
+        )
+
+    @staticmethod
+    def _cleanup_download_artifacts(output_dir: str) -> None:
+        if not os.path.exists(output_dir):
+            return
+        for fname in os.listdir(output_dir):
+            if fname.startswith("input_video") or fname.startswith("ptf_"):
+                try:
+                    os.remove(os.path.join(output_dir, fname))
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _probe_media_streams(file_path: str) -> Dict[str, bool]:
+        """Probes downloaded media with ffprobe to verify video/audio stream presence."""
+        if not shutil.which("ffprobe"):
+            return {"probed": False, "has_audio": True, "has_video": True}
+        try:
+            res = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", file_path],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            types = {line.strip().lower() for line in res.stdout.splitlines() if line.strip()}
+            return {"probed": True, "has_audio": "audio" in types, "has_video": "video" in types}
+        except Exception:
+            return {"probed": False, "has_audio": True, "has_video": True}
+
+    @staticmethod
+    def _finalize_downloaded_media(output_dir: str) -> str:
+        """Normalizes downloaded candidate into input_video.mp4 and verifies it contains audio."""
+        mp4_target = os.path.join(output_dir, "input_video.mp4")
+        candidate = None
+        for ext in [".mp4", ".mkv", ".webm", ".mov", ".m4a"]:
+            p = os.path.join(output_dir, f"input_video{ext}")
+            if os.path.exists(p) and os.path.getsize(p) > 1024:
+                candidate = p
+                break
+
+        if not candidate:
+            raise RuntimeError("Không tìm thấy tệp video hợp lệ sau khi tải xuống.")
+
+        if candidate != mp4_target:
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", candidate, "-c", "copy", mp4_target],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=120,
+                )
+            except Exception:
+                shutil.move(candidate, mp4_target)
+            else:
+                try:
+                    os.remove(candidate)
+                except Exception:
+                    pass
+
+        if not os.path.exists(mp4_target) or os.path.getsize(mp4_target) <= 1024:
+            raise RuntimeError("Tệp video sau khi đóng gói MP4 bị rỗng hoặc lỗi.")
+
+        probe = VideoDubbingService._probe_media_streams(mp4_target)
+        if probe["probed"] and not probe["has_audio"]:
+            raise RuntimeError("Video tải về không có kênh âm thanh để lồng tiếng.")
+
+        return mp4_target
+
+    @staticmethod
+    def get_youtube_video_info(url: str, allow_remote_bridge: bool = True) -> Dict[str, Any]:
+        """Fetches YouTube video metadata (title, channel, duration, thumbnail, available qualities)."""
+        VideoDubbingService.ensure_dependencies()
+        video_id, canonical_url = VideoDubbingService.normalize_youtube_url(url)
+
+        if allow_remote_bridge:
+            try:
+                from app.services.r2_bridge_client import RemoteYouTubeBridgeClient
+                if RemoteYouTubeBridgeClient.is_enabled():
+                    return RemoteYouTubeBridgeClient.fetch_video_info(canonical_url, video_id)
+            except Exception as bridge_err:
+                print(f"[VideoDubbingService] Remote bridge info fallback: {bridge_err}", flush=True)
+
+        cookie_info = VideoDubbingService.inspect_cookie_status()
+        cookie_path = VideoDubbingService.get_cookie_file_path()
+        work_cookie_path = None
+        if cookie_info.get("is_authenticated") and cookie_path and os.path.exists(cookie_path):
+            try:
+                fd, work_cookie_path = tempfile.mkstemp(prefix="ytinfo_ck_", suffix=".txt")
+                os.close(fd)
+                shutil.copy2(cookie_path, work_cookie_path)
+            except Exception:
+                work_cookie_path = None
+
+        proxy_pool = VideoDubbingService.get_youtube_proxies()
+        primary_proxy = proxy_pool[0] if proxy_pool else None
+        oauth_token = VideoDubbingService.refresh_oauth_token_if_needed()
+
+        try:
+            # 1. Primary: in-process yt_dlp skip_download
+            try:
+                import yt_dlp
+                _, js_dict = VideoDubbingService._detect_js_runtimes()
+                ydl_opts: Dict[str, Any] = {
+                    "skip_download": True,
+                    "noplaylist": True,
+                    "socket_timeout": 12,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "nocheckcertificate": True,
+                }
+                if js_dict:
+                    ydl_opts["js_runtimes"] = js_dict
+                yt_info_ext_args: Dict[str, Any] = {}
+                if VideoDubbingService._should_disable_pot_ping():
+                    yt_info_ext_args["fetch_pot"] = ["never"]
+                if not work_cookie_path and not oauth_token:
+                    yt_info_ext_args["player_client"] = ["web_embedded", "tv_simply", "mweb", "android"]
+                if yt_info_ext_args:
+                    ydl_opts["extractor_args"] = {"youtube": yt_info_ext_args}
+                if primary_proxy:
+                    ydl_opts["proxy"] = primary_proxy
+                if work_cookie_path:
+                    ydl_opts["cookiefile"] = work_cookie_path
+                elif oauth_token:
+                    ydl_opts["username"] = "oauth2"
+                    ydl_opts["password"] = ""
+                    ydl_opts["cachedir"] = VideoDubbingService.get_oauth_cache_dir()
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(canonical_url, download=False)
+                if info:
+                    heights = {
+                        int(f["height"])
+                        for f in (info.get("formats") or [])
+                        if f.get("height") and f.get("vcodec") not in (None, "none")
+                    }
+                    max_h = max(heights) if heights else 0
+                    avail = [q for q, h in _QUALITY_HEIGHT_MAP.items() if max_h == 0 or max_h >= h]
+                    if not avail:
+                        avail = ["360p"]
+                    return {
+                        "video_id": video_id,
+                        "canonical_url": canonical_url,
+                        "title": info.get("title") or f"YouTube Video ({video_id})",
+                        "channel": info.get("channel") or info.get("uploader"),
+                        "duration": float(info["duration"]) if info.get("duration") is not None else None,
+                        "thumbnail_url": info.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                        "available_qualities": avail,
+                        "is_live": bool(info.get("is_live")),
+                    }
+            except Exception as e:
+                print(f"[VideoDubbingService] yt_dlp info extraction fallback: {e}", flush=True)
+
+            # 2. Fallback 1: pytubefix ANDROID_VR
+            try:
+                from pytubefix import YouTube
+                proxies_ptf = {"http": primary_proxy, "https": primary_proxy} if primary_proxy else None
+                yt = YouTube(canonical_url, client="ANDROID_VR", proxies=proxies_ptf)
+                title = yt.title or f"YouTube Video ({video_id})"
+                heights = set()
+                for s in yt.streams.filter(file_extension="mp4"):
+                    if getattr(s, "resolution", None) and s.resolution.endswith("p"):
+                        try:
+                            heights.add(int(s.resolution[:-1]))
+                        except ValueError:
+                            pass
+                max_h = max(heights) if heights else 0
+                avail = [q for q, h in _QUALITY_HEIGHT_MAP.items() if max_h == 0 or max_h >= h] or ["360p"]
+                return {
+                    "video_id": video_id,
+                    "canonical_url": canonical_url,
+                    "title": title,
+                    "channel": getattr(yt, "author", None),
+                    "duration": float(yt.length) if getattr(yt, "length", None) else None,
+                    "thumbnail_url": getattr(yt, "thumbnail_url", None) or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                    "available_qualities": avail,
+                    "is_live": False,
+                }
+            except Exception as e:
+                print(f"[VideoDubbingService] pytubefix info extraction fallback: {e}", flush=True)
+
+            # 3. Fallback 2: YouTube public oEmbed API
+            proxies_req = {"http": primary_proxy, "https": primary_proxy} if primary_proxy else None
+            oembed_url = f"https://www.youtube.com/oembed?url={urllib.parse.quote(canonical_url, safe='')}&format=json"
+            res = requests.get(oembed_url, proxies=proxies_req, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                return {
+                    "video_id": video_id,
+                    "canonical_url": canonical_url,
+                    "title": data.get("title") or f"YouTube Video ({video_id})",
+                    "channel": data.get("author_name"),
+                    "duration": None,
+                    "thumbnail_url": data.get("thumbnail_url") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                    "available_qualities": ["1080p", "720p", "480p", "360p"],
+                    "is_live": False,
+                }
+
+            raise RuntimeError(f"Không thể lấy thông tin video từ YouTube (HTTP {res.status_code}).")
+        finally:
+            if work_cookie_path and os.path.exists(work_cookie_path):
+                try:
+                    os.remove(work_cookie_path)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _build_yt_dlp_progress_hook(
+        progress_callback: Optional[Callable[[float, str], None]],
+    ) -> Callable[[Dict[str, Any]], None]:
+        def _hook(d: Dict[str, Any]):
+            if not progress_callback:
+                return
+            status = d.get("status")
+            if status == "downloading":
+                downloaded = float(d.get("downloaded_bytes") or 0)
+                total = float(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+                pct = min(99.0, max(0.0, (downloaded / total) * 100.0)) if total > 0 else 0.0
+                if total <= 0:
+                    m = re.search(r"(\d+(?:\.\d+)?)%", str(d.get("_percent_str") or ""))
+                    if m:
+                        pct = min(99.0, float(m.group(1)))
+                dl_mb = downloaded / (1024 * 1024)
+                tot_mb = total / (1024 * 1024)
+                speed = d.get("speed")
+                eta = d.get("eta")
+                parts = [f"{pct:.0f}%"]
+                if tot_mb > 0:
+                    parts.append(f"{dl_mb:.1f}/{tot_mb:.1f} MB")
+                elif dl_mb > 0:
+                    parts.append(f"{dl_mb:.1f} MB")
+                if speed:
+                    parts.append(f"{float(speed) / (1024 * 1024):.1f} MB/s")
+                if eta is not None:
+                    parts.append(f"ETA {int(eta)}s")
+                progress_callback(pct, f"Đang tải video YouTube ({' • '.join(parts)})...")
+            elif status == "finished":
+                progress_callback(95.0, "Đã tải xong dữ liệu, đang ghép âm thanh & hình ảnh MP4...")
+
+        return _hook
+
+    @staticmethod
+    def _download_via_ytdlp_python(
+        canonical_url: str,
+        output_dir: str,
+        fmt_selector: str,
+        proxy_url: Optional[str],
+        work_cookie_path: Optional[str],
+        has_oauth: bool,
+        cache_dir: str,
+        js_dict: Dict[str, Dict[str, Optional[str]]],
+        disable_pot: bool,
+        progress_callback: Optional[Callable[[float, str], None]],
+        metadata_out: Optional[Dict[str, Any]],
+        log_fn: Callable[[str], None],
+    ) -> Tuple[str, str]:
+        import yt_dlp
+        VideoDubbingService._cleanup_download_artifacts(output_dir)
+        ydl_opts: Dict[str, Any] = {
+            "format": fmt_selector,
+            "merge_output_format": "mp4",
+            "outtmpl": os.path.join(output_dir, "input_video.%(ext)s"),
+            "noplaylist": True,
+            "concurrent_fragment_downloads": 4,
+            "socket_timeout": 30,
+            "extractor_retries": 3,
+            "retries": 3,
+            "fragment_retries": 3,
+            "nocheckcertificate": True,
+            "quiet": True,
+            "no_warnings": True,
+            "progress_hooks": [VideoDubbingService._build_yt_dlp_progress_hook(progress_callback)],
+        }
+        if js_dict:
+            ydl_opts["js_runtimes"] = js_dict
+        yt_ext_args: Dict[str, Any] = {}
+        if disable_pot:
+            yt_ext_args["fetch_pot"] = ["never"]
+        if not work_cookie_path and not has_oauth:
+            yt_ext_args["player_client"] = ["web_embedded", "tv_simply", "mweb", "android"]
+        if yt_ext_args:
+            ydl_opts["extractor_args"] = {"youtube": yt_ext_args}
+        if proxy_url:
+            ydl_opts["proxy"] = proxy_url
+        if work_cookie_path:
+            ydl_opts["cookiefile"] = work_cookie_path
+        elif has_oauth:
+            ydl_opts["username"] = "oauth2"
+            ydl_opts["password"] = ""
+            ydl_opts["cachedir"] = cache_dir
+
+        t0 = time.time()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(canonical_url, download=True)
+
+        title = (info.get("title") if info else None) or "YouTube Video"
+        if metadata_out is not None and info:
+            metadata_out.update({
+                "title": title,
+                "duration": float(info["duration"]) if info.get("duration") is not None else None,
+                "thumbnail": info.get("thumbnail"),
+                "channel": info.get("channel") or info.get("uploader"),
+            })
+        if progress_callback:
+            progress_callback(100.0, "Đã tải xuống và kiểm tra MP4 thành công.")
+        final_path = VideoDubbingService._finalize_downloaded_media(output_dir)
+        log_fn(f"Engine 1 (yt-dlp Python) thành công: '{title}' ({os.path.getsize(final_path)} bytes trong {time.time() - t0:.2f}s)")
+        return final_path, title
+
+    @staticmethod
+    def _download_via_ytdlp_subprocess(
+        canonical_url: str,
+        output_dir: str,
+        fmt_selector: str,
+        proxy_url: Optional[str],
+        work_cookie_path: Optional[str],
+        is_authenticated_cookies: bool,
+        has_oauth: bool,
+        cache_dir: str,
+        js_cli: str,
+        disable_pot: bool,
+        progress_callback: Optional[Callable[[float, str], None]],
+        metadata_out: Optional[Dict[str, Any]],
+        log_fn: Callable[[str], None],
+    ) -> Tuple[str, str]:
+        VideoDubbingService._cleanup_download_artifacts(output_dir)
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "--no-warnings",
+            "--no-update",
+            "--no-playlist",
+            "--no-check-certificate",
+            "--newline",
+            "--progress",
+            "--concurrent-fragments", "4",
+            "-f", fmt_selector,
+            "--merge-output-format", "mp4",
+            "-o", os.path.join(output_dir, "input_video.%(ext)s"),
+            "--socket-timeout", "40",
+            "--print", "after_video:TITLE:%(title)s",
+        ]
+        if js_cli:
+            cmd.extend(["--js-runtimes", js_cli])
+        if proxy_url:
+            cmd.extend(["--proxy", proxy_url])
+
+        if work_cookie_path and is_authenticated_cookies:
+            cmd.extend(["--cookies", work_cookie_path])
+            if disable_pot:
+                cmd.extend(["--extractor-args", "youtube:fetch_pot=never"])
+        elif has_oauth:
+            cmd.extend(["--cache-dir", cache_dir, "--username", "oauth2", "--password", ""])
+            if disable_pot:
+                cmd.extend(["--extractor-args", "youtube:fetch_pot=never"])
+        else:
+            ext_arg = "youtube:player_client=web_embedded,tv_simply,mweb,android"
+            if disable_pot:
+                ext_arg += ";fetch_pot=never"
+            cmd.extend(["--extractor-args", ext_arg])
+
+        cmd.append(canonical_url)
+
+        t0 = time.time()
+        deadline = t0 + 180
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
+        )
+        title = "YouTube Video"
+        tail_lines: List[str] = []
+        try:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                if time.time() > deadline:
+                    proc.kill()
+                    raise TimeoutError("Subprocess yt-dlp vượt quá 180 giây.")
+                line = raw_line.strip()
+                if not line:
+                    continue
+                tail_lines.append(line)
+                if len(tail_lines) > 25:
+                    tail_lines.pop(0)
+                if line.startswith("TITLE:"):
+                    title = line[6:].strip() or title
+                elif progress_callback:
+                    m = _YTDLP_PROGRESS_RE.search(line)
+                    if m:
+                        pct = min(99.0, float(m.group(1)))
+                        progress_callback(pct, f"Đang tải video YouTube ({pct:.0f}%)...")
+            rc = proc.wait(timeout=max(5, int(deadline - time.time())))
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise
+
+        if rc != 0:
+            raise RuntimeError(f"rc={rc}: {' | '.join(tail_lines[-4:])}")
+
+        if metadata_out is not None:
+            metadata_out.setdefault("title", title)
+        if progress_callback:
+            progress_callback(100.0, "Đã tải xuống và kiểm tra MP4 thành công.")
+        final_path = VideoDubbingService._finalize_downloaded_media(output_dir)
+        log_fn(f"Engine 2 (yt-dlp CLI) thành công: '{title}' ({os.path.getsize(final_path)} bytes trong {time.time() - t0:.2f}s)")
+        return final_path, title
+
+    @staticmethod
+    def _download_via_pytubefix(
+        canonical_url: str,
+        output_dir: str,
+        preferred_quality: str,
+        proxy_url: Optional[str],
+        progress_callback: Optional[Callable[[float, str], None]],
+        metadata_out: Optional[Dict[str, Any]],
+        log_fn: Callable[[str], None],
+    ) -> Tuple[str, str]:
+        from pytubefix import YouTube
+        max_h = _QUALITY_HEIGHT_MAP.get((preferred_quality or "1080p").strip().lower(), 1080)
+        proxies_ptf = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        last_err = None
+
+        for client_name in ["ANDROID_VR", "WEB", "ANDROID"]:
+            try:
+                VideoDubbingService._cleanup_download_artifacts(output_dir)
+                log_fn(f"Engine 3 (pytubefix {client_name}) đang tải...")
+
+                def _on_ptf_progress(stream, chunk, bytes_remaining):
+                    if not progress_callback or not getattr(stream, "filesize", 0):
+                        return
+                    pct = min(95.0, max(0.0, ((stream.filesize - bytes_remaining) / stream.filesize) * 100.0))
+                    progress_callback(pct, f"Đang tải video YouTube ({pct:.0f}%)...")
+
+                yt = YouTube(canonical_url, client=client_name, proxies=proxies_ptf, on_progress_callback=_on_ptf_progress)
+                title = yt.title or "YouTube Video"
+                if metadata_out is not None:
+                    metadata_out.update({
+                        "title": title,
+                        "duration": float(yt.length) if getattr(yt, "length", None) else None,
+                        "thumbnail": getattr(yt, "thumbnail_url", None),
+                        "channel": getattr(yt, "author", None),
+                    })
+
+                v_candidates = yt.streams.filter(only_video=True, file_extension="mp4")
+                eligible = []
+                for s in v_candidates:
+                    res_str = getattr(s, "resolution", "") or ""
+                    if res_str.endswith("p"):
+                        try:
+                            h = int(res_str[:-1])
+                            if h <= max_h:
+                                eligible.append((h, s))
+                        except ValueError:
+                            pass
+                eligible.sort(key=lambda item: item[0], reverse=True)
+                v_stream = eligible[0][1] if eligible else v_candidates.order_by("resolution").desc().first()
+                a_stream = yt.streams.filter(only_audio=True, file_extension="mp4").order_by("abr").desc().first()
+
+                target_path = os.path.join(output_dir, "input_video.mp4")
+                if v_stream and a_stream:
+                    v_stream.download(output_path=output_dir, filename="ptf_v.mp4", timeout=180)
+                    a_stream.download(output_path=output_dir, filename="ptf_a.mp4", timeout=180)
+                    v_temp = os.path.join(output_dir, "ptf_v.mp4")
+                    a_temp = os.path.join(output_dir, "ptf_a.mp4")
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", v_temp, "-i", a_temp, "-c", "copy", target_path],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    for tmp_p in (v_temp, a_temp):
+                        if os.path.exists(tmp_p):
+                            try:
+                                os.remove(tmp_p)
+                            except Exception:
+                                pass
+                else:
+                    prog_stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
+                    if not prog_stream:
+                        raise RuntimeError("Không tìm thấy luồng MP4 khả dụng từ pytubefix.")
+                    prog_stream.download(output_path=output_dir, filename="input_video.mp4", timeout=180)
+
+                if progress_callback:
+                    progress_callback(100.0, "Đã tải xuống và kiểm tra MP4 thành công.")
+                final_path = VideoDubbingService._finalize_downloaded_media(output_dir)
+                log_fn(f"Engine 3 (pytubefix {client_name}) thành công: '{title}' ({os.path.getsize(final_path)} bytes)")
+                return final_path, title
+            except Exception as exc:
+                last_err = str(exc)
+                log_fn(f"Engine 3 (pytubefix {client_name}) thất bại: {exc}")
+
+        raise RuntimeError(last_err or "pytubefix thất bại")
+
+    @staticmethod
+    def download_youtube_video(
+        url: str,
+        output_dir: str,
+        log_file: Optional[str] = None,
+        preferred_quality: str = "1080p",
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+        metadata_out: Optional[Dict[str, Any]] = None,
+        allow_remote_bridge: bool = True,
+    ) -> Tuple[str, str]:
         """
-        Downloads a YouTube video in the best available quality and returns (video_path, title).
-        Uses Python yt_dlp primary with bestvideo+bestaudio merged to MP4 via ffmpeg.
-        Falls back to CLI subprocess yt_dlp and pytubefix.
+        Downloads a YouTube video in the requested quality and returns (video_path, title).
+        Tries Remote Windows Bridge + Cloudflare R2 first when configured, then yt-dlp Python API, yt-dlp CLI, and pytubefix.
         """
         VideoDubbingService.ensure_dependencies()
         os.makedirs(output_dir, exist_ok=True)
-        target_path = os.path.join(output_dir, "input_video.mp4")
+        video_id, canonical_url = VideoDubbingService.normalize_youtube_url(url)
 
         def _log(msg: str):
             print(f"[VideoDubbingService] {msg}", flush=True)
             if log_file:
                 try:
+                    os.makedirs(os.path.dirname(log_file), exist_ok=True)
                     with open(log_file, "a", encoding="utf-8") as f:
                         f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
                         f.flush()
                 except Exception:
                     pass
 
-        # Check for persistent OAuth token or authenticated cookies
+        last_error_summary: List[str] = []
+
+        if allow_remote_bridge:
+            try:
+                from app.services.r2_bridge_client import RemoteYouTubeBridgeClient
+                if RemoteYouTubeBridgeClient.is_enabled():
+                    return RemoteYouTubeBridgeClient.download_via_bridge(
+                        canonical_url=canonical_url,
+                        video_id=video_id,
+                        output_dir=output_dir,
+                        preferred_quality=preferred_quality,
+                        progress_callback=progress_callback,
+                        metadata_out=metadata_out,
+                        log_fn=_log,
+                    )
+            except Exception as bridge_err:
+                bridge_msg = str(bridge_err)
+                _log(f"⚠️ Windows Bridge / R2 không khả dụng, chuyển sang phương án dự phòng: {bridge_msg[:260]}")
+                last_error_summary.append(f"Windows Bridge + R2: {bridge_msg[:240]}")
+
         oauth_token = VideoDubbingService.refresh_oauth_token_if_needed()
         has_oauth = bool(oauth_token)
+        cookie_info = VideoDubbingService.inspect_cookie_status()
+        stored_cookie_path = VideoDubbingService.get_cookie_file_path()
+        work_cookie_path: Optional[str] = None
 
-        storage_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "storage", "cookies.txt"))
-        bundled_cookies = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cookies.txt"))
-        
-        has_user_cookies = False
-        cookie_path = None
-        for ck in [storage_cookies, bundled_cookies]:
-            if os.path.exists(ck) and os.path.getsize(ck) > 0:
-                try:
-                    with open(ck, 'r', encoding='utf-8', errors='ignore') as f:
-                        c_text = f.read()
-                        if 'SID' in c_text or 'LOGIN_INFO' in c_text or '__Secure-1PSID' in c_text or '__Secure-3PSID' in c_text:
-                            cookie_path = ck
-                            has_user_cookies = True
-                            _log(f"Using verified authenticated cookies ({os.path.getsize(ck)} bytes from {os.path.basename(ck)})")
-                            break
-                except Exception:
-                    pass
-
-        # Standardize URL
-        v_match = re.search(r'(?:v=|\/embed\/|\.be\/)([0-9A-Za-z_-]{11})', url)
-        standard_url = f"https://www.youtube.com/watch?v={v_match.group(1)}" if v_match else url
+        if cookie_info.get("has_cookies") and cookie_info.get("is_authenticated") and stored_cookie_path and os.path.exists(stored_cookie_path):
+            work_cookie_path = os.path.join(output_dir, "_cookies_work.txt")
+            try:
+                shutil.copy2(stored_cookie_path, work_cookie_path)
+                _log(f"Sử dụng bản sao cookies cách ly ({cookie_info.get('cookie_count', 0)} cookies, auth=True)")
+            except Exception:
+                work_cookie_path = None
+        elif cookie_info.get("has_cookies") and not cookie_info.get("is_authenticated"):
+            _log(f"Bỏ qua file cookies chưa đăng nhập ({cookie_info.get('cookie_count', 0)} visitor cookies, auth=False) để tránh xung đột luồng tải công khai.")
 
         cache_dir = VideoDubbingService.get_oauth_cache_dir()
+        js_cli, js_dict = VideoDubbingService._detect_js_runtimes()
+        disable_pot = VideoDubbingService._should_disable_pot_ping()
+        fmt_selector = VideoDubbingService._build_format_selector(preferred_quality)
 
-        # Retrieve Proxy Pool (or single Direct attempt if no proxies configured)
         proxy_pool = VideoDubbingService.get_youtube_proxies()
-        proxy_attempts = proxy_pool if proxy_pool else [None]
-        _log(f"Configured Proxy Pool: {len(proxy_pool)} proxy(s) available. Attempting download...")
+        proxy_attempts: List[Optional[str]] = [*proxy_pool, None] if proxy_pool else [None]
+        _log(f"Bắt đầu tải {canonical_url} (chất lượng tối đa: {preferred_quality}, JS runtime: {js_cli or 'none'}, proxy pool: {len(proxy_pool)})")
 
-        last_error_summary = []
+        try:
+            for p_idx, proxy_url in enumerate(proxy_attempts):
+                masked_p = VideoDubbingService.mask_proxy_url(proxy_url) if proxy_url else "Direct Connection (Không dùng proxy)"
+                _log(f"--- [Kết nối {p_idx + 1}/{len(proxy_attempts)}] Đang thử tải qua: {masked_p} ---")
 
-        for p_idx, proxy_url in enumerate(proxy_attempts):
-            masked_p = VideoDubbingService.mask_proxy_url(proxy_url) if proxy_url else "Direct Connection (Không dùng proxy)"
-            _log(f"--- [Proxy {p_idx + 1}/{len(proxy_attempts)}] Thử tải video qua: {masked_p} ---")
+                err_py = None
+                err_cli = None
+                err_ptf = None
 
-            err_oauth = None
-            err_sub = None
-            err_pytubefix = None
-            err_ytdlp = None
-
-            # Method 1: Authenticated Subprocess yt-dlp via YouTube TV OAuth (Primary when user connected 1-Click)
-            if has_oauth:
+                # Engine 1: Modern in-process yt-dlp
                 try:
-                    _log(f"Starting Authenticated YouTube OAuth2 Downloader ({url}) via {masked_p}...")
-                    cmd_oauth = [
-                        sys.executable, "-m", "yt_dlp",
-                        "--no-warnings",
-                        "--no-check-certificate",
-                        "--cache-dir", cache_dir,
-                        "--username", "oauth2",
-                        "--password", "",
-                        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best/18/17",
-                        "--merge-output-format", "mp4",
-                        "-o", os.path.join(output_dir, "input_video.%(ext)s"),
-                        "--socket-timeout", "45",
-                        "--print", "after_video:%(title)s",
-                    ]
-                    if proxy_url:
-                        cmd_oauth.extend(["--proxy", proxy_url])
-                    cmd_oauth.append(url)
-                    t0 = time.time()
-                    res_oauth = subprocess.run(cmd_oauth, capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
-                    if res_oauth.returncode == 0:
-                        stdout_lines = [line.strip() for line in res_oauth.stdout.strip().splitlines() if line.strip()]
-                        title = stdout_lines[0] if stdout_lines else "YouTube Video"
-                        for ext in ['.mp4', '.mkv', '.webm', '.m4a']:
-                            candidate = os.path.join(output_dir, f"input_video{ext}")
-                            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-                                if not candidate.endswith('.mp4'):
-                                    mp4_path = os.path.join(output_dir, "input_video.mp4")
-                                    subprocess.run(["ffmpeg", "-y", "-i", candidate, "-c", "copy", mp4_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                    try: os.remove(candidate)
-                                    except Exception: pass
-                                    candidate = mp4_path
-                                _log(f"OAuth2 download success via {masked_p}: '{title}' ({candidate}, size={os.path.getsize(candidate)} bytes in {time.time()-t0:.2f}s)")
-                                return candidate, title
-                    else:
-                        err_oauth = res_oauth.stderr[-300:] if res_oauth.stderr else f"Exit code {res_oauth.returncode}"
-                        _log(f"OAuth2 download failed via {masked_p} (rc={res_oauth.returncode}): {err_oauth}")
+                    return VideoDubbingService._download_via_ytdlp_python(
+                        canonical_url=canonical_url,
+                        output_dir=output_dir,
+                        fmt_selector=fmt_selector,
+                        proxy_url=proxy_url,
+                        work_cookie_path=work_cookie_path,
+                        has_oauth=has_oauth,
+                        cache_dir=cache_dir,
+                        js_dict=js_dict,
+                        disable_pot=disable_pot,
+                        progress_callback=progress_callback,
+                        metadata_out=metadata_out,
+                        log_fn=_log,
+                    )
                 except Exception as e:
-                    err_oauth = str(e)
-                    _log(f"OAuth2 download exception via {masked_p}: {e}")
+                    err_py = str(e)
+                    _log(f"Engine 1 (yt-dlp Python) thất bại qua {masked_p}: {err_py[:260]}")
 
-            # Method 2: High-Performance Isolated Subprocess yt-dlp via Android Client (Direct Stream)
-            try:
-                _log(f"Starting Isolated Subprocess YouTube Downloader ({url}) via {masked_p}...")
-                cmd = [
-                    sys.executable, "-m", "yt_dlp",
-                    "--no-warnings",
-                    "--no-check-certificate",
-                    "--impersonate", "chrome",
-                    "--extractor-args", "youtube:player_skip=webpage,configs,js,initial_data;player_client=android",
-                    "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best/18/17",
-                    "--merge-output-format", "mp4",
-                    "-o", os.path.join(output_dir, "input_video.%(ext)s"),
-                    "--socket-timeout", "40",
-                    "--print", "after_video:%(title)s",
-                ]
-                if proxy_url:
-                    cmd.extend(["--proxy", proxy_url])
-                if has_user_cookies and cookie_path:
-                    cmd.extend(["--cookies", cookie_path])
-                    _log(f"Passing authenticated cookies to subprocess yt-dlp: {cookie_path}")
-                
-                cmd.append(url)
-                t0 = time.time()
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
-                if res.returncode == 0:
-                    stdout_lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
-                    title = stdout_lines[0] if stdout_lines else "YouTube Video"
-                    for ext in ['.mp4', '.mkv', '.webm', '.m4a']:
-                        candidate = os.path.join(output_dir, f"input_video{ext}")
-                        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-                            if not candidate.endswith('.mp4'):
-                                mp4_path = os.path.join(output_dir, "input_video.mp4")
-                                subprocess.run(["ffmpeg", "-y", "-i", candidate, "-c", "copy", mp4_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                try: os.remove(candidate)
-                                except Exception: pass
-                                candidate = mp4_path
-                            _log(f"Subprocess yt-dlp download success via {masked_p}: '{title}' ({candidate}, size={os.path.getsize(candidate)} bytes in {time.time()-t0:.2f}s)")
-                            return candidate, title
-                else:
-                    err_sub = res.stderr[-300:] if res.stderr else f"Exit code {res.returncode}"
-                    _log(f"Subprocess yt-dlp android failed via {masked_p} (rc={res.returncode}): {err_sub}")
-            except Exception as e:
-                err_sub = str(e)
-                _log(f"Subprocess yt-dlp android exception via {masked_p}: {e}")
-
-            # Method 3: High-Speed HD pytubefix fallback with ANDROID_VR client
-            for client_name in ['ANDROID_VR', 'ANDROID']:
+                # Engine 2: Streaming subprocess yt-dlp CLI with multi-client fallback
                 try:
-                    _log(f"Attempting YouTube download via pytubefix ({client_name}) via {masked_p}...")
-                    from pytubefix import YouTube
-                    proxies_ptf = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
-                    yt = YouTube(url, client=client_name, proxies=proxies_ptf)
-                    title = yt.title or "YouTube Video"
-                    
-                    v_candidates = yt.streams.filter(only_video=True, file_extension='mp4')
-                    v_1080 = [s for s in v_candidates if s.resolution in ['1080p', '720p', '1440p']]
-                    v_stream = v_1080[0] if v_1080 else v_candidates.order_by('resolution').desc().first()
-                    a_stream = yt.streams.filter(only_audio=True, file_extension='mp4').order_by('abr').desc().first()
-                    
-                    if v_stream and a_stream:
-                        _log(f"Pytubefix ({client_name}) downloading stream: {v_stream.resolution} + audio {a_stream.abr}...")
-                        v_temp = os.path.join(output_dir, "ptf_v.mp4")
-                        a_temp = os.path.join(output_dir, "ptf_a.mp4")
-                        v_stream.download(output_path=output_dir, filename="ptf_v.mp4", timeout=180)
-                        a_stream.download(output_path=output_dir, filename="ptf_a.mp4", timeout=180)
-                        
-                        cmd_merge = ["ffmpeg", "-y", "-i", v_temp, "-i", a_temp, "-c", "copy", target_path]
-                        subprocess.run(cmd_merge, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        
-                        for f_tmp in [v_temp, a_temp]:
-                            if os.path.exists(f_tmp):
-                                try: os.remove(f_tmp)
-                                except Exception: pass
-                        
-                        if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
-                            _log(f"Pytubefix HD download & merge success via {masked_p}: '{title}' ({target_path}, size={os.path.getsize(target_path)} bytes)")
-                            return target_path, title
+                    return VideoDubbingService._download_via_ytdlp_subprocess(
+                        canonical_url=canonical_url,
+                        output_dir=output_dir,
+                        fmt_selector=fmt_selector,
+                        proxy_url=proxy_url,
+                        work_cookie_path=work_cookie_path,
+                        is_authenticated_cookies=bool(cookie_info.get("is_authenticated")),
+                        has_oauth=has_oauth,
+                        cache_dir=cache_dir,
+                        js_cli=js_cli,
+                        disable_pot=disable_pot,
+                        progress_callback=progress_callback,
+                        metadata_out=metadata_out,
+                        log_fn=_log,
+                    )
                 except Exception as e:
-                    err_pytubefix = str(e)
-                    _log(f"Pytubefix ({client_name}) failed via {masked_p}: {e}")
+                    err_cli = str(e)
+                    _log(f"Engine 2 (yt-dlp CLI) thất bại qua {masked_p}: {err_cli[:260]}")
 
-            # Method 4: In-process yt_dlp fallback
-            try:
-                _log(f"Attempting YouTube download via in-process yt-dlp fallback via {masked_p}...")
-                import yt_dlp
-                ydl_opts = {
-                    'socket_timeout': 30,
-                    'extractor_retries': 2,
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': ['android']
-                        }
-                    },
-                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                    'merge_output_format': 'mp4',
-                    'outtmpl': os.path.join(output_dir, "input_video.%(ext)s"),
-                    'nocheckcertificate': True,
-                    'quiet': False
-                }
-                if proxy_url:
-                    ydl_opts['proxy'] = proxy_url
-                if has_user_cookies and cookie_path and os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0:
-                    ydl_opts['cookiefile'] = cookie_path
+                # Engine 3: pytubefix fallback
+                try:
+                    return VideoDubbingService._download_via_pytubefix(
+                        canonical_url=canonical_url,
+                        output_dir=output_dir,
+                        preferred_quality=preferred_quality,
+                        proxy_url=proxy_url,
+                        progress_callback=progress_callback,
+                        metadata_out=metadata_out,
+                        log_fn=_log,
+                    )
+                except Exception as e:
+                    err_ptf = str(e)
+                    _log(f"Engine 3 (pytubefix) thất bại qua {masked_p}: {err_ptf[:260]}")
 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    title = info.get('title', 'YouTube Video') if info else 'YouTube Video'
-                for ext in ['.mp4', '.mkv', '.webm', '.m4a']:
-                    candidate = os.path.join(output_dir, f"input_video{ext}")
-                    if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-                        _log(f"In-process yt-dlp download success via {masked_p}: '{title}' ({candidate})")
-                        return candidate, title
-            except Exception as e:
-                err_ytdlp = str(e)
-                _log(f"In-process yt-dlp failed via {masked_p}: {e}")
+                last_error_summary.append(
+                    f"{masked_p}: (yt-dlp: {err_py or 'N/A'} | CLI: {err_cli or 'N/A'} | pytubefix: {err_ptf or 'N/A'})"
+                )
+                if p_idx + 1 < len(proxy_attempts):
+                    _log(f"⚠️ Kết nối [{masked_p}] thất bại. Tự động chuyển sang phương án [{p_idx + 2}/{len(proxy_attempts)}]...")
 
-            fail_desc = f"{masked_p}: (Subprocess: {err_sub or 'N/A'}, In-process: {err_ytdlp or 'N/A'}, pytubefix: {err_pytubefix or 'N/A'})"
-            last_error_summary.append(fail_desc)
-            if p_idx + 1 < len(proxy_attempts):
-                _log(f"⚠️ Proxy [{masked_p}] thất bại. Tự động chuyển sang Proxy [{p_idx + 2}/{len(proxy_attempts)}]...")
-
-        err_msg = f"Không thể tải video từ YouTube sau khi thử qua {len(proxy_attempts)} cấu hình proxy/kết nối:\n" + "\n".join(f"• {e}" for e in last_error_summary[-5:])
-        if not has_oauth and not has_user_cookies:
-            err_msg += "\n💡 HƯỚNG DẪN: Bạn có thể thêm Proxy dân cư mới vào tab 'Proxy Dân Cư' hoặc bấm '🔑 Đăng Nhập 1-Click' để tải trực tiếp."
-        raise Exception(err_msg)
+            err_msg = (
+                f"Không thể tải video từ YouTube sau khi thử qua {len(proxy_attempts)} kết nối:\n"
+                + "\n".join(f"• {e}" for e in last_error_summary[-5:])
+            )
+            if not has_oauth and not cookie_info.get("is_authenticated"):
+                err_msg += "\n💡 GỢI Ý: Bạn có thể dán Cookies.txt đã đăng nhập YouTube hoặc thêm Proxy dân cư vào tab 'Proxy Dân Cư'."
+            raise Exception(err_msg)
+        finally:
+            if work_cookie_path and os.path.exists(work_cookie_path):
+                try:
+                    os.remove(work_cookie_path)
+                except Exception:
+                    pass
 
     @staticmethod
     def extract_audio_ffmpeg(video_path: str, output_audio_path: str) -> float:

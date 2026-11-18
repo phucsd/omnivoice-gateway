@@ -711,12 +711,23 @@ export const api = {
     });
   },
 
-  createDubbingJob: async (file?: File, youtubeUrl?: string, targetLanguage?: string, uploadedJobId?: string, llmProfileId?: string): Promise<VideoDubbingJobResponse> => {
+  createDubbingJob: async (
+    file?: File,
+    youtubeUrl?: string,
+    targetLanguage?: string,
+    uploadedJobId?: string,
+    llmProfileId?: string,
+    extra?: { preferredQuality?: string; videoTitle?: string; videoThumbnail?: string; videoDuration?: number }
+  ): Promise<VideoDubbingJobResponse> => {
     const formData = new FormData();
     if (file) formData.append("file", file);
     if (youtubeUrl) formData.append("youtube_url", youtubeUrl);
     if (uploadedJobId) formData.append("uploaded_job_id", uploadedJobId);
     if (llmProfileId) formData.append("llm_profile_id", llmProfileId);
+    if (extra?.preferredQuality) formData.append("preferred_quality", extra.preferredQuality);
+    if (extra?.videoTitle) formData.append("video_title", extra.videoTitle);
+    if (extra?.videoThumbnail) formData.append("video_thumbnail", extra.videoThumbnail);
+    if (extra?.videoDuration !== undefined) formData.append("video_duration", String(extra.videoDuration));
     formData.append("target_language", targetLanguage || "Vietnamese");
     
     const savedOauth = localStorage.getItem("youtube_oauth_token");
@@ -727,6 +738,81 @@ export const api = {
     return request<VideoDubbingJobResponse>("/v1/video-dubbing", {
       method: "POST",
       body: formData,
+    });
+  },
+
+  getYouTubeVideoInfo: async (url: string): Promise<YouTubeVideoInfo> => {
+    return request<YouTubeVideoInfo>("/v1/video-dubbing/youtube/info", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+  },
+
+  preDownloadYouTubeVideo: async (
+    url: string,
+    preferredQuality = "1080p",
+    targetLanguage = "Vietnamese"
+  ): Promise<VideoDubbingJobResponse> => {
+    return request<VideoDubbingJobResponse>("/v1/video-dubbing/youtube/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url,
+        preferred_quality: preferredQuality,
+        target_language: targetLanguage,
+      }),
+    });
+  },
+
+  retryDubbingJob: async (
+    jobId: string,
+    params?: { preferred_quality?: string; download_only?: boolean }
+  ): Promise<VideoDubbingJobResponse> => {
+    return request<VideoDubbingJobResponse>(`/v1/video-dubbing/jobs/${jobId}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params || {}),
+    });
+  },
+
+  getYouTubeBridgeStatus: async (): Promise<{
+    configured: boolean;
+    server_mode: boolean;
+    enabled: boolean;
+    bridge_url?: string | null;
+    r2_gateway_url?: string | null;
+    bridge_online: boolean;
+    bridge_latency_ms: number;
+    bridge_detail: string;
+    r2_online: boolean;
+    r2_latency_ms: number;
+    r2_detail: string;
+  }> => {
+    return request("/v1/video-dubbing/bridge-status");
+  },
+
+  testYouTubeConnection: async (url?: string): Promise<{
+    status: "success" | "error";
+    latency_ms: number;
+    title?: string | null;
+    available_qualities?: string[];
+    cookie_status?: { has_cookies: boolean; is_authenticated?: boolean; cookie_count?: number };
+    oauth_connected?: boolean;
+    proxy_count?: number;
+    bridge?: {
+      configured: boolean;
+      bridge_online: boolean;
+      bridge_detail: string;
+      r2_online: boolean;
+      r2_detail: string;
+    };
+    message: string;
+  }> => {
+    return request("/v1/video-dubbing/test-youtube", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(url ? { url } : {}),
     });
   },
 
@@ -780,15 +866,28 @@ export const api = {
     });
   },
 
-  getDubbingCookieStatus: async (): Promise<{ has_cookies: boolean; size_bytes?: number; path?: string; modified_at?: number }> => {
-    return request<{ has_cookies: boolean; size_bytes?: number; path?: string; modified_at?: number }>("/v1/video-dubbing/cookie-status");
+  getDubbingCookieStatus: async (): Promise<{
+    has_cookies: boolean;
+    is_authenticated?: boolean;
+    cookie_count?: number;
+    size_bytes?: number;
+    path?: string;
+    modified_at?: number | null;
+  }> => {
+    return request("/v1/video-dubbing/cookie-status");
   },
 
-  uploadDubbingCookies: async (file?: File, cookieText?: string): Promise<{ status: string; message: string; size_bytes: number }> => {
+  uploadDubbingCookies: async (file?: File, cookieText?: string): Promise<{
+    status: string;
+    message: string;
+    size_bytes: number;
+    cookie_count?: number;
+    is_authenticated?: boolean;
+  }> => {
     const formData = new FormData();
     if (file) formData.append("file", file);
     if (cookieText) formData.append("cookie_text", cookieText);
-    return request<{ status: string; message: string; size_bytes: number }>("/v1/video-dubbing/upload-cookies", {
+    return request("/v1/video-dubbing/upload-cookies", {
       method: "POST",
       body: formData,
     });
@@ -1045,10 +1144,11 @@ export const api = {
     });
   },
 
-  getDubbingFileUrl: (jobId: string, type: 'video' | 'vocals' | 'bgm' | 'output'): string => {
+  getDubbingFileUrl: (jobId: string, type: 'video' | 'vocals' | 'bgm' | 'output', download = false): string => {
     const token = localStorage.getItem("VITE_JWT_TOKEN");
     const baseUrl = getApiBaseUrl();
-    return `${baseUrl}/v1/video-dubbing/jobs/${jobId}/${type}?token=${token || ""}`;
+    const dlSuffix = download ? "&download=1" : "";
+    return `${baseUrl}/v1/video-dubbing/jobs/${jobId}/${type}?token=${token || ""}${dlSuffix}`;
   },
 };
 
@@ -1126,6 +1226,17 @@ export interface SubtitleSegment {
   text: string;
 }
 
+export interface YouTubeVideoInfo {
+  video_id: string;
+  canonical_url: string;
+  title: string;
+  channel?: string | null;
+  duration?: number | null;
+  thumbnail_url?: string | null;
+  available_qualities: string[];
+  is_live: boolean;
+}
+
 export interface VideoDubbingJobResponse {
   id: string;
   status: string;
@@ -1133,11 +1244,19 @@ export interface VideoDubbingJobResponse {
   message: string | null;
   source_type: string;
   source_url: string | null;
+  video_title?: string | null;
+  video_thumbnail?: string | null;
+  video_duration?: number | null;
+  preferred_quality?: string | null;
+  has_source_video?: boolean;
   target_language: string;
+  llm_profile_id?: string | null;
   original_subtitles: SubtitleSegment[] | null;
   translated_subtitles: SubtitleSegment[] | null;
   vocals_audio_path: string | null;
   bgm_audio_path: string | null;
+  vocals_volume?: number;
+  bgm_volume?: number;
   output_video_url: string | null;
   error_message: string | null;
   created_at: string;

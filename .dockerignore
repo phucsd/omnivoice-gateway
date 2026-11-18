@@ -21,3 +21,7 @@ tmp_*
 *.db
 *.sqlite
 *.log
+local_yt_bridge/bin
+local_yt_bridge/logs
+local_yt_bridge/.bridge_secrets.json
+local_yt_bridge/.env

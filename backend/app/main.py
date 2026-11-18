@@ -34,16 +34,28 @@ async def auto_shutdown_monitor():
         if elapsed > 300:  # 5 minutes
             # Double check if there are any active jobs in the database
             from app.database import SessionLocal
-            from app.models import TTSJob
+            from app.models import TTSJob, VideoDubbingJob
             db = SessionLocal()
             try:
                 active_job = db.query(TTSJob).filter(
                     TTSJob.status.in_(["starting_worker", "booting_kaggle", "queued_kaggle", "running", "exporting_wav"])
                 ).first()
-                if active_job:
+                active_dub = db.query(VideoDubbingJob).filter(
+                    VideoDubbingJob.status.in_([
+                        "downloading",
+                        "separating_audio",
+                        "transcribing",
+                        "translating",
+                        "generating_tts",
+                        "mixing_audio",
+                        "muxing_video",
+                    ])
+                ).first()
+                if active_job or active_dub:
                     # Reset timer if there is an active job, so we don't shut down while working!
                     last_request_time = time.time()
-                    print(f"[AutoShutdown] Active job {active_job.id} is running. Delaying shutdown.")
+                    running_id = active_job.id if active_job else active_dub.id
+                    print(f"[AutoShutdown] Active job {running_id} is running. Delaying shutdown.")
                     continue
             except Exception as e:
                 print(f"[AutoShutdown] Error checking active jobs: {e}")
@@ -284,6 +296,7 @@ async def log_api_usage(request: Request, call_next):
             (path.startswith("/v1/tts/jobs/") and len(path) > 13)
             or (path.startswith("/v1/voice-design/previews/") and len(path) > 26)
             or (path.startswith("/v1/jobs/") and len(path) > 9)
+            or path.startswith("/v1/video-dubbing/jobs")
         ))
         or (request.method == "POST" and path == "/v1/jobs/batch")
     )

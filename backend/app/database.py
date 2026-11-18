@@ -177,20 +177,8 @@ Base = declarative_base()
 def migrate_database(db_url: str):
     if not db_url.startswith("sqlite"):
         return
-    
-    import os
-    # Clean up prefix and query params to get raw file path
-    db_path = db_url
-    if db_path.startswith("sqlite:///"):
-        db_path = db_path[10:]
-    elif db_path.startswith("sqlite://"):
-        db_path = db_path[9:]
-    elif db_path.startswith("sqlite:"):
-        db_path = db_path[7:]
-        
-    if "?" in db_path:
-        db_path = db_path.split("?")[0]
-        
+
+    db_path = get_sqlite_path(db_url)
     if not os.path.exists(db_path):
         return
     
@@ -266,7 +254,11 @@ def migrate_database(db_url: str):
             vd_new_cols = {
                 "llm_profile_id": "VARCHAR(50)",
                 "vocals_volume": "FLOAT DEFAULT 1.0",
-                "bgm_volume": "FLOAT DEFAULT 0.4"
+                "bgm_volume": "FLOAT DEFAULT 0.4",
+                "video_title": "TEXT",
+                "video_thumbnail": "TEXT",
+                "video_duration": "FLOAT",
+                "preferred_quality": "VARCHAR(20) DEFAULT '1080p'",
             }
             for col, col_type in vd_new_cols.items():
                 if col not in vd_columns:
