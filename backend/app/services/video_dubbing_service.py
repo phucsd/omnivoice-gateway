@@ -52,6 +52,12 @@ _QUALITY_HEIGHT_MAP = {
     "360p": 360,
 }
 
+# Primary unauthenticated YouTube player clients:
+# 'android_vr' is placed first because YouTube's SABR-only streaming experiment and GVS PO-Token
+# enforcement frequently strip 1080p/720p HTTPS DASH URLs from web_embedded/mweb/android/tv_simply,
+# leaving only 360p (itag 18) unless android_vr is queried.
+_DEFAULT_YT_PLAYER_CLIENTS = ["android_vr", "web_embedded", "mweb", "tv"]
+
 _YOUTUBE_ID_RE = re.compile(r"^[0-9A-Za-z_-]{11}$")
 _YTDLP_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%(.*)")
 
@@ -1147,7 +1153,7 @@ class VideoDubbingService:
                 if VideoDubbingService._should_disable_pot_ping():
                     yt_info_ext_args["fetch_pot"] = ["never"]
                 if not work_cookie_path and not oauth_token:
-                    yt_info_ext_args["player_client"] = ["web_embedded", "tv_simply", "mweb", "android"]
+                    yt_info_ext_args["player_client"] = list(_DEFAULT_YT_PLAYER_CLIENTS)
                 if yt_info_ext_args:
                     ydl_opts["extractor_args"] = {"youtube": yt_info_ext_args}
                 if primary_proxy:
@@ -1168,6 +1174,19 @@ class VideoDubbingService:
                         if f.get("height") and f.get("vcodec") not in (None, "none")
                     }
                     max_h = max(heights) if heights else 0
+                    if max_h <= 360:
+                        # Secondary check via pytubefix ANDROID_VR adaptive streams in case one session hit SABR
+                        try:
+                            from pytubefix import YouTube
+                            proxies_ptf = {"http": primary_proxy, "https": primary_proxy} if primary_proxy else None
+                            yt_check = YouTube(canonical_url, client="ANDROID_VR", proxies=proxies_ptf)
+                            for s in yt_check.streams.filter(file_extension="mp4"):
+                                res_s = getattr(s, "resolution", None) or ""
+                                if res_s.endswith("p") and res_s[:-1].isdigit():
+                                    heights.add(int(res_s[:-1]))
+                            max_h = max(heights) if heights else max_h
+                        except Exception:
+                            pass
                     avail = [q for q, h in _QUALITY_HEIGHT_MAP.items() if max_h == 0 or max_h >= h]
                     if not avail:
                         avail = ["360p"]
@@ -1310,7 +1329,7 @@ class VideoDubbingService:
         if disable_pot:
             yt_ext_args["fetch_pot"] = ["never"]
         if not work_cookie_path and not has_oauth:
-            yt_ext_args["player_client"] = ["web_embedded", "tv_simply", "mweb", "android"]
+            yt_ext_args["player_client"] = list(_DEFAULT_YT_PLAYER_CLIENTS)
         if yt_ext_args:
             ydl_opts["extractor_args"] = {"youtube": yt_ext_args}
         if proxy_url:
@@ -1386,7 +1405,7 @@ class VideoDubbingService:
             if disable_pot:
                 cmd.extend(["--extractor-args", "youtube:fetch_pot=never"])
         else:
-            ext_arg = "youtube:player_client=web_embedded,tv_simply,mweb,android"
+            ext_arg = f"youtube:player_client={','.join(_DEFAULT_YT_PLAYER_CLIENTS)}"
             if disable_pot:
                 ext_arg += ";fetch_pot=never"
             cmd.extend(["--extractor-args", ext_arg])

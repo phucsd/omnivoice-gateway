@@ -271,7 +271,13 @@ def bridge_video_info(req: BridgeInfoRequest) -> Dict[str, Any]:
     if r2.is_configured():
         try:
             cached = r2.get_json(info_key)
-            if cached and cached.get("video_id") == video_id and cached.get("title"):
+            cached_quals = (cached.get("available_qualities") or []) if isinstance(cached, dict) else []
+            if (
+                cached
+                and cached.get("video_id") == video_id
+                and cached.get("title")
+                and len(cached_quals) > 1
+            ):
                 return cached
         except Exception:
             pass
@@ -281,7 +287,7 @@ def bridge_video_info(req: BridgeInfoRequest) -> Dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Không thể lấy thông tin video YouTube: {exc}")
 
-    if r2.is_configured():
+    if r2.is_configured() and len(info.get("available_qualities") or []) > 1:
         try:
             r2.put_json(info_key, info)
         except Exception:

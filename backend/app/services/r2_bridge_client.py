@@ -426,7 +426,13 @@ class RemoteYouTubeBridgeClient:
         if r2.is_configured():
             try:
                 cached = r2.get_json(f"yt/{video_id}.info.json")
-                if cached and cached.get("video_id") == video_id and cached.get("title"):
+                cached_quals = (cached.get("available_qualities") or []) if isinstance(cached, dict) else []
+                if (
+                    cached
+                    and cached.get("video_id") == video_id
+                    and cached.get("title")
+                    and len(cached_quals) > 1
+                ):
                     return cached
             except Exception:
                 pass
