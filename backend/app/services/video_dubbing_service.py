@@ -70,10 +70,10 @@ _QUALITY_ALIASES = {
 }
 
 # Primary unauthenticated YouTube player clients:
-# 'android_vr' is placed first because YouTube's SABR-only streaming experiment and GVS PO-Token
-# enforcement frequently strip 1080p/720p HTTPS DASH URLs from web_embedded/mweb/android/tv_simply,
-# leaving only 360p (itag 18) unless android_vr is queried.
-_DEFAULT_YT_PLAYER_CLIENTS = ["android_vr", "web_embedded", "mweb", "tv"]
+# 'web_embedded' is placed first because with yt-dlp >=2026.10 + Node/Deno JS challenge solving,
+# it serves full 2160p/1440p/1080p streams without the mid-stream HTTP 403 cutoff that YouTube
+# enforces on android_vr chunks (>10-50 MB). 'android_vr', 'tv', 'mweb' remain as fallbacks.
+_DEFAULT_YT_PLAYER_CLIENTS = ["web_embedded", "android_vr", "tv", "mweb"]
 
 _YOUTUBE_ID_RE = re.compile(r"^[0-9A-Za-z_-]{11}$")
 _YTDLP_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%(.*)")
@@ -1357,43 +1357,74 @@ class VideoDubbingService:
         log_fn: Callable[[str], None],
     ) -> Tuple[str, str]:
         import yt_dlp
-        VideoDubbingService._cleanup_download_artifacts(output_dir)
-        ydl_opts: Dict[str, Any] = {
-            "format": fmt_selector,
-            "merge_output_format": "mp4",
-            "outtmpl": os.path.join(output_dir, "input_video.%(ext)s"),
-            "noplaylist": True,
-            "concurrent_fragment_downloads": 4,
-            "socket_timeout": 30,
-            "extractor_retries": 3,
-            "retries": 3,
-            "fragment_retries": 3,
-            "nocheckcertificate": True,
-            "quiet": True,
-            "no_warnings": True,
-            "progress_hooks": [VideoDubbingService._build_yt_dlp_progress_hook(progress_callback)],
-        }
-        if js_dict:
-            ydl_opts["js_runtimes"] = js_dict
-        yt_ext_args: Dict[str, Any] = {}
-        if disable_pot:
-            yt_ext_args["fetch_pot"] = ["never"]
-        if not work_cookie_path and not has_oauth:
-            yt_ext_args["player_client"] = list(_DEFAULT_YT_PLAYER_CLIENTS)
-        if yt_ext_args:
-            ydl_opts["extractor_args"] = {"youtube": yt_ext_args}
-        if proxy_url:
-            ydl_opts["proxy"] = proxy_url
-        if work_cookie_path:
-            ydl_opts["cookiefile"] = work_cookie_path
-        elif has_oauth:
-            ydl_opts["username"] = "oauth2"
-            ydl_opts["password"] = ""
-            ydl_opts["cachedir"] = cache_dir
 
+        client_profiles: List[Optional[List[str]]]
+        if work_cookie_path or has_oauth:
+            client_profiles = [None]
+        else:
+            client_profiles = [
+                list(_DEFAULT_YT_PLAYER_CLIENTS),
+                ["web_embedded", "tv", "mweb"],
+                ["web_safari", "mweb", "android_vr"],
+            ]
+
+        last_err: Optional[Exception] = None
         t0 = time.time()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(canonical_url, download=True)
+        info = None
+        for p_idx, profile in enumerate(client_profiles):
+            VideoDubbingService._cleanup_download_artifacts(output_dir)
+            ydl_opts: Dict[str, Any] = {
+                "format": fmt_selector,
+                "merge_output_format": "mp4",
+                "outtmpl": os.path.join(output_dir, "input_video.%(ext)s"),
+                "noplaylist": True,
+                "concurrent_fragment_downloads": 4,
+                "socket_timeout": 30,
+                "extractor_retries": 5,
+                "retries": 10,
+                "fragment_retries": 10,
+                "nocheckcertificate": True,
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [VideoDubbingService._build_yt_dlp_progress_hook(progress_callback)],
+            }
+            if js_dict:
+                ydl_opts["js_runtimes"] = js_dict
+            yt_ext_args: Dict[str, Any] = {}
+            if disable_pot:
+                yt_ext_args["fetch_pot"] = ["never"]
+            if profile is not None:
+                yt_ext_args["player_client"] = profile
+            if yt_ext_args:
+                ydl_opts["extractor_args"] = {"youtube": yt_ext_args}
+            if proxy_url:
+                ydl_opts["proxy"] = proxy_url
+            if work_cookie_path:
+                ydl_opts["cookiefile"] = work_cookie_path
+            elif has_oauth:
+                ydl_opts["username"] = "oauth2"
+                ydl_opts["password"] = ""
+                ydl_opts["cachedir"] = cache_dir
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(canonical_url, download=True)
+                last_err = None
+                break
+            except Exception as dl_err:
+                last_err = dl_err
+                err_low = str(dl_err).lower()
+                can_retry_profile = (
+                    p_idx + 1 < len(client_profiles)
+                    and any(k in err_low for k in ("403", "forbidden", "requested format", "sabr", "po token", "unavailable"))
+                )
+                if can_retry_profile:
+                    log_fn(f"Engine 1 client profile {profile} gặp lỗi ({str(dl_err)[:120]}), tự động chuyển sang profile kế tiếp...")
+                    continue
+                raise
+
+        if last_err is not None:
+            raise last_err
 
         title = (info.get("title") if info else None) or "YouTube Video"
         if metadata_out is not None and info:
@@ -1435,6 +1466,9 @@ class VideoDubbingService:
             "--newline",
             "--progress",
             "--concurrent-fragments", "4",
+            "--retries", "10",
+            "--fragment-retries", "10",
+            "--extractor-retries", "5",
             "-f", fmt_selector,
             "--merge-output-format", "mp4",
             "-o", os.path.join(output_dir, "input_video.%(ext)s"),

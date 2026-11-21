@@ -529,10 +529,10 @@ def test_unauthenticated_cookies_ignored_and_player_client_selection(tmp_path, m
         opts_anon = captured_calls[-1]
         assert "cookiefile" not in opts_anon
         assert opts_anon["extractor_args"]["youtube"]["player_client"] == [
-            "android_vr",
             "web_embedded",
-            "mweb",
+            "android_vr",
             "tv",
+            "mweb",
         ]
 
         # 2. Authenticated cookies MUST be isolated & passed without forcing unauthenticated client override
