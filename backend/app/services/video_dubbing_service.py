@@ -46,10 +46,27 @@ _AUTH_COOKIE_KEYS = {
 }
 
 _QUALITY_HEIGHT_MAP = {
+    "2160p": 2160,
+    "1440p": 1440,
     "1080p": 1080,
     "720p": 720,
     "480p": 480,
     "360p": 360,
+}
+
+_QUALITY_ALIASES = {
+    "4k": "2160p",
+    "uhd": "2160p",
+    "2160": "2160p",
+    "2k": "1440p",
+    "qhd": "1440p",
+    "1440": "1440p",
+    "fhd": "1080p",
+    "1080": "1080p",
+    "hd": "720p",
+    "720": "720p",
+    "480": "480p",
+    "360": "360p",
 }
 
 # Primary unauthenticated YouTube player clients:
@@ -833,8 +850,38 @@ class VideoDubbingService:
             return True
 
     @staticmethod
+    def normalize_preferred_quality(preferred_quality: Optional[str] = "1080p") -> str:
+        raw = (preferred_quality or "1080p").strip().lower()
+        raw = _QUALITY_ALIASES.get(raw, raw)
+        return raw if raw in _QUALITY_HEIGHT_MAP else "1080p"
+
+    @staticmethod
+    def download_timeout_for_quality(preferred_quality: Optional[str] = "1080p") -> int:
+        """2K/4K VP9/AV1 streams are 5-8x larger than 1080p H.264, so allow a longer download window."""
+        h = _QUALITY_HEIGHT_MAP.get(VideoDubbingService.normalize_preferred_quality(preferred_quality), 1080)
+        if h >= 2160:
+            return 1500
+        if h >= 1440:
+            return 900
+        return 300
+
+    @staticmethod
     def _build_format_selector(preferred_quality: str = "1080p") -> str:
-        max_h = _QUALITY_HEIGHT_MAP.get((preferred_quality or "1080p").strip().lower(), 1080)
+        norm_q = VideoDubbingService.normalize_preferred_quality(preferred_quality)
+        max_h = _QUALITY_HEIGHT_MAP.get(norm_q, 1080)
+        if max_h > 1080:
+            # YouTube encodes 2K (1440p) and 4K (2160p) exclusively in VP9 or AV1 (never avc1).
+            # Prefer SDR 8-bit VP9 or AV1 at >1080p first, then fall back to <=1080p H.264.
+            return (
+                f"bestvideo[height<={max_h}][height>1080][vcodec=vp9]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={max_h}][height>1080][vcodec^=av01][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={max_h}][height>1080]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={max_h}][height>1080]+bestaudio/"
+                f"bestvideo[height<={max_h}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={max_h}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={max_h}]+bestaudio/"
+                f"best[height<={max_h}][ext=mp4]/best[height<={max_h}]/18/best"
+            )
         return (
             f"bestvideo[height<={max_h}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height<={max_h}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -952,7 +999,10 @@ class VideoDubbingService:
             VideoDubbingService._write_web_ok_marker(file_path)
             return file_path
 
-        is_h264 = info["codec_name"] == "h264" and info["pix_fmt"] in ("yuv420p", "yuvj420p", "")
+        is_h264 = (
+            info["codec_name"] in ("h264", "vp9", "av1")
+            and info["pix_fmt"] in ("yuv420p", "yuvj420p", "yuv420p10le", "")
+        )
         has_faststart = VideoDubbingService._mp4_has_faststart_moov(file_path)
 
         if (is_h264 or not transcode_non_h264) and has_faststart:
@@ -1180,14 +1230,14 @@ class VideoDubbingService:
                             from pytubefix import YouTube
                             proxies_ptf = {"http": primary_proxy, "https": primary_proxy} if primary_proxy else None
                             yt_check = YouTube(canonical_url, client="ANDROID_VR", proxies=proxies_ptf)
-                            for s in yt_check.streams.filter(file_extension="mp4"):
+                            for s in yt_check.streams:
                                 res_s = getattr(s, "resolution", None) or ""
                                 if res_s.endswith("p") and res_s[:-1].isdigit():
                                     heights.add(int(res_s[:-1]))
                             max_h = max(heights) if heights else max_h
                         except Exception:
                             pass
-                    avail = [q for q, h in _QUALITY_HEIGHT_MAP.items() if max_h == 0 or max_h >= h]
+                    avail = [q for q, h in _QUALITY_HEIGHT_MAP.items() if (max_h == 0 and h <= 1080) or max_h >= h]
                     if not avail:
                         avail = ["360p"]
                     return {
@@ -1210,14 +1260,14 @@ class VideoDubbingService:
                 yt = YouTube(canonical_url, client="ANDROID_VR", proxies=proxies_ptf)
                 title = yt.title or f"YouTube Video ({video_id})"
                 heights = set()
-                for s in yt.streams.filter(file_extension="mp4"):
+                for s in yt.streams:
                     if getattr(s, "resolution", None) and s.resolution.endswith("p"):
                         try:
                             heights.add(int(s.resolution[:-1]))
                         except ValueError:
                             pass
                 max_h = max(heights) if heights else 0
-                avail = [q for q, h in _QUALITY_HEIGHT_MAP.items() if max_h == 0 or max_h >= h] or ["360p"]
+                avail = [q for q, h in _QUALITY_HEIGHT_MAP.items() if (max_h == 0 and h <= 1080) or max_h >= h] or ["360p"]
                 return {
                     "video_id": video_id,
                     "canonical_url": canonical_url,
@@ -1413,7 +1463,8 @@ class VideoDubbingService:
         cmd.append(canonical_url)
 
         t0 = time.time()
-        deadline = t0 + 180
+        subprocess_budget = 1200 if "height>1080" in fmt_selector else 180
+        deadline = t0 + subprocess_budget
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1431,7 +1482,7 @@ class VideoDubbingService:
             for raw_line in proc.stdout:
                 if time.time() > deadline:
                     proc.kill()
-                    raise TimeoutError("Subprocess yt-dlp vượt quá 180 giây.")
+                    raise TimeoutError(f"Subprocess yt-dlp vượt quá {subprocess_budget} giây.")
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -1475,7 +1526,8 @@ class VideoDubbingService:
         log_fn: Callable[[str], None],
     ) -> Tuple[str, str]:
         from pytubefix import YouTube
-        max_h = _QUALITY_HEIGHT_MAP.get((preferred_quality or "1080p").strip().lower(), 1080)
+        norm_q = VideoDubbingService.normalize_preferred_quality(preferred_quality)
+        max_h = _QUALITY_HEIGHT_MAP.get(norm_q, 1080)
         proxies_ptf = {"http": proxy_url, "https": proxy_url} if proxy_url else None
         last_err = None
 
@@ -1500,7 +1552,7 @@ class VideoDubbingService:
                         "channel": getattr(yt, "author", None),
                     })
 
-                v_candidates = yt.streams.filter(only_video=True, file_extension="mp4")
+                v_candidates = yt.streams.filter(only_video=True)
                 eligible = []
                 for s in v_candidates:
                     res_str = getattr(s, "resolution", "") or ""
@@ -1508,11 +1560,12 @@ class VideoDubbingService:
                         try:
                             h = int(res_str[:-1])
                             if h <= max_h:
-                                eligible.append((h, s))
+                                is_mp4 = 1 if getattr(s, "subtype", "") == "mp4" else 0
+                                eligible.append((h, is_mp4, s))
                         except ValueError:
                             pass
-                eligible.sort(key=lambda item: item[0], reverse=True)
-                v_stream = eligible[0][1] if eligible else v_candidates.order_by("resolution").desc().first()
+                eligible.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                v_stream = eligible[0][2] if eligible else v_candidates.order_by("resolution").desc().first()
                 a_stream = yt.streams.filter(only_audio=True, file_extension="mp4").order_by("abr").desc().first()
 
                 target_path = os.path.join(output_dir, "input_video.mp4")
@@ -2963,13 +3016,13 @@ class VideoDubbingService:
                 print(f"[FFmpeg Mix Error] {res_fb.stderr}")
                 raise RuntimeError(f"FFmpeg audio mixing failed: {res_fb.stderr[:300]}")
         
-        # Check video stream codec so output_dubbed.mp4 is guaranteed browser-playable (H.264 + AAC + faststart)
+        # Check video stream codec so output_dubbed.mp4 is guaranteed browser-playable (H.264/VP9/AV1 + AAC + faststart)
         v_info = VideoDubbingService.probe_video_stream_info(video_path)
         has_video = v_info["has_video"]
         can_copy_h264 = (
             has_video
-            and v_info["codec_name"] == "h264"
-            and v_info["pix_fmt"] in ("yuv420p", "yuvj420p", "")
+            and v_info["codec_name"] in ("h264", "vp9", "av1")
+            and v_info["pix_fmt"] in ("yuv420p", "yuvj420p", "yuv420p10le", "")
         )
 
         res_mux = None

@@ -27,7 +27,7 @@ from app.services.r2_bridge_client import R2GatewayClient
 from app.services.video_dubbing_service import VideoDubbingService
 
 _SECRETS_FILE = os.path.join(_BRIDGE_DIR, ".bridge_secrets.json")
-_VALID_QUALITIES = {"1080p", "720p", "480p", "360p"}
+_VALID_QUALITIES = {"2160p", "1440p", "1080p", "720p", "480p", "360p"}
 _TASK_RETENTION_SECONDS = 7200  # 2 hours
 
 
@@ -277,6 +277,7 @@ def bridge_video_info(req: BridgeInfoRequest) -> Dict[str, Any]:
                 and cached.get("video_id") == video_id
                 and cached.get("title")
                 and len(cached_quals) > 1
+                and cached.get("quality_schema_v") == 2
             ):
                 return cached
         except Exception:
@@ -289,7 +290,9 @@ def bridge_video_info(req: BridgeInfoRequest) -> Dict[str, Any]:
 
     if r2.is_configured() and len(info.get("available_qualities") or []) > 1:
         try:
-            r2.put_json(info_key, info)
+            info_to_cache = dict(info)
+            info_to_cache["quality_schema_v"] = 2
+            r2.put_json(info_key, info_to_cache)
         except Exception:
             pass
     return info
@@ -302,7 +305,7 @@ def create_bridge_job(req: BridgeJobRequest):
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
-    quality = (req.preferred_quality or "1080p").strip().lower()
+    quality = VideoDubbingService.normalize_preferred_quality(req.preferred_quality)
     if quality not in _VALID_QUALITIES:
         quality = "1080p"
 

@@ -408,10 +408,11 @@ def run_youtube_predownload(job_id: str):
                 progress_callback=progress_cb,
                 metadata_out=meta_out,
             )
+            dl_budget = VideoDubbingService.download_timeout_for_quality(job.preferred_quality) + 120
             try:
-                video_path, title = future.result(timeout=300)
+                video_path, title = future.result(timeout=dl_budget)
             except concurrent.futures.TimeoutError:
-                raise Exception("Tải video từ YouTube vượt quá 5 phút. Vui lòng thử chất lượng thấp hơn hoặc dùng video MP4.")
+                raise Exception(f"Tải video từ YouTube vượt quá {dl_budget // 60} phút. Vui lòng thử chất lượng thấp hơn hoặc dùng video MP4.")
 
         db.refresh(job)
         job.input_file_path = video_path
@@ -501,10 +502,11 @@ def run_dubbing_pipeline(job_id: str):
                     progress_callback=progress_cb,
                     metadata_out=meta_out,
                 )
+                dl_budget = VideoDubbingService.download_timeout_for_quality(job.preferred_quality) + 120
                 try:
-                    video_path, title = future.result(timeout=300)
+                    video_path, title = future.result(timeout=dl_budget)
                 except concurrent.futures.TimeoutError:
-                    raise Exception("Tải video từ YouTube vượt quá 5 phút. Vui lòng thử lại hoặc dùng video MP4.")
+                    raise Exception(f"Tải video từ YouTube vượt quá {dl_budget // 60} phút. Vui lòng thử lại, chọn chất lượng thấp hơn hoặc dùng video MP4.")
 
             db.refresh(job)
             job.input_file_path = video_path

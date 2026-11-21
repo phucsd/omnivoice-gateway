@@ -529,10 +529,10 @@ def test_unauthenticated_cookies_ignored_and_player_client_selection(tmp_path, m
         opts_anon = captured_calls[-1]
         assert "cookiefile" not in opts_anon
         assert opts_anon["extractor_args"]["youtube"]["player_client"] == [
+            "android_vr",
             "web_embedded",
-            "tv_simply",
             "mweb",
-            "android",
+            "tv",
         ]
 
         # 2. Authenticated cookies MUST be isolated & passed without forcing unauthenticated client override
@@ -1127,5 +1127,27 @@ def test_detect_speaker_gender_male_vs_female(tmp_path):
     female_path = str(tmp_path / "female_vocals.wav")
     sf.write(female_path, female_wave, sr)
     assert VideoDubbingService.detect_speaker_gender(female_path) == "female"
+
+
+def test_youtube_2k_4k_quality_normalization_and_format_selector():
+    from app.services.video_dubbing_service import VideoDubbingService, _QUALITY_HEIGHT_MAP
+
+    assert _QUALITY_HEIGHT_MAP["2160p"] == 2160
+    assert _QUALITY_HEIGHT_MAP["1440p"] == 1440
+    assert VideoDubbingService.normalize_preferred_quality("4K") == "2160p"
+    assert VideoDubbingService.normalize_preferred_quality("2160p") == "2160p"
+    assert VideoDubbingService.normalize_preferred_quality("2k") == "1440p"
+    assert VideoDubbingService.normalize_preferred_quality("1440p") == "1440p"
+    assert VideoDubbingService.normalize_preferred_quality("1080p") == "1080p"
+
+    fmt_4k = VideoDubbingService._build_format_selector("2160p")
+    assert fmt_4k.startswith("bestvideo[height<=2160][height>1080][vcodec=vp9]+bestaudio[ext=m4a]/")
+
+    fmt_2k = VideoDubbingService._build_format_selector("1440p")
+    assert fmt_2k.startswith("bestvideo[height<=1440][height>1080][vcodec=vp9]+bestaudio[ext=m4a]/")
+
+    fmt_1080 = VideoDubbingService._build_format_selector("1080p")
+    assert fmt_1080.startswith("bestvideo[height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/")
+
 
 

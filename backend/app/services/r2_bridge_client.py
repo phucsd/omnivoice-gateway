@@ -432,6 +432,7 @@ class RemoteYouTubeBridgeClient:
                     and cached.get("video_id") == video_id
                     and cached.get("title")
                     and len(cached_quals) > 1
+                    and cached.get("quality_schema_v") == 2
                 ):
                     return cached
             except Exception:
@@ -474,7 +475,7 @@ class RemoteYouTubeBridgeClient:
             if log_fn:
                 log_fn(msg)
 
-        quality = (preferred_quality or "1080p").strip().lower()
+        quality = VideoDubbingService.normalize_preferred_quality(preferred_quality)
         r2 = R2GatewayClient()
         video_key = f"yt/{video_id}_{quality}.mp4"
         meta_key = f"yt/{video_id}_{quality}.meta.json"
@@ -540,7 +541,8 @@ class RemoteYouTubeBridgeClient:
         task_id = task_data["task_id"]
         _emit_log(f"[Windows Bridge] Đã nhận task_id={task_id}. Bắt đầu theo dõi tiến độ...")
 
-        deadline = time.monotonic() + 300.0
+        bridge_budget = float(VideoDubbingService.download_timeout_for_quality(quality))
+        deadline = time.monotonic() + bridge_budget
         last_state_msg = ""
         while time.monotonic() < deadline:
             time.sleep(1.5)
@@ -582,4 +584,4 @@ class RemoteYouTubeBridgeClient:
             if t_status == "failed":
                 raise RuntimeError(t_info.get("error") or "Windows Bridge báo lỗi khi tải YouTube.")
 
-        raise TimeoutError("Windows Bridge quá thời gian chờ 300 giây.")
+        raise TimeoutError(f"Windows Bridge quá thời gian chờ {int(bridge_budget)} giây.")

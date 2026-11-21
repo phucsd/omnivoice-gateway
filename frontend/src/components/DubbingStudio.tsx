@@ -2076,6 +2076,8 @@ export default function DubbingStudio({
                       onChange={(e) => setRetryQuality(e.target.value)}
                       className="bg-background border border-border rounded-lg px-2.5 py-1 text-xs font-medium text-foreground focus:outline-none focus:border-primary"
                     >
+                      <option value="2160p">4K Ultra HD (2160p)</option>
+                      <option value="1440p">2K QHD (1440p)</option>
                       <option value="1080p">1080p Full HD</option>
                       <option value="720p">720p HD</option>
                       <option value="480p">480p SD</option>
@@ -2753,10 +2755,20 @@ export default function DubbingStudio({
                               >
                                 {(ytInfo.available_qualities && ytInfo.available_qualities.length > 0
                                   ? ytInfo.available_qualities
-                                  : ["1080p", "720p", "480p", "360p"]
+                                  : ["2160p", "1440p", "1080p", "720p", "480p", "360p"]
                                 ).map((q) => (
                                   <option key={q} value={q}>
-                                    {q === "1080p" ? "1080p Full HD" : q === "720p" ? "720p HD" : q === "480p" ? "480p SD" : "360p Nhanh"}
+                                    {q === "2160p"
+                                      ? "4K Ultra HD (2160p)"
+                                      : q === "1440p"
+                                        ? "2K QHD (1440p)"
+                                        : q === "1080p"
+                                          ? "1080p Full HD"
+                                          : q === "720p"
+                                            ? "720p HD"
+                                            : q === "480p"
+                                              ? "480p SD"
+                                              : "360p Nhanh"}
                                   </option>
                                 ))}
                               </select>
