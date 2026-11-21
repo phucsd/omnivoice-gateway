@@ -528,12 +528,7 @@ def test_unauthenticated_cookies_ignored_and_player_client_selection(tmp_path, m
         assert title1 == "Client Check"
         opts_anon = captured_calls[-1]
         assert "cookiefile" not in opts_anon
-        assert opts_anon["extractor_args"]["youtube"]["player_client"] == [
-            "web_embedded",
-            "android_vr",
-            "tv",
-            "mweb",
-        ]
+        assert opts_anon["extractor_args"]["youtube"]["player_client"] == ["default"]
 
         # 2. Authenticated cookies MUST be isolated & passed without forcing unauthenticated client override
         VideoDubbingService.save_cookies_content("SID=sec123; SAPISID=auth456")
