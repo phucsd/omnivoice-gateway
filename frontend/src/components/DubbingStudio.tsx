@@ -152,8 +152,8 @@ function estimateDubbingSpokenStats(text: string, targetLanguage?: string): { sy
   }
   const commas = (s.match(/[,;:]/g) || []).length;
   const internalBreaks = (s.match(/[.!?]+(?=\s+\S)/g) || []).length;
-  // Empirically calibrated on native OmniVoice Vietnamese narration at speed=0.92 (~4.45 syl/s)
-  const est = (0.2015 * syllables + 0.2174 * commas + 0.34 * internalBreaks + 0.0544) * (0.96 / 0.92);
+  // Empirically calibrated on native OmniVoice Vietnamese narration at speed=0.92 (sub-linear speed response)
+  const est = (0.2015 * syllables + 0.2174 * commas + 0.34 * internalBreaks + 0.0544) * Math.pow(0.96 / 0.92, 0.55);
   return { syllables, estSeconds: Math.round(Math.max(0.25, est) * 10) / 10 };
 }
 

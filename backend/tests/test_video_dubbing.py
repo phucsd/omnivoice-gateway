@@ -1193,7 +1193,7 @@ def test_two_stage_isochronous_translation_and_monotone_guard(monkeypatch):
         strategy="two_stage_isochronous",
     )
     assert len(calls) == 2
-    assert calls[1][0] == "medium"  # High effort automatically steps down to medium on selective Pass 2
+    assert calls[1][0] == "low"  # High effort automatically steps down to low on fast selective Pass 2
     assert len(out) == 3
     # Seg 1 expanded cleanly, seg 2 untouched, seg 3 tightened cleanly
     assert "lỗ thần kinh cằm" in out[0]["text"]

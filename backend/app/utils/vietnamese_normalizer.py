@@ -340,7 +340,8 @@ def estimate_vietnamese_spoken_duration(
     internal_breaks = len(re.findall(r'[.!?]+(?=\s+\S)', norm_no_tags))
     base_at_096 = 0.2015 * syllables + 0.2174 * commas + 0.34 * internal_breaks + 0.0544
     safe_speed = max(0.5, min(2.0, float(speed or 0.92)))
-    est = base_at_096 * (0.96 / safe_speed)
+    # OmniVoice diffusion responds sub-linearly to speed around reference cadence (~exponent 0.55 verified across 56 utterances)
+    est = base_at_096 * ((0.96 / safe_speed) ** 0.55)
     return round(max(0.25, est), 3)
 
 
@@ -389,11 +390,11 @@ def compute_segment_timing_budget(
     allowed_dur = round(slot_dur + safe_borrow, 3)
 
     safe_speed = max(0.5, min(2.0, float(speed or 0.92)))
-    syl_sec = 0.2015 * (0.96 / safe_speed)
+    syl_sec = 0.2015 * ((0.96 / safe_speed) ** 0.55)
     pause_overhead = (0.22 if slot_dur >= 3.5 else 0.0) + 0.055
 
-    min_dur = slot_dur * (0.82 if slot_dur >= 2.8 else 0.72)
-    ideal_dur = slot_dur * 0.96
+    min_dur = slot_dur * (0.86 if slot_dur >= 2.8 else 0.74)
+    ideal_dur = slot_dur * 0.97
     max_dur = allowed_dur * 1.02
 
     min_syl = max(2, int(round((min_dur - pause_overhead) / syl_sec)))

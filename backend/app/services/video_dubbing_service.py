@@ -2155,7 +2155,7 @@ class VideoDubbingService:
             ratio = est_dur / budget["slot_dur"]
             ratios.append(ratio)
 
-            low_bound = budget["slot_dur"] * (0.82 if budget["slot_dur"] >= 2.8 else 0.72)
+            low_bound = budget["slot_dur"] * (0.86 if budget["slot_dur"] >= 2.8 else 0.74)
             high_bound = budget["allowed_dur"] * (1.03 if budget["gap_after"] < 0.45 else 1.05)
 
             if est_dur > high_bound:
@@ -2169,7 +2169,7 @@ class VideoDubbingService:
             if est_dur > high_bound:
                 status = "TOO_LONG"
                 too_long_count += 1
-            elif budget["slot_dur"] >= 2.8 and est_dur < budget["slot_dur"] * 0.80 and (not is_vi or syl_count <= budget["min_syl"] - 2):
+            elif budget["slot_dur"] >= 2.8 and est_dur < budget["slot_dur"] * 0.84 and (not is_vi or syl_count <= budget["min_syl"] - 1):
                 status = "TOO_SHORT"
                 too_short_count += 1
             else:
@@ -2406,15 +2406,15 @@ class VideoDubbingService:
                 f"You are a precision isochronous dubbing editor for {target_language}.\n"
                 f"Our acoustic duration model measured the exact spoken duration of our Pass-1 dubbing script and flagged ONLY the {len(flagged_payload)} segments below as outside the ideal timing window.\n\n"
                 f"CALIBRATION RULES:\n"
-                f"1. For `EXPAND_ACCURATELY` (currently finishing too early): Rewrite the translation in fuller, smoother, natural {target_language} voiceover phrasing so its spoken syllable count lands inside `target_syl_range` (~`target_sec` seconds). Restore EVERY nuance, preposition, subject, and technical modifier from `orig_source`. NEVER invent facts not present in `orig_source` and NEVER pad meaningless fluff.\n"
+                f"1. For `EXPAND_ACCURATELY` (currently finishing too early): Rewrite the translation in fuller, smoother, natural {target_language} voiceover phrasing so its spoken syllable count lands inside `target_syl_range` (~`target_sec` seconds). Restore EVERY nuance, logical subject/action, preposition, and technical modifier from `orig_source`. NEVER invert or omit the logical subject/action, NEVER invent facts not present in `orig_source`, and NEVER pad meaningless fluff.\n"
                 f"2. For `TIGHTEN_WITHOUT_LOSS` (currently too long for its slot): Tighten wording to fit squarely inside `target_syl_range` (`<= allowed_max_sec` seconds) while STRICTLY preserving ALL numbers, measurements, medical/technical terms, and steps from `orig_source`.\n"
                 f"3. Keep terminology 100% consistent with `prev_segment` and `next_segment`, and remember spoken syllable expansion of units/acronyms (e.g. '10 Ncm'=6 syl, '10 mm'=4 syl, 'MIS'=3 syl, 'implant'=2 syl, 'abutment'=3 syl).\n"
                 f"4. Return ONLY a valid JSON array of revised objects `[{{\"id\": <int>, \"text\": \"<revised text>\"}}]` containing ONLY the {len(flagged_payload)} flagged IDs. No markdown fences or commentary.\n\n"
                 f"Flagged Segments JSON:\n{json.dumps(flagged_payload, ensure_ascii=False)}"
             )
 
-            # Use medium effort for fast, targeted Pass 2 if profile is set to high
-            pass2_effort = "medium" if llm_config.get("thinking_effort") == "high" else llm_config.get("thinking_effort", "none")
+            # Use low effort for fast, targeted Pass 2 (~8-15s) so full 2-stage translation stays well under Cloudflare's 100s proxy timeout
+            pass2_effort = "low" if llm_config.get("thinking_effort") in ("high", "medium") else llm_config.get("thinking_effort", "none")
 
             try:
                 parsed_pass2 = VideoDubbingService._call_llm_json_array(
@@ -2441,7 +2441,7 @@ class VideoDubbingService:
                     if not cand_text:
                         continue
                     cand_est = estimate_spoken_duration(cand_text, target_language=target_language, speed=base_speed)
-                    low_bound = row["slot_dur"] * (0.82 if row["slot_dur"] >= 2.8 else 0.72)
+                    low_bound = row["slot_dur"] * (0.86 if row["slot_dur"] >= 2.8 else 0.74)
                     high_bound = row["allowed_dur"] * (1.03 if row["gap_after"] < 0.45 else 1.05)
                     if cand_est > high_bound:
                         cand_err = cand_est - high_bound
