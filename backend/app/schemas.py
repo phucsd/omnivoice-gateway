@@ -301,6 +301,7 @@ class DubbingRetryTranslationRequest(BaseModel):
     llm_profile_id: Optional[str] = None
     target_language: Optional[str] = None
     force_fallback: Optional[bool] = False
+    translation_strategy: Optional[str] = None
 
 class ShortenSubtitleRequest(BaseModel):
     segment_id: int

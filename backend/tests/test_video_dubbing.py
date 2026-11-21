@@ -1145,4 +1145,93 @@ def test_youtube_2k_4k_quality_normalization_and_format_selector():
     assert fmt_1080.startswith("bestvideo[height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/")
 
 
+def test_two_stage_isochronous_translation_and_monotone_guard(monkeypatch):
+    from app.services.video_dubbing_service import VideoDubbingService
+
+    orig_subs = [
+        {"id": 1, "start": 0.0, "end": 5.2, "text": "Use the mental foramen as your landmark, ending the drilling anteriorly to it."},
+        {"id": 2, "start": 15.0, "end": 18.0, "text": "Multifix is fixed restoration for atrophic ridges."},
+        {"id": 3, "start": 18.1, "end": 21.1, "text": "Short tight slot with almost zero gap after it."},
+    ]
+
+    monkeypatch.setattr(
+        VideoDubbingService,
+        "get_llm_settings",
+        staticmethod(lambda db, llm_profile_id=None: {
+            "provider": "openai",
+            "api_key": "sk-test",
+            "model": "gpt-test",
+            "custom_endpoint": "",
+            "thinking_effort": "high",
+            "profile_name": "Test LLM",
+        }),
+    )
+
+    calls = []
+
+    def _fake_call_llm(llm_config, system_prompt, user_prompt, override_thinking_effort=None):
+        calls.append((override_thinking_effort, user_prompt))
+        if len(calls) == 1:
+            # Pass 1: seg 1 is too short (11 syl vs 5.2s), seg 2 is perfect (~2.9s), seg 3 is way too long for tight 3.0s slot
+            return [
+                {"id": 1, "text": "Dùng lỗ cằm làm mốc, dừng khoan phía trước."},
+                {"id": 2, "text": "Multifix là giải pháp phục hình cố định cho sống hàm tiêu xương."},
+                {"id": 3, "text": "Đây là phân đoạn rất dài dòng giải thích cực kỳ chi tiết quá nhiều từ vượt hẳn thời lượng cho phép trong khung ngắn này."},
+            ]
+        # Pass 2: calibrates seg 1 accurately (~4.9s), seg 3 tightens cleanly (~2.8s)
+        return [
+            {"id": 1, "text": "Hãy sử dụng lỗ thần kinh cằm làm mốc giải phẫu, và kết thúc đường khoan ở phía trước vị trí này."},
+            {"id": 3, "text": "Phân đoạn ngắn có khoảng nghỉ phía sau gần như bằng không."},
+        ]
+
+    monkeypatch.setattr(VideoDubbingService, "_call_llm_json_array", staticmethod(_fake_call_llm))
+
+    out = VideoDubbingService.translate_subtitles_llm(
+        orig_subs,
+        target_language="Vietnamese",
+        db=None,
+        strategy="two_stage_isochronous",
+    )
+    assert len(calls) == 2
+    assert calls[1][0] == "medium"  # High effort automatically steps down to medium on selective Pass 2
+    assert len(out) == 3
+    # Seg 1 expanded cleanly, seg 2 untouched, seg 3 tightened cleanly
+    assert "lỗ thần kinh cằm" in out[0]["text"]
+    assert out[1]["text"] == "Multifix là giải pháp phục hình cố định cho sống hàm tiêu xương."
+    assert len(out[2]["text"].split()) <= 14
+
+
+def test_assemble_dubbed_vocal_smart_gap_borrowing(tmp_path):
+    import numpy as np
+    import soundfile as sf
+    from app.services.video_dubbing_service import VideoDubbingService
+
+    sr = 24000
+    # Seg 1: orig slot 0.0 -> 2.0s (2.0s), gap_after = 3.0s -> safe_borrow = 0.85s -> allowed 2.85s
+    # Audio is 2.55s -> should NOT be time-compressed (stays ~2.55s inside 0.0 -> 5.0s window!)
+    s1_path = str(tmp_path / "s1.wav")
+    s2_path = str(tmp_path / "s2.wav")
+    sf.write(s1_path, 0.3 * np.ones(int(sr * 2.55), dtype=np.float32), sr)
+    sf.write(s2_path, 0.3 * np.ones(int(sr * 1.50), dtype=np.float32), sr)
+
+    out_wav = str(tmp_path / "assembled.wav")
+    VideoDubbingService.assemble_dubbed_vocal(
+        [
+            {"start": 0.0, "end": 2.0, "file_path": s1_path},
+            {"start": 5.0, "end": 7.0, "file_path": s2_path},
+        ],
+        out_wav,
+        total_duration=8.0,
+    )
+    assembled, out_sr = sf.read(out_wav, dtype="float32")
+    assert out_sr == 24000
+    # At 2.40s (borrowed into silence), seg 1 must still be active (not compressed down to 2.0s!)
+    assert float(np.max(np.abs(assembled[int(2.35 * sr):int(2.45 * sr)]))) > 0.1
+    # At 3.0s .. 4.8s (silence gap before seg 2), must be quiet
+    assert float(np.max(np.abs(assembled[int(3.0 * sr):int(4.8 * sr)]))) < 0.01
+    # At 5.2s, seg 2 must be active cleanly
+    assert float(np.max(np.abs(assembled[int(5.2 * sr):int(5.4 * sr)]))) > 0.1
+
+
+
 

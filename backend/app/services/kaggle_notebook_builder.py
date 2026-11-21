@@ -1343,8 +1343,26 @@ def main():
                         return out
 
                     vi_diacritics = set("áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗợúùủũụưứừửữựýỳỷỹỵđ")
-                    base_speed = float(job.get("speed") or 0.96)
+                    base_speed = float(job.get("speed") or 0.92)
                     base_guidance = float(job.get("guidance_scale") or 2.0)
+
+                    def _qa_check_dub_wav(wav_arr, exp_w_list, s_lang):
+                        if len(exp_w_list) < 4:
+                            return 1.0, False, ""
+                        try:
+                            wm_qa = get_whisper_model()
+                            q_segs, _ = wm_qa.transcribe(
+                                resample_to_16k(wav_arr, 24000),
+                                language=s_lang if s_lang in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None,
+                                without_timestamps=True,
+                            )
+                            q_txt = " ".join(s.text.strip() for s in q_segs if s.text).strip()
+                            q_words = [w.strip(".,!?;:()-").lower() for w in q_txt.split() if w.strip(".,!?;:()-")]
+                            oh_leak = bool(q_words and q_words[0] in ("oh", "ồ", "ờ"))
+                            cov = len(q_words) / float(max(1, len(exp_w_list)))
+                            return cov, oh_leak, q_txt
+                        except Exception:
+                            return 1.0, False, ""
 
                     for idx, seg in enumerate(segments):
                         seg_id = seg.get("id", idx + 1) if isinstance(seg, dict) else (idx + 1)
@@ -1352,6 +1370,17 @@ def main():
                         start_t = float(seg.get("start", 0.0)) if isinstance(seg, dict) else 0.0
                         end_t = float(seg.get("end", start_t + 3.0)) if isinstance(seg, dict) else (start_t + 3.0)
                         target_dur = max(0.5, end_t - start_t)
+                        if isinstance(seg, dict) and seg.get("gap_after") is not None:
+                            gap_after = max(0.0, float(seg.get("gap_after") or 0.0))
+                        elif idx + 1 < len(segments) and isinstance(segments[idx + 1], dict):
+                            nxt_s = float(segments[idx + 1].get("start", end_t) or end_t)
+                            gap_after = max(0.0, nxt_s - end_t)
+                        else:
+                            gap_after = 4.0
+                        if isinstance(seg, dict) and seg.get("allowed_dur") is not None:
+                            allowed_dur = max(target_dur, float(seg.get("allowed_dur") or target_dur))
+                        else:
+                            allowed_dur = target_dur + min(0.80, max(0.0, gap_after - 0.30) * 0.42)
 
                         if idx == 0 or (idx + 1) % 3 == 0 or (idx + 1) == total_segs:
                             seg_pct = min(92, 60 + int(((idx + 1) / total_segs) * 32))
@@ -1376,11 +1405,23 @@ def main():
                                 seg_text = re.sub(r'(\\d),(\\d)', r'\\1.\\2', seg_text)
                             seg_text = normalize_vietnamese_text(seg_text)
 
-                        log(f"Dubbing segment {{seg_id}} ({{idx+1}}/{{total_segs}}, lang={{seg_lang}}): '{{seg_text[:75]}}' (target: {{target_dur:.2f}}s)")
+                        # Pre-pass Adaptive Natural Acoustic Speed: nail the target duration natively on Pass 1!
+                        init_speed = base_speed
+                        if is_vi_seg and seg_text:
+                            try:
+                                pred_dur = estimate_vietnamese_spoken_duration(seg_text, speed=base_speed, already_normalized=True)
+                                if pred_dur > allowed_dur * 1.03:
+                                    init_speed = min(1.16, max(base_speed, round(base_speed * (pred_dur / allowed_dur), 3)))
+                                elif target_dur >= 2.6 and pred_dur > 0.4 and pred_dur < target_dur * 0.86:
+                                    init_speed = max(0.84, min(base_speed, round(base_speed * (pred_dur / (target_dur * 0.93)), 3)))
+                            except Exception:
+                                init_speed = base_speed
+
+                        log(f"Dubbing segment {{seg_id}} ({{idx+1}}/{{total_segs}}, lang={{seg_lang}}, speed={{init_speed:.2f}}): '{{seg_text[:75]}}' (slot={{target_dur:.2f}}s, allowed={{allowed_dur:.2f}}s)")
 
                         gen_kwargs = {{
                             "text": seg_text,
-                            "speed": base_speed,
+                            "speed": init_speed,
                             "guidance_scale": base_guidance,
                             "postprocess_output": False,
                         }}
@@ -1413,51 +1454,50 @@ def main():
 
                         # Fast GPU Whisper QA verification: catch & retry any stochastic word-skip or prompt prefix artifact
                         exp_words = [w for w in seg_text.split() if any(c.isalnum() for c in w)]
-                        if len(exp_words) >= 4:
-                            try:
-                                wm_qa = get_whisper_model()
-                                qa_segs, _ = wm_qa.transcribe(
-                                    resample_to_16k(wav_seg, 24000),
-                                    language=seg_lang if seg_lang in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None,
-                                    without_timestamps=True,
-                                )
-                                qa_txt = " ".join(s.text.strip() for s in qa_segs if s.text).strip()
-                                qa_words = [w.strip(".,!?;:()-").lower() for w in qa_txt.split() if w.strip(".,!?;:()-")]
-                                has_oh_leak = bool(qa_words and qa_words[0] in ("oh", "ồ", "ờ"))
-                                coverage = len(qa_words) / float(max(1, len(exp_words)))
-                                if has_oh_leak or coverage < 0.70:
-                                    log(f"QA retry on segment {{seg_id}} (coverage={{coverage:.2f}}, oh_leak={{has_oh_leak}}, heard='{{qa_txt[:55]}}')...")
-                                    retry_kw = dict(gen_kwargs)
-                                    retry_kw["position_temperature"] = 2.0
-                                    retry_kw["guidance_scale"] = 2.8
-                                    retry_res = _run_omni_gen(retry_kw)
-                                    retry_wav = _gentle_trim_dub_wav(retry_res[0], 24000)
-                                    qa_segs2, _ = wm_qa.transcribe(
-                                        resample_to_16k(retry_wav, 24000),
-                                        language=seg_lang if seg_lang in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None,
-                                        without_timestamps=True,
-                                    )
-                                    qa_txt2 = " ".join(s.text.strip() for s in qa_segs2 if s.text).strip()
-                                    qa_words2 = [w.strip(".,!?;:()-").lower() for w in qa_txt2.split() if w.strip(".,!?;:()-")]
-                                    oh2 = bool(qa_words2 and qa_words2[0] in ("oh", "ồ", "ờ"))
-                                    cov2 = len(qa_words2) / float(max(1, len(exp_words)))
-                                    if (not oh2 and has_oh_leak) or cov2 >= coverage:
-                                        wav_seg = retry_wav
-                                        log(f"QA retry improved segment {{seg_id}} -> coverage={{cov2:.2f}}, heard='{{qa_txt2[:55]}}'")
-                            except Exception as qa_err:
-                                log(f"Notice: QA check skipped on segment {{seg_id}}: {{qa_err}}")
+                        cov1, oh1, qa_txt1 = _qa_check_dub_wav(wav_seg, exp_words, seg_lang)
+                        if len(exp_words) >= 4 and (oh1 or cov1 < 0.70):
+                            log(f"QA retry on segment {{seg_id}} (coverage={{cov1:.2f}}, oh_leak={{oh1}}, heard='{{qa_txt1[:55]}}')...")
+                            retry_kw = dict(gen_kwargs)
+                            retry_kw["position_temperature"] = 2.0
+                            retry_kw["guidance_scale"] = 2.8
+                            retry_res = _run_omni_gen(retry_kw)
+                            retry_wav = _gentle_trim_dub_wav(retry_res[0], 24000)
+                            cov2, oh2, qa_txt2 = _qa_check_dub_wav(retry_wav, exp_words, seg_lang)
+                            if (not oh2 and oh1) or cov2 >= cov1:
+                                wav_seg = retry_wav
+                                cov1, oh1 = cov2, oh2
+                                log(f"QA retry improved segment {{seg_id}} -> coverage={{cov2:.2f}}, heard='{{qa_txt2[:55]}}'")
 
                         synth_dur = len(wav_seg) / 24000.0
-                        log(f"Segment {{seg_id}} synthesized duration: {{synth_dur:.2f}}s (slot={{target_dur:.2f}}s)")
+                        log(f"Segment {{seg_id}} synthesized: {{synth_dur:.2f}}s (slot={{target_dur:.2f}}s, allowed={{allowed_dur:.2f}}s, ratio={{synth_dur/target_dur:.2f}}x)")
 
-                        # Only re-generate at faster speed when grossly exceeding slot (>1.38x); Gateway WSOLA handles gentle 1.0-1.35x fit!
-                        if synth_dur > max(target_dur + 0.65, target_dur * 1.38):
-                            speed_val = min(1.28, max(1.06, (synth_dur / target_dur) * 0.92))
-                            log(f"Re-generating segment {{seg_id}} with gentle speed={{speed_val:.2f}}...")
+                        # Closed-Loop Native Acoustic Speed Calibration (bidirectional, QA-guarded):
+                        if synth_dur > max(allowed_dur + 0.28, allowed_dur * 1.12):
+                            speed_val = min(1.22, max(init_speed + 0.06, round(init_speed * (synth_dur / (allowed_dur * 1.02)), 3)))
+                            log(f"Acoustic speed-up retry seg {{seg_id}}: {{init_speed:.2f}} -> {{speed_val:.2f}} ({{synth_dur:.2f}}s > allowed {{allowed_dur:.2f}}s)")
                             fast_kw = dict(gen_kwargs)
                             fast_kw["speed"] = speed_val
-                            audio_res = _run_omni_gen(fast_kw)
-                            wav_seg = _gentle_trim_dub_wav(audio_res[0], 24000)
+                            fast_res = _run_omni_gen(fast_kw)
+                            fast_wav = _gentle_trim_dub_wav(fast_res[0], 24000)
+                            fast_dur = len(fast_wav) / 24000.0
+                            fcov, foh, _ = _qa_check_dub_wav(fast_wav, exp_words, seg_lang)
+                            if (not foh) and fcov >= 0.72 and fast_dur < synth_dur:
+                                wav_seg = fast_wav
+                                synth_dur = fast_dur
+                                log(f"Acoustic speed-up accepted seg {{seg_id}} -> {{synth_dur:.2f}}s (ratio={{synth_dur/target_dur:.2f}}x)")
+                        elif target_dur >= 2.8 and synth_dur < target_dur * 0.78 and init_speed > 0.85:
+                            speed_val = max(0.84, min(init_speed - 0.04, round(init_speed * (synth_dur / (target_dur * 0.92)), 3)))
+                            log(f"Acoustic calm-pace retry seg {{seg_id}}: {{init_speed:.2f}} -> {{speed_val:.2f}} ({{synth_dur:.2f}}s < 0.78x of {{target_dur:.2f}}s)")
+                            slow_kw = dict(gen_kwargs)
+                            slow_kw["speed"] = speed_val
+                            slow_res = _run_omni_gen(slow_kw)
+                            slow_wav = _gentle_trim_dub_wav(slow_res[0], 24000)
+                            slow_dur = len(slow_wav) / 24000.0
+                            scov, soh, _ = _qa_check_dub_wav(slow_wav, exp_words, seg_lang)
+                            if (not soh) and scov >= 0.72 and slow_dur > synth_dur and slow_dur <= allowed_dur * 1.06:
+                                wav_seg = slow_wav
+                                synth_dur = slow_dur
+                                log(f"Acoustic calm-pace accepted seg {{seg_id}} -> {{synth_dur:.2f}}s (ratio={{synth_dur/target_dur:.2f}}x)")
 
                         seg_wav_name = f"segment_{{seg_id}}.wav"
                         sf.write(seg_wav_name, wav_seg, 24000, format='WAV', subtype='PCM_16')

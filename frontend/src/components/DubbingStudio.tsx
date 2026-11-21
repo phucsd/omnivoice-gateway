@@ -96,6 +96,67 @@ function formatDuration(seconds?: number | null): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+function estimateDubbingSpokenStats(text: string, targetLanguage?: string): { syllables: number; estSeconds: number } {
+  const cleaned = (text || "").replace(/\[[^\[\]\n]{1,64}\]/g, " ").trim();
+  if (!cleaned) return { syllables: 0, estSeconds: 0 };
+
+  const lang = (targetLanguage || "vietnamese").toLowerCase();
+  const isVi = lang === "vi" || lang.includes("viet") || lang.includes("việt");
+  if (!isVi) {
+    const words = cleaned.split(/\s+/).filter(Boolean).length;
+    const pauses = (cleaned.match(/[,;:]/g) || []).length;
+    return { syllables: words, estSeconds: Math.round((words / 2.65 + pauses * 0.18 + 0.08) * 10) / 10 };
+  }
+
+  // Approximate phonetic expansion matching backend vietnamese_normalizer.py
+  let s = cleaned
+    .replace(/(\d)\s*(?:N[\s·.\-]*cm|NCM)\b/g, "$1 niu tơn xen ti mét")
+    .replace(/\bN[·.]?cm\b/g, "niu tơn xen ti mét")
+    .replace(/(\d)\s*(?:N[·.]m|Nm)\b/g, "$1 niu tơn mét")
+    .replace(/(\d)\s*RPM\b/gi, "$1 vòng một phút")
+    .replace(/\bvòng\s*\/\s*phút\b/gi, "vòng một phút")
+    .replace(/(\d)\s*mm\b/g, "$1 mi li mét")
+    .replace(/(\d)\s*cm\b/g, "$1 xen ti mét")
+    .replace(/(\d)\s*km\b/g, "$1 ki lô mét")
+    .replace(/(\d)\s*m[lL]\b/g, "$1 mi li lít")
+    .replace(/(\d)\s*°\s*C\b/gi, "$1 độ xê")
+    .replace(/(\d)\s*°/g, "$1 độ");
+
+  const tokens = s.split(/[\s\-–—/]+/).filter(Boolean);
+  let syllables = 0;
+  for (const rawTok of tokens) {
+    const tok = rawTok.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+    if (!tok) continue;
+    if (/[^\x00-\x7F]/.test(tok)) {
+      syllables += 1;
+    } else if (/^\d+(?:[.,]\d+)?$/.test(tok)) {
+      const n = Number(tok.replace(",", "."));
+      if (Number.isFinite(n)) {
+        if (tok.includes(".") || tok.includes(",")) syllables += 3;
+        else if (n >= 1000) syllables += 4;
+        else if (n >= 100) syllables += 2;
+        else if (n >= 20) syllables += 2;
+        else syllables += 1;
+      } else {
+        syllables += 2;
+      }
+    } else if (/^[A-Z]{2,5}$/.test(tok)) {
+      syllables += tok.length;
+    } else {
+      const w = tok.toLowerCase();
+      const groups = w.match(/[aeiouy]+/g) || [];
+      let sc = Math.max(1, groups.length);
+      if (w.endsWith("e") && !/(?:le|ye|ee|oe|ae)$/.test(w) && sc > 1) sc -= 1;
+      syllables += Math.max(1, sc);
+    }
+  }
+  const commas = (s.match(/[,;:]/g) || []).length;
+  const internalBreaks = (s.match(/[.!?]+(?=\s+\S)/g) || []).length;
+  // Empirically calibrated on native OmniVoice Vietnamese narration at speed=0.92 (~4.45 syl/s)
+  const est = (0.2015 * syllables + 0.2174 * commas + 0.34 * internalBreaks + 0.0544) * (0.96 / 0.92);
+  return { syllables, estSeconds: Math.round(Math.max(0.25, est) * 10) / 10 };
+}
+
 export default function DubbingStudio({
   currentUser,
   initialJobIdProp,
@@ -3740,9 +3801,15 @@ export default function DubbingStudio({
                   const isPlayingNow = activeOrigSeg?.id === seg.id;
                   const isEditingOrig = editingOrigSegId === seg.id;
                   const duration = typeof seg.start === "number" && typeof seg.end === "number" ? Math.max(0.1, seg.end - seg.start) : 2.0;
-                  const words = (seg.text || "").trim().split(/\s+/).filter(Boolean).length;
-                  const estSeconds = Math.round((words / 3.0) * 10) / 10;
-                  const isOverDuration = estSeconds > duration * 1.15;
+                  const nextSeg = translatedSubs[idx + 1];
+                  const gapAfter = nextSeg && typeof nextSeg.start === "number" && typeof seg.end === "number"
+                    ? Math.max(0, nextSeg.start - seg.end)
+                    : 4.0;
+                  const safeBorrow = Math.min(0.80, Math.max(0, gapAfter - 0.30) * 0.42);
+                  const allowedDur = duration + safeBorrow;
+                  const { syllables, estSeconds } = estimateDubbingSpokenStats(seg.text || "", targetLanguage || job?.target_language);
+                  const isOverDuration = estSeconds > allowedDur * 1.06;
+                  const isUnderDuration = duration >= 2.8 && estSeconds < duration * 0.78;
                   const isShortening = shorteningSegId === seg.id;
 
                   return (
@@ -3767,10 +3834,18 @@ export default function DubbingStudio({
                               <span>● Đang phát</span>
                             </span>
                           )}
-                          {isOverDuration && (
+                          {isOverDuration ? (
                             <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30 flex items-center gap-1">
                               <AlertTriangle className="w-2.5 h-2.5" />
-                              <span>Quá dài (~{estSeconds}s / {duration.toFixed(1)}s)</span>
+                              <span>Quá dài (~{estSeconds}s / tối đa {allowedDur.toFixed(1)}s)</span>
+                            </span>
+                          ) : isUnderDuration ? (
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-sky-500/15 text-sky-600 dark:text-sky-400 border border-sky-500/30 flex items-center gap-1">
+                              <span>Hơi ngắn (~{estSeconds}s / {duration.toFixed(1)}s)</span>
+                            </span>
+                          ) : (
+                            <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/25 flex items-center gap-1">
+                              <span>Khớp nhịp (~{estSeconds}s / {duration.toFixed(1)}s)</span>
                             </span>
                           )}
                         </div>
@@ -3865,7 +3940,7 @@ export default function DubbingStudio({
                           <div className="flex items-center justify-between">
                             <span className="text-[9px] uppercase font-bold text-primary tracking-wider">Dịch ({targetLanguage}):</span>
                             <span className="text-[9px] text-muted-foreground font-mono">
-                              {words} từ • ước tính {estSeconds}s
+                              {syllables} âm tiết • ước tính ~{estSeconds}s
                             </span>
                           </div>
                           <textarea

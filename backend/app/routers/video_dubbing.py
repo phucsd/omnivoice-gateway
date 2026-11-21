@@ -732,7 +732,13 @@ def trigger_translation_stage(dub_job_id: str, text: str, alignment_str: str, db
     VideoDubbingService.log_to_job(dub_job_id, f"Bắt đầu dịch thuật phụ đề tự động sang tiếng: {job.target_language} bằng LLM (Profile ID: {llm_prof_id or 'Default'})...")
     
     try:
-        translated = VideoDubbingService.translate_subtitles_llm(merged_orig_segments, job.target_language, db, llm_profile_id=llm_prof_id)
+        translated = VideoDubbingService.translate_subtitles_llm(
+            merged_orig_segments,
+            job.target_language,
+            db,
+            llm_profile_id=llm_prof_id,
+            log_job_id=dub_job_id,
+        )
         normalized_translated = VideoDubbingService.normalize_translated_subtitles(translated, merged_orig_segments)
         job.translated_subtitles = json.dumps(normalized_translated)
         job.error_message = None
@@ -1370,11 +1376,11 @@ def get_dubbing_job(
     """Lấy thông tin tiến độ và phụ đề của tác vụ lồng tiếng."""
     job = _get_accessible_dubbing_job(db, job_id, current_user)
     
-    # Auto-recovery: If job is stuck in 'translating' for more than 60 seconds and original_subtitles is already available,
+    # Auto-recovery: If job is stuck in 'translating' for more than 180 seconds and original_subtitles is already available,
     # auto-advance it to awaiting_review so the user can immediately review and edit!
     if job.status == "translating" and job.original_subtitles:
         delta = (datetime.utcnow() - job.updated_at).total_seconds() if job.updated_at else 9999
-        if delta > 60:
+        if delta > 180:
             print(f"[AutoRecovery] Rescuing stuck job {job.id} (stuck for {delta:.0f}s in translating)")
             job.status = "awaiting_review"
             job.progress = 100
@@ -1422,9 +1428,20 @@ def retry_dubbing_translation(
         VideoDubbingService.log_to_job(job_id, "Người dùng đã chọn bỏ qua dịch LLM và sử dụng phụ đề gốc.")
         return _format_dubbing_job_response(job)
 
-    VideoDubbingService.log_to_job(job_id, f"Bắt đầu dịch lại phụ đề sang tiếng: {target_lang} bằng LLM (Profile ID: {llm_prof_id or 'Default'})...")
+    strategy = payload.translation_strategy or "two_stage_isochronous"
+    VideoDubbingService.log_to_job(
+        job_id,
+        f"Bắt đầu dịch lại phụ đề sang tiếng: {target_lang} bằng LLM (Profile ID: {llm_prof_id or 'Default'}, chiến lược: {strategy})..."
+    )
     try:
-        translated = VideoDubbingService.translate_subtitles_llm(orig_segments, target_lang, db, llm_profile_id=llm_prof_id)
+        translated = VideoDubbingService.translate_subtitles_llm(
+            orig_segments,
+            target_lang,
+            db,
+            llm_profile_id=llm_prof_id,
+            strategy=strategy,
+            log_job_id=job_id,
+        )
         normalized_translated = VideoDubbingService.normalize_translated_subtitles(translated, orig_segments)
         job.translated_subtitles = json.dumps(normalized_translated)
         job.target_language = target_lang
@@ -1667,6 +1684,7 @@ def run_finalization_pipeline(job_id: str):
             job.message = "Đang gửi yêu cầu sinh giọng đọc lồng tiếng lên Kaggle GPU..."
             db.commit()
 
+            from app.utils.vietnamese_normalizer import compute_segment_timing_budget
             orig_subs = json.loads(job.original_subtitles or "[]")
             orig_by_id = {
                 int(o.get("id", i + 1)): str(o.get("text", "")).strip()
@@ -1674,10 +1692,21 @@ def run_finalization_pipeline(job_id: str):
                 if isinstance(o, dict)
             }
             enriched_segments = []
+            n_trans = len(translated_subs)
             for i, seg in enumerate(translated_subs):
                 if isinstance(seg, dict):
                     sid = int(seg.get("id", i + 1))
                     item = dict(seg)
+                    s_t = float(item.get("start", 0.0) or 0.0)
+                    e_t = float(item.get("end", s_t + 1.0) or (s_t + 1.0))
+                    if i + 1 < n_trans and isinstance(translated_subs[i + 1], dict):
+                        next_s = float(translated_subs[i + 1].get("start", e_t) or e_t)
+                        gap_after = max(0.0, next_s - e_t)
+                    else:
+                        gap_after = 4.0
+                    budget = compute_segment_timing_budget(max(0.4, e_t - s_t), gap_after=gap_after, speed=0.92)
+                    item["gap_after"] = budget["gap_after"]
+                    item["allowed_dur"] = budget["allowed_dur"]
                     if sid in orig_by_id and orig_by_id[sid]:
                         item["orig_text"] = orig_by_id[sid]
                     elif i < len(orig_subs) and isinstance(orig_subs[i], dict):
@@ -1722,7 +1751,8 @@ def run_finalization_pipeline(job_id: str):
             resolved_ref_audio = None
             resolved_ref_text = None
             resolved_instruct = None
-            resolved_speed = 0.96
+            # Slightly calmer 0.92 baseline speed for Vietnamese documentary/instructional narration (~4.45 syl/s)
+            resolved_speed = 0.92 if ov_lang == "vi" else 0.96
             resolved_guidance = 2.0
 
             vi_diac_set = set("áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗợúùủũụưứừửữựýỳỷỹỵđ")
@@ -1893,8 +1923,8 @@ def shorten_subtitle_segment(
         llm_profile_id=profile_id
     )
 
-    words = len(shortened.strip().split()) if shortened else 0
-    est_dur = round(words / 3.0, 2)
+    from app.utils.vietnamese_normalizer import estimate_spoken_duration
+    est_dur = round(estimate_spoken_duration(shortened or "", target_language=target_lang, speed=0.92), 2)
 
     return ShortenSubtitleResponse(
         segment_id=payload.segment_id,

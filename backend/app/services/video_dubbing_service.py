@@ -1972,24 +1972,278 @@ class VideoDubbingService:
         }
 
     @staticmethod
-    def translate_subtitles_llm(subtitles: List[Dict[str, Any]], target_language: str, db: Session, llm_profile_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Translates a list of subtitle segments to target language using configured LLM.
-        Expected input schema: [{"id": 1, "start": 1.2, "end": 4.5, "text": "..."}]
-        """
-        if not subtitles:
-            return []
-
-        llm_config = VideoDubbingService.get_llm_settings(db, llm_profile_id=llm_profile_id)
+    def _call_llm_json_array(
+        llm_config: Dict[str, Any],
+        system_prompt: str,
+        user_prompt: str,
+        override_thinking_effort: Optional[str] = None,
+    ) -> List[Any]:
+        """Executes a configured LLM call (Gemini / OpenAI / Custom) and extracts a JSON array."""
         provider = llm_config["provider"]
         api_key = llm_config["api_key"]
         model = llm_config["model"]
         custom_endpoint = llm_config["custom_endpoint"]
-        thinking_effort = llm_config.get("thinking_effort", "none")
+        thinking_effort = override_thinking_effort if override_thinking_effort is not None else llm_config.get("thinking_effort", "none")
+
+        # Reasoning models with high thinking effort regularly take 50-110s on 30+ segment scripts.
+        read_timeout = 150 if thinking_effort == "high" else 110
+        req_timeout = (15, read_timeout)
+
+        if provider == "gemini":
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            headers = {"Content-Type": "application/json"}
+            gen_config: Dict[str, Any] = {"responseMimeType": "application/json"}
+
+            if thinking_effort and thinking_effort != "none":
+                budget_map = {"low": 1024, "medium": 2048, "high": 4096}
+                budget = budget_map.get(thinking_effort, 1024)
+                gen_config["thinkingConfig"] = {"thinkingBudget": budget}
+
+            payload = {
+                "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}],
+                "generationConfig": gen_config,
+            }
+            res = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
+            if not res.ok and "thinkingConfig" in gen_config and res.status_code == 400:
+                gen_config.pop("thinkingConfig", None)
+                payload["generationConfig"] = gen_config
+                res = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
+
+            if not res.ok:
+                err_msg = res.text
+                try:
+                    err_json = res.json()
+                    if "error" in err_json:
+                        err_msg = err_json["error"].get("message", err_msg)
+                except Exception:
+                    pass
+                raise Exception(f"HTTP {res.status_code} ({provider}): {err_msg[:250]}")
+
+            res_data = res.json()
+            parts = res_data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            text_out = ""
+            for part in parts:
+                if part.get("thought"):
+                    continue
+                if "text" in part:
+                    text_out += part["text"]
+            if not text_out and parts:
+                text_out = parts[-1].get("text", "")
+
+        elif provider in ["openai", "custom"]:
+            if provider == "custom" and custom_endpoint:
+                url = custom_endpoint.strip()
+                if not url.endswith("/chat/completions"):
+                    if url.endswith("/"):
+                        url = url + "chat/completions"
+                    elif "/v1" not in url:
+                        url = url + "/v1/chat/completions"
+                    else:
+                        url = url + "/chat/completions"
+            else:
+                url = "https://api.openai.com/v1/chat/completions"
+
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            payload: Dict[str, Any] = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+            if thinking_effort and thinking_effort != "none":
+                payload["reasoning_effort"] = thinking_effort
+
+            res = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
+            if not res.ok and "reasoning_effort" in payload and res.status_code == 400:
+                payload.pop("reasoning_effort", None)
+                res = requests.post(url, headers=headers, json=payload, timeout=req_timeout)
+
+            if not res.ok:
+                err_msg = res.text
+                try:
+                    err_json = res.json()
+                    if "error" in err_json:
+                        err_msg = err_json["error"].get("message", err_msg)
+                except Exception:
+                    pass
+                raise Exception(f"HTTP {res.status_code} ({provider}): {err_msg[:250]}")
+
+            res_data = res.json()
+            msg_obj = res_data.get("choices", [{}])[0].get("message", {})
+            text_out = msg_obj.get("content") or msg_obj.get("reasoning_content") or ""
+        else:
+            raise Exception(f"Unsupported LLM provider: {provider}")
+
+        text_out = (text_out or "").strip()
+        if text_out.startswith("```"):
+            lines = text_out.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text_out = "\n".join(lines).strip()
+
+        try:
+            parsed = json.loads(text_out)
+        except Exception:
+            # Extract first JSON array if model included stray wrapper text
+            b_start = text_out.find("[")
+            b_end = text_out.rfind("]")
+            if b_start != -1 and b_end > b_start:
+                parsed = json.loads(text_out[b_start:b_end + 1])
+            else:
+                raise
+
+        if isinstance(parsed, dict):
+            for _, v in parsed.items():
+                if isinstance(v, list):
+                    parsed = v
+                    break
+
+        if not isinstance(parsed, list):
+            raise Exception("LLM returned non-array JSON.")
+        return parsed
+
+    @staticmethod
+    def _audit_isochronous_segments(
+        orig_subtitles: List[Dict[str, Any]],
+        translated_subtitles: List[Dict[str, Any]],
+        target_language: str,
+        base_speed: float = 0.92,
+    ) -> Dict[str, Any]:
+        """
+        Deterministically audits translated dubbing segments against empirically calibrated
+        spoken duration budgets (with Smart Gap-Borrowing) to identify segments that are
+        either too short (dropped detail / early cut-off) or too long (speech overrun).
+        """
+        from app.utils.vietnamese_normalizer import (
+            compute_segment_timing_budget,
+            count_vietnamese_spoken_syllables,
+            estimate_spoken_duration,
+        )
+
+        lang_low = (target_language or "vietnamese").strip().lower()
+        is_vi = lang_low in ("vi", "vietnamese", "tiếng việt") or "viet" in lang_low or "việt" in lang_low
+
+        rows: List[Dict[str, Any]] = []
+        flagged: List[Dict[str, Any]] = []
+        ratios: List[float] = []
+        in_band_count = 0
+        too_long_count = 0
+        too_short_count = 0
+
+        n = len(orig_subtitles)
+        for i, orig in enumerate(orig_subtitles):
+            trans = translated_subtitles[i] if i < len(translated_subtitles) else orig
+            start = float(orig.get("start", 0.0) or 0.0)
+            end = float(orig.get("end", start + 1.0) or (start + 1.0))
+            orig_dur = max(0.4, end - start)
+            if i + 1 < n:
+                next_start = float(orig_subtitles[i + 1].get("start", end) or end)
+                gap_after = max(0.0, next_start - end)
+            else:
+                gap_after = 4.0
+
+            budget = compute_segment_timing_budget(orig_dur, gap_after=gap_after, speed=base_speed)
+            vi_text = str(trans.get("text", "") or "").strip()
+            est_dur = estimate_spoken_duration(vi_text, target_language=target_language, speed=base_speed)
+            syl_count = count_vietnamese_spoken_syllables(vi_text) if is_vi else len(vi_text.split())
+            ratio = est_dur / budget["slot_dur"]
+            ratios.append(ratio)
+
+            low_bound = budget["slot_dur"] * (0.82 if budget["slot_dur"] >= 2.8 else 0.72)
+            high_bound = budget["allowed_dur"] * (1.03 if budget["gap_after"] < 0.45 else 1.05)
+
+            if est_dur > high_bound:
+                band_err = est_dur - high_bound
+            elif est_dur < low_bound:
+                band_err = low_bound - est_dur
+            else:
+                band_err = 0.0
+
+            status = "OK"
+            if est_dur > high_bound:
+                status = "TOO_LONG"
+                too_long_count += 1
+            elif budget["slot_dur"] >= 2.8 and est_dur < budget["slot_dur"] * 0.80 and (not is_vi or syl_count <= budget["min_syl"] - 2):
+                status = "TOO_SHORT"
+                too_short_count += 1
+            else:
+                in_band_count += 1
+
+            row = {
+                "index": i,
+                "id": int(orig.get("id", i + 1)),
+                "orig_text": str(orig.get("text", "") or "").strip(),
+                "trans_text": vi_text,
+                "slot_dur": budget["slot_dur"],
+                "gap_after": budget["gap_after"],
+                "allowed_dur": budget["allowed_dur"],
+                "min_syl": budget["min_syl"],
+                "ideal_syl": budget["ideal_syl"],
+                "max_syl": budget["max_syl"],
+                "syl_count": syl_count,
+                "est_dur": est_dur,
+                "ratio": round(ratio, 3),
+                "band_err": round(band_err, 3),
+                "status": status,
+            }
+            rows.append(row)
+            if status != "OK":
+                flagged.append(row)
+
+        mean_ratio = round(sum(ratios) / max(1, len(ratios)), 3)
+        return {
+            "rows": rows,
+            "flagged": flagged,
+            "total": n,
+            "in_band": in_band_count,
+            "too_long": too_long_count,
+            "too_short": too_short_count,
+            "mean_ratio": mean_ratio,
+        }
+
+    @staticmethod
+    def translate_subtitles_llm(
+        subtitles: List[Dict[str, Any]],
+        target_language: str,
+        db: Session,
+        llm_profile_id: Optional[str] = None,
+        strategy: Optional[str] = None,
+        log_job_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Translates subtitle segments to target_language using configured LLM with
+        empirically calibrated isochronous dubbing duration matching.
+
+        Supported strategies:
+          - "two_stage_isochronous" (default): Accuracy-first + full-script glossary + calibrated
+            phonetic syllable budgets (Stage 1), followed by deterministic phonetic duration audit
+            and selective closed-loop calibration ONLY on out-of-band segments (Stage 2) with a
+            strict monotone improvement guard.
+          - "single_pass_calibrated": Single-pass accuracy-first translation with calibrated
+            per-segment phonetic syllable & gap-borrowing budgets.
+          - "baseline": Legacy 1-pass brevity prompt (~3 words/sec) for A/B benchmarking.
+        """
+        if not subtitles:
+            return []
+
+        from app.utils.vietnamese_normalizer import (
+            compute_segment_timing_budget,
+            count_vietnamese_spoken_syllables,
+            estimate_spoken_duration,
+        )
+
+        llm_config = VideoDubbingService.get_llm_settings(db, llm_profile_id=llm_profile_id)
+        provider = llm_config["provider"]
+        api_key = llm_config["api_key"]
         profile_name = llm_config.get("profile_name", "Default")
 
         if provider == "none" or (not api_key and provider != "custom"):
-            # Fallback mock translation if no LLM configured
             translated = []
             for seg in subtitles:
                 translated.append({
@@ -2000,147 +2254,226 @@ class VideoDubbingService:
                 })
             return translated
 
-        # Create translation prompt with strict video dubbing & time synchronization rules
-        prompt = (
-            f"You are an expert video dubbing translator and voice-sync director. "
-            f"Translate the following video subtitle segments into {target_language}.\n\n"
-            f"CRITICAL VIDEO DUBBING CONSTRAINTS:\n"
-            f"1. TIME DURATION BUDGET: The translation will be voiced by AI text-to-speech to fit the EXACT duration between 'start' and 'end' seconds.\n"
-            f"2. BREVITY & PACING: For each segment, duration = end - start seconds. The translated text in {target_language} MUST be concise, natural, and succinct so it can be comfortably spoken within that duration (~3 words per second, or ~4-5 syllables/sec). Do NOT make the translation wordy or verbose.\n"
-            f"3. PRESERVE MEANING: Keep the natural colloquial tone and core meaning, but express it economically to avoid speech overrun or audio collision with subsequent segments.\n"
-            f"4. FORMAT: You MUST preserve the exact JSON array structure with keys 'id', 'start', 'end', and 'text'. Return ONLY the valid JSON array without any markdown fences, backticks, or extra explanation.\n\n"
-            f"Subtitles JSON:\n{json.dumps(subtitles, ensure_ascii=False)}"
-        )
+        eff_strategy = (strategy or "two_stage_isochronous").strip().lower()
+        if eff_strategy not in ("baseline", "single_pass_calibrated", "two_stage_isochronous"):
+            eff_strategy = "two_stage_isochronous"
+
+        lang_low = (target_language or "vietnamese").strip().lower()
+        is_vi = lang_low in ("vi", "vietnamese", "tiếng việt") or "viet" in lang_low or "việt" in lang_low
+        base_speed = 0.92 if is_vi else 0.96
+
+        def _parse_aligned_list(parsed_list: List[Any]) -> List[Dict[str, Any]]:
+            by_id: Dict[int, Dict[str, Any]] = {}
+            for item in parsed_list:
+                if isinstance(item, dict) and item.get("id") is not None:
+                    try:
+                        by_id[int(item["id"])] = item
+                    except (TypeError, ValueError):
+                        pass
+            final_list = []
+            for i, orig_seg in enumerate(subtitles):
+                oid = int(orig_seg.get("id", i + 1))
+                matched = by_id.get(oid)
+                if matched is None and i < len(parsed_list) and isinstance(parsed_list[i], dict):
+                    matched = parsed_list[i]
+                text_val = str(matched.get("text", orig_seg["text"])) if matched else str(orig_seg["text"])
+                final_list.append({
+                    "id": oid,
+                    "start": float(orig_seg["start"]),
+                    "end": float(orig_seg["end"]),
+                    "text": text_val.strip() or str(orig_seg["text"]),
+                })
+            return final_list
 
         try:
-            if provider == "gemini":
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-                headers = {"Content-Type": "application/json"}
-                gen_config: Dict[str, Any] = {"responseMimeType": "application/json"}
-                
-                # Apply Gemini Thinking / Reasoning Config if enabled
-                if thinking_effort and thinking_effort != "none":
-                    budget_map = {"low": 1024, "medium": 2048, "high": 4096}
-                    budget = budget_map.get(thinking_effort, 1024)
-                    gen_config["thinkingConfig"] = {"thinkingBudget": budget}
+            # --- Strategy 1: Legacy Baseline Prompt (for A/B comparison) ---
+            if eff_strategy == "baseline":
+                prompt = (
+                    f"You are an expert video dubbing translator and voice-sync director. "
+                    f"Translate the following video subtitle segments into {target_language}.\n\n"
+                    f"CRITICAL VIDEO DUBBING CONSTRAINTS:\n"
+                    f"1. TIME DURATION BUDGET: The translation will be voiced by AI text-to-speech to fit the EXACT duration between 'start' and 'end' seconds.\n"
+                    f"2. BREVITY & PACING: For each segment, duration = end - start seconds. The translated text in {target_language} MUST be concise, natural, and succinct so it can be comfortably spoken within that duration (~3 words per second, or ~4-5 syllables/sec). Do NOT make the translation wordy or verbose.\n"
+                    f"3. PRESERVE MEANING: Keep the natural colloquial tone and core meaning, but express it economically to avoid speech overrun or audio collision with subsequent segments.\n"
+                    f"4. FORMAT: You MUST preserve the exact JSON array structure with keys 'id', 'start', 'end', and 'text'. Return ONLY the valid JSON array without any markdown fences, backticks, or extra explanation.\n\n"
+                    f"Subtitles JSON:\n{json.dumps(subtitles, ensure_ascii=False)}"
+                )
+                parsed = VideoDubbingService._call_llm_json_array(
+                    llm_config,
+                    "You are a professional JSON subtitle translator.",
+                    prompt,
+                )
+                return _parse_aligned_list(parsed)
 
-                payload = {
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": gen_config
-                }
-                res = requests.post(url, headers=headers, json=payload, timeout=45)
-                # If thinkingConfig causes 400 error, retry once without thinkingConfig
-                if not res.ok and "thinkingConfig" in gen_config and res.status_code == 400:
-                    gen_config.pop("thinkingConfig", None)
-                    payload["generationConfig"] = gen_config
-                    res = requests.post(url, headers=headers, json=payload, timeout=45)
-
-                if not res.ok:
-                    err_msg = res.text
-                    try:
-                        err_json = res.json()
-                        if "error" in err_json:
-                            err_msg = err_json["error"].get("message", err_msg)
-                    except Exception:
-                        pass
-                    raise Exception(f"HTTP {res.status_code} ({provider}): {err_msg[:250]}")
-
-                res_data = res.json()
-                parts = res_data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                text_out = ""
-                for part in parts:
-                    if part.get("thought"):
-                        continue
-                    if "text" in part:
-                        text_out += part["text"]
-                if not text_out and parts:
-                    text_out = parts[-1].get("text", "")
-            
-            elif provider in ["openai", "custom"]:
-                if provider == "custom" and custom_endpoint:
-                    url = custom_endpoint.strip()
-                    if not url.endswith("/chat/completions"):
-                        if url.endswith("/"):
-                            url = url + "chat/completions"
-                        elif "/v1" not in url:
-                            url = url + "/v1/chat/completions"
-                        else:
-                            url = url + "/chat/completions"
+            # --- Build enriched timing & phonetic syllable budgets for Calibrated / Two-Stage ---
+            enriched_input = []
+            n = len(subtitles)
+            for i, seg in enumerate(subtitles):
+                start = float(seg.get("start", 0.0) or 0.0)
+                end = float(seg.get("end", start + 1.0) or (start + 1.0))
+                orig_dur = max(0.4, end - start)
+                if i + 1 < n:
+                    next_start = float(subtitles[i + 1].get("start", end) or end)
+                    gap_after = max(0.0, next_start - end)
                 else:
-                    url = "https://api.openai.com/v1/chat/completions"
-
-                headers = {
-                    "Content-Type": "application/json"
+                    gap_after = 4.0
+                budget = compute_segment_timing_budget(orig_dur, gap_after=gap_after, speed=base_speed)
+                item_in: Dict[str, Any] = {
+                    "id": int(seg.get("id", i + 1)),
+                    "dur": round(orig_dur, 2),
+                    "gap_after": round(gap_after, 2),
+                    "max_sec": round(budget["allowed_dur"], 2),
+                    "text": str(seg.get("text", "") or "").strip(),
                 }
-                if api_key:
-                    headers["Authorization"] = f"Bearer {api_key}"
-                    
-                payload: Dict[str, Any] = {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": "You are a professional JSON subtitle translator."},
-                        {"role": "user", "content": prompt}
-                    ]
-                }
-                if thinking_effort and thinking_effort != "none":
-                    payload["reasoning_effort"] = thinking_effort
-                
-                res = requests.post(url, headers=headers, json=payload, timeout=45)
-                # If reasoning_effort causes 400 error, retry once without reasoning_effort
-                if not res.ok and "reasoning_effort" in payload and res.status_code == 400:
-                    payload.pop("reasoning_effort", None)
-                    res = requests.post(url, headers=headers, json=payload, timeout=45)
+                if is_vi:
+                    item_in["target_syl"] = f"{budget['min_syl']}-{budget['max_syl']}"
+                enriched_input.append(item_in)
 
-                if not res.ok:
-                    err_msg = res.text
-                    try:
-                        err_json = res.json()
-                        if "error" in err_json:
-                            err_msg = err_json["error"].get("message", err_msg)
-                    except Exception:
-                        pass
-                    raise Exception(f"HTTP {res.status_code} ({provider}): {err_msg[:250]}")
+            vi_specific_rules = (
+                "5. VIETNAMESE TTS PHONETIC RATE & PROSODY (EMPIRICALLY CALIBRATED):\n"
+                "   - Our native Vietnamese studio narrator speaks naturally at ~4.45 spoken syllables/second (NOT 3 words/sec!).\n"
+                "   - IMPORTANT: Spoken syllable counts include how numbers, units, and acronyms are READ ALOUD:\n"
+                "     * '10 Ncm' = 6 syllables ('mười niu tơn xen ti mét'); '10 mm' = 4 syllables ('mười mi li mét');\n"
+                "     * '200 vòng/phút' = 5 syllables ('hai trăm vòng một phút'); 'MIS' = 3 syllables ('em ai ét');\n"
+                "     * Kept technical loanwords: 'implant' = 2 syl, 'abutment' = 3 syl, 'Multifix' = 3 syl, 'profiler' = 3 syl.\n"
+                "   - Aim squarely inside each segment's `target_syl` range (`min-max`). DO NOT compress a 5–7 second explanation down to 10–12 choppy syllables — finishing 2–3 seconds early creates awkward dead air and loses clinical/technical precision!\n"
+                "   - Conversely, when `gap_after` is small (< 0.5s), NEVER exceed the upper bound of `target_syl`.\n"
+                "   - Write smooth, natural spoken Vietnamese for voiceover: avoid raw hyphen pairs like 'hướng lưỡi - má' (write 'theo hướng từ mặt lưỡi ra mặt má' instead), and keep clean standard scientific units (e.g. '10 mm', '10 Ncm', '200 vòng/phút').\n"
+            ) if is_vi else (
+                "5. SPOKEN DURATION MATCHING:\n"
+                "   - Ensure each translated segment reads aloud smoothly right around `dur` seconds (never finishing >25% early on long explanations, and never exceeding `max_sec`).\n"
+            )
 
-                res_data = res.json()
-                msg_obj = res_data.get("choices", [{}])[0].get("message", {})
-                text_out = msg_obj.get("content") or msg_obj.get("reasoning_content") or ""
-            
-            else:
-                raise Exception(f"Unsupported LLM provider: {provider}")
+            pass1_prompt = (
+                f"You are an elite technical/medical video dubbing translator and voiceover director translating a full video script into {target_language}.\n\n"
+                f"CORE MISSION — ACCURACY FIRST + ISOCHRONOUS SPOKEN TIMING:\n"
+                f"1. 100% SEMANTIC & DOMAIN ACCURACY: Translate EVERY technical term, procedural step, qualifier, purpose clause, and number faithfully. NEVER omit modifiers (e.g. 'pilot drill', 'for the restoration', 'solid, angulated abutments', 'according to the specific case') just to shorten text.\n"
+                f"2. CONSISTENT FULL-SCRIPT TERMINOLOGY: Read the entire script first so terminology stays 100% consistent from segment #1 to the end. Use accurate, idiomatic domain terms in {target_language}.\n"
+                f"3. CONTEXTUAL ASR ERROR CORRECTION: Whisper ASR occasionally mishears homophones or units in speech. Use surrounding technical context to silently fix obvious ASR slips (e.g. 'maximum torque of 10 centimeters' -> torque unit is '10 Ncm'). Never invent new facts.\n"
+                f"4. NATURAL VOICEOVER FLOW: Write complete, clear, authoritative spoken sentences that sync cleanly with the visuals and flow naturally across adjacent segments.\n"
+                f"{vi_specific_rules}"
+                f"6. OUTPUT FORMAT: Return ONLY a valid JSON array with exact objects `[{{\"id\": <int>, \"text\": \"<translated text>\"}}]` in the exact same order and count ({n} items). No markdown fences, no commentary.\n\n"
+                f"Script Segments JSON:\n{json.dumps(enriched_input, ensure_ascii=False)}"
+            )
 
-            # Clean and parse text
-            text_out = text_out.strip()
-            # If the response contains markdown code block, strip it
-            if text_out.startswith("```"):
-                lines = text_out.splitlines()
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                text_out = "\n".join(lines).strip()
+            parsed_pass1 = VideoDubbingService._call_llm_json_array(
+                llm_config,
+                f"You are an expert isochronous video dubbing translator into {target_language}. Output ONLY valid JSON array.",
+                pass1_prompt,
+            )
+            pass1_subs = _parse_aligned_list(parsed_pass1)
 
-            parsed = json.loads(text_out)
-            # If it's wrapped in an object like {"subtitles": [...]}, extract it
-            if isinstance(parsed, dict):
-                for k, v in parsed.items():
-                    if isinstance(v, list):
-                        parsed = v
-                        break
-            
-            if isinstance(parsed, list):
-                # Validation to ensure timestamps are floats and IDs match
-                final_list = []
-                for i, seg in enumerate(parsed):
-                    orig_seg = subtitles[i] if i < len(subtitles) else subtitles[-1]
-                    final_list.append({
-                        "id": seg.get("id", orig_seg["id"]),
-                        "start": float(seg.get("start", orig_seg["start"])),
-                        "end": float(seg.get("end", orig_seg["end"])),
-                        "text": str(seg.get("text", orig_seg["text"]))
-                    })
-                return final_list
-            
-            raise Exception("LLM returned non-array JSON.")
+            audit1 = VideoDubbingService._audit_isochronous_segments(
+                subtitles, pass1_subs, target_language=target_language, base_speed=base_speed
+            )
+            if log_job_id:
+                VideoDubbingService.log_to_job(
+                    log_job_id,
+                    f"[ISOCHRONOUS:{eff_strategy}] Pass 1 ({profile_name}): "
+                    f"{audit1['in_band']}/{audit1['total']} phân đoạn đạt chuẩn thời lượng "
+                    f"(tỷ lệ TB={audit1['mean_ratio']:.2f}x, quá dài={audit1['too_long']}, quá ngắn={audit1['too_short']})."
+                )
+
+            if eff_strategy == "single_pass_calibrated" or not audit1["flagged"]:
+                return pass1_subs
+
+            # --- Stage 2: Selective Closed-Loop Phonetic Calibration (ONLY out-of-band segments) ---
+            flagged_payload = []
+            for row in audit1["flagged"]:
+                idx = row["index"]
+                prev_txt = pass1_subs[idx - 1]["text"] if idx > 0 else ""
+                next_txt = pass1_subs[idx + 1]["text"] if idx + 1 < len(pass1_subs) else ""
+                direction = (
+                    "TIGHTEN_WITHOUT_LOSS"
+                    if row["status"] == "TOO_LONG"
+                    else "EXPAND_ACCURATELY"
+                )
+                flagged_payload.append({
+                    "id": row["id"],
+                    "direction": direction,
+                    "orig_source": row["orig_text"],
+                    "current_translation": row["trans_text"],
+                    "current_spoken_syl": row["syl_count"],
+                    "current_est_sec": round(row["est_dur"], 2),
+                    "target_sec": round(row["slot_dur"], 2),
+                    "allowed_max_sec": round(row["allowed_dur"], 2),
+                    "target_syl_range": f"{row['min_syl']}-{row['max_syl']}" if is_vi else None,
+                    "prev_segment": prev_txt,
+                    "next_segment": next_txt,
+                })
+
+            pass2_prompt = (
+                f"You are a precision isochronous dubbing editor for {target_language}.\n"
+                f"Our acoustic duration model measured the exact spoken duration of our Pass-1 dubbing script and flagged ONLY the {len(flagged_payload)} segments below as outside the ideal timing window.\n\n"
+                f"CALIBRATION RULES:\n"
+                f"1. For `EXPAND_ACCURATELY` (currently finishing too early): Rewrite the translation in fuller, smoother, natural {target_language} voiceover phrasing so its spoken syllable count lands inside `target_syl_range` (~`target_sec` seconds). Restore EVERY nuance, preposition, subject, and technical modifier from `orig_source`. NEVER invent facts not present in `orig_source` and NEVER pad meaningless fluff.\n"
+                f"2. For `TIGHTEN_WITHOUT_LOSS` (currently too long for its slot): Tighten wording to fit squarely inside `target_syl_range` (`<= allowed_max_sec` seconds) while STRICTLY preserving ALL numbers, measurements, medical/technical terms, and steps from `orig_source`.\n"
+                f"3. Keep terminology 100% consistent with `prev_segment` and `next_segment`, and remember spoken syllable expansion of units/acronyms (e.g. '10 Ncm'=6 syl, '10 mm'=4 syl, 'MIS'=3 syl, 'implant'=2 syl, 'abutment'=3 syl).\n"
+                f"4. Return ONLY a valid JSON array of revised objects `[{{\"id\": <int>, \"text\": \"<revised text>\"}}]` containing ONLY the {len(flagged_payload)} flagged IDs. No markdown fences or commentary.\n\n"
+                f"Flagged Segments JSON:\n{json.dumps(flagged_payload, ensure_ascii=False)}"
+            )
+
+            # Use medium effort for fast, targeted Pass 2 if profile is set to high
+            pass2_effort = "medium" if llm_config.get("thinking_effort") == "high" else llm_config.get("thinking_effort", "none")
+
+            try:
+                parsed_pass2 = VideoDubbingService._call_llm_json_array(
+                    llm_config,
+                    f"You are an expert isochronous dubbing timing editor for {target_language}. Output ONLY valid JSON array.",
+                    pass2_prompt,
+                    override_thinking_effort=pass2_effort,
+                )
+                revisions_by_id: Dict[int, str] = {}
+                for item in parsed_pass2:
+                    if isinstance(item, dict) and item.get("id") is not None and item.get("text"):
+                        try:
+                            revisions_by_id[int(item["id"])] = str(item["text"]).strip()
+                        except (TypeError, ValueError):
+                            pass
+
+                # Monotone improvement guard: accept each revision ONLY if it moves strictly closer to golden band!
+                final_subs = [dict(s) for s in pass1_subs]
+                accepted = 0
+                for row in audit1["flagged"]:
+                    sid = row["id"]
+                    idx = row["index"]
+                    cand_text = revisions_by_id.get(sid)
+                    if not cand_text:
+                        continue
+                    cand_est = estimate_spoken_duration(cand_text, target_language=target_language, speed=base_speed)
+                    low_bound = row["slot_dur"] * (0.82 if row["slot_dur"] >= 2.8 else 0.72)
+                    high_bound = row["allowed_dur"] * (1.03 if row["gap_after"] < 0.45 else 1.05)
+                    if cand_est > high_bound:
+                        cand_err = cand_est - high_bound
+                    elif cand_est < low_bound:
+                        cand_err = low_bound - cand_est
+                    else:
+                        cand_err = 0.0
+
+                    # Accept if strictly closer to golden band and never wildly overflowing slot
+                    if cand_err < row["band_err"] - 0.03 and cand_est <= row["allowed_dur"] * 1.16:
+                        final_subs[idx]["text"] = cand_text
+                        accepted += 1
+
+                audit2 = VideoDubbingService._audit_isochronous_segments(
+                    subtitles, final_subs, target_language=target_language, base_speed=base_speed
+                )
+                if log_job_id:
+                    VideoDubbingService.log_to_job(
+                        log_job_id,
+                        f"[ISOCHRONOUS] Pass 2 hoàn tất: chấp nhận {accepted}/{len(audit1['flagged'])} bản cân chỉnh -> "
+                        f"{audit2['in_band']}/{audit2['total']} phân đoạn đạt chuẩn "
+                        f"(tỷ lệ TB={audit2['mean_ratio']:.2f}x, quá dài={audit2['too_long']}, quá ngắn={audit2['too_short']})."
+                    )
+                return final_subs
+            except Exception as p2_err:
+                print(f"[VideoDubbingService Warning] Isochronous Pass 2 skipped ({p2_err}); keeping Pass 1 result.")
+                if log_job_id:
+                    VideoDubbingService.log_to_job(
+                        log_job_id,
+                        f"[ISOCHRONOUS] Lưu ý: Pass 2 bỏ qua ({str(p2_err)[:120]}), giữ nguyên kết quả chuẩn Pass 1."
+                    )
+                return pass1_subs
 
         except Exception as e:
             print(f"[VideoDubbingService] LLM Translation failed ({profile_name}): {e}")
@@ -2156,38 +2489,43 @@ class VideoDubbingService:
         llm_profile_id: Optional[str] = None
     ) -> str:
         """
-        Uses LLM to condense/shorten a subtitle sentence so that it fits comfortably within target_duration seconds
-        (budget: ~3.0 words/sec for native Vietnamese speech) while preserving core meaning.
+        Uses LLM to condense/calibrate a subtitle sentence so its spoken duration fits comfortably
+        within target_duration seconds using empirically calibrated Vietnamese syllable rate (~4.45 syl/s).
         """
         if not text or not text.strip():
             return ""
 
-        max_words = max(2, int(target_duration * 3.0))
+        from app.utils.vietnamese_normalizer import compute_segment_timing_budget
+
+        lang_low = (target_language or "vietnamese").strip().lower()
+        is_vi = lang_low in ("vi", "vietnamese", "tiếng việt") or "viet" in lang_low or "việt" in lang_low
+        budget = compute_segment_timing_budget(target_duration, gap_after=0.0, speed=0.92)
+        max_units = budget["max_syl"] if is_vi else max(2, int(target_duration * 2.7))
+        unit_label = "SPOKEN SYLLABLES" if is_vi else "WORDS"
 
         llm_config = VideoDubbingService.get_llm_settings(db, llm_profile_id=llm_profile_id)
         provider = llm_config["provider"]
         api_key = llm_config["api_key"]
         model = llm_config["model"]
         custom_endpoint = llm_config["custom_endpoint"]
-        profile_name = llm_config.get("profile_name", "Default")
 
         if provider == "none" or (not api_key and provider != "custom"):
             words = text.strip().split()
-            if len(words) > max_words:
-                return " ".join(words[:max_words])
+            if len(words) > max_units:
+                return " ".join(words[:max_units])
             return text
 
-        context_info = f'\nOriginal English context: "{original_text}"' if original_text else ""
+        context_info = f'\nOriginal context: "{original_text}"' if original_text else ""
         prompt = (
             f"You are a professional voiceover editor and dubbing dialogue adapter. "
-            f"Shorten the following {target_language} subtitle text so it can be comfortably spoken "
-            f"in {target_duration:.1f} seconds (STRICT LIMIT: MAXIMUM {max_words} WORDS).\n"
+            f"Rewrite the following {target_language} subtitle text so it can be comfortably spoken "
+            f"in {target_duration:.1f} seconds (STRICT LIMIT: MAXIMUM {max_units} {unit_label}).\n"
             f'Current text: "{text}"{context_info}\n\n'
             f"RULES:\n"
             f"1. Language MUST be {target_language}.\n"
-            f"2. Keep the core meaning clear, natural, and punchy.\n"
-            f"3. Maximum word count: {max_words} words.\n"
-            f"4. Return ONLY the final shortened sentence without quotes, explanations, markdown, or preface."
+            f"2. Strictly preserve ALL technical/medical terms, numbers, and core meaning without dropping key facts.\n"
+            f"3. Maximum length: {max_units} {unit_label.lower()}.\n"
+            f"4. Return ONLY the final edited sentence without quotes, explanations, markdown, or preface."
         )
 
         try:
@@ -2196,9 +2534,9 @@ class VideoDubbingService:
                 headers = {"Content-Type": "application/json"}
                 payload = {
                     "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 150}
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 200}
                 }
-                res = requests.post(url, headers=headers, json=payload, timeout=25)
+                res = requests.post(url, headers=headers, json=payload, timeout=(10, 60))
                 if res.ok:
                     res_data = res.json()
                     parts = res_data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
@@ -2216,13 +2554,13 @@ class VideoDubbingService:
                 payload = {
                     "model": model,
                     "messages": [
-                        {"role": "system", "content": "You are a concise voiceover editor. Output only the shortened sentence."},
+                        {"role": "system", "content": "You are a concise voiceover editor. Output only the edited sentence."},
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": 0.3,
-                    "max_tokens": 100
+                    "max_tokens": 180
                 }
-                res = requests.post(url, headers=headers, json=payload, timeout=25)
+                res = requests.post(url, headers=headers, json=payload, timeout=(10, 60))
                 if res.ok:
                     res_data = res.json()
                     out = res_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -2928,24 +3266,29 @@ class VideoDubbingService:
                     num_samples = int(len(data) * 24000 / sr)
                     data = signal.resample(data, num_samples)
 
-                # 2. Anti-collision lookahead:
-                # Determine target window and hard deadline before the next speaker starts
+                # 2. Anti-collision lookahead + Smart Gap-Borrowing:
+                # Allow accurate translations to borrow a modest fraction of trailing silence
+                # before invoking WSOLA speed-up, while strictly preventing collision with next speaker.
                 gap_silence = 0.06  # 60ms natural breathing silence before next speaker begins
                 if next_start is not None and next_start > start_time:
                     max_allowed_sec = max(0.3, next_start - start_time - gap_silence)
                     if end_time and end_time > start_time:
-                        target_sec = min(end_time - start_time, max_allowed_sec)
+                        orig_dur = end_time - start_time
+                        gap_after = max(0.0, next_start - end_time)
+                        safe_borrow = min(0.85, max(0.0, gap_after - 0.30) * 0.45)
+                        target_sec = min(orig_dur + safe_borrow, max_allowed_sec)
                     else:
                         target_sec = max_allowed_sec
                 else:
-                    target_sec = (end_time - start_time) if (end_time and end_time > start_time) else 10.0
+                    orig_dur = (end_time - start_time) if (end_time and end_time > start_time) else 10.0
+                    target_sec = orig_dur + 0.80
                     max_allowed_sec = target_sec * 1.25
 
                 actual_sec = len(data) / 24000.0
 
-                # 3. Dynamic pitch-neutral speed scaling (up to 1.65x via WSOLA without pitch distortion)
+                # 3. Dynamic pitch-neutral speed scaling (up to 1.50x via WSOLA without pitch distortion)
                 if actual_sec > target_sec * 1.03 and target_sec > 0.3:
-                    speed_factor = min(1.65, actual_sec / target_sec)
+                    speed_factor = min(1.50, actual_sec / target_sec)
                     data = pitch_neutral_stretch(data, 24000, speed_factor)
                     actual_sec = len(data) / 24000.0
 

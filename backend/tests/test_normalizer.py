@@ -1,5 +1,11 @@
 import pytest
-from app.utils.vietnamese_normalizer import normalize_vietnamese_text, read_int
+from app.utils.vietnamese_normalizer import (
+    normalize_vietnamese_text,
+    read_int,
+    count_vietnamese_spoken_syllables,
+    estimate_vietnamese_spoken_duration,
+    compute_segment_timing_budget,
+)
 
 def test_vietnamese_integers():
     assert read_int(0) == "không"
@@ -81,5 +87,37 @@ def test_technical_units_decimals_and_medical_acronyms_for_dubbing():
         "Mũi khoan ích đi pai lốt có đầu mũi hai mi li mét."
     )
     assert normalize_vietnamese_text("MIS. Đơn giản hóa.") == "Em ai ét. Đơn giản hóa."
+
+
+def test_surgical_torque_rpm_and_degree_units():
+    assert normalize_vietnamese_text("lực xoắn tối đa 10 Ncm.") == "lực xoắn tối đa mười niu tơn xen ti mét."
+    assert normalize_vietnamese_text("lực siết 15N·cm và 30°") == "lực siết mười lăm niu tơn xen ti mét và ba mươi độ"
+    assert normalize_vietnamese_text("tốc độ tối đa 200 RPM.") == "tốc độ tối đa hai trăm vòng một phút."
+    assert normalize_vietnamese_text("tay khoan tối đa 200 vòng/phút.") == "tay khoan tối đa hai trăm vòng một phút."
+    assert normalize_vietnamese_text("dung tích 5 mL và độ dày 50 µm") == "dung tích năm mi li lít và độ dày năm mươi mi crô mét"
+
+
+def test_phonetic_syllable_count_and_duration_estimator():
+    # '10 Ncm' -> 'mười niu tơn xen ti mét' (6 syllables)
+    assert count_vietnamese_spoken_syllables("10 Ncm") == 6
+    # '10mm' -> 'mười mi li mét' (4 syllables)
+    assert count_vietnamese_spoken_syllables("10mm") == 4
+    # 'implant' = 2, 'abutment' = 3, 'Multifix' = 3, 'MIS' = 3
+    assert count_vietnamese_spoken_syllables("implant") == 2
+    assert count_vietnamese_spoken_syllables("abutment") == 3
+    assert count_vietnamese_spoken_syllables("Multifix") == 3
+    assert count_vietnamese_spoken_syllables("MIS") == 3
+    # Full sentence realistic duration check
+    est = estimate_vietnamese_spoken_duration(
+        "Multifix là phục hình cố định cho xương hàm teo.",
+        speed=0.96,
+    )
+    assert 2.2 <= est <= 2.8
+
+    budget = compute_segment_timing_budget(orig_dur=5.2, gap_after=9.7, speed=0.92)
+    assert budget["safe_borrow"] == 0.8
+    assert budget["allowed_dur"] == 6.0
+    assert budget["min_syl"] < budget["ideal_syl"] < budget["max_syl"]
+
 
 
