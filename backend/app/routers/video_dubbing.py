@@ -790,11 +790,23 @@ def _sanitize_subtitle_segments(raw: Optional[str]) -> list[dict]:
     return cleaned
 
 
-def reconcile_dubbing_jobs_from_disk(db: Session, fallback_user_id: Optional[str] = None) -> int:
+_LAST_DISK_RECONCILE_TS = 0.0
+_DISK_RECONCILE_INTERVAL_SEC = 60.0
+
+
+def reconcile_dubbing_jobs_from_disk(db: Session, fallback_user_id: Optional[str] = None, force: bool = False) -> int:
     """
     Scans settings.dubbing_dir for any vd_* project directories whose DB rows were lost
     or orphaned across container restarts, reconstructing them cleanly.
+    Throttled in production so 4s UI list polls never scan disk on every request.
     """
+    global _LAST_DISK_RECONCILE_TS
+    now_mono = time.monotonic()
+    is_testing = (settings.APP_ENV or "").lower() == "testing"
+    if not force and not is_testing and (now_mono - _LAST_DISK_RECONCILE_TS) < _DISK_RECONCILE_INTERVAL_SEC:
+        return 0
+    _LAST_DISK_RECONCILE_TS = now_mono
+
     dubbing_root = settings.dubbing_dir
     if not dubbing_root or not os.path.isdir(dubbing_root):
         return 0
