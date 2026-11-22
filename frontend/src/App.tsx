@@ -61,6 +61,7 @@ function App() {
     return window.location.hash === "#/docs" ? "docs" : "workspace";
   });
   const [pendingDubbingJobId, setPendingDubbingJobId] = useState<string | null>(null);
+  const [dubbingListNavTrigger, setDubbingListNavTrigger] = useState<number>(0);
   
   const [theme, setTheme] = useState<"light" | "dark" | "system">(() => {
     return (localStorage.getItem("theme") as "light" | "dark" | "system") || "dark";
@@ -114,6 +115,7 @@ function App() {
     } else {
       window.location.hash = "#/";
     }
+    window.scrollTo(0, 0);
   };
 
   const [currentUser, setCurrentUser] = useState<{ id: string; username: string; is_admin: boolean } | null>(null);
@@ -317,7 +319,11 @@ function App() {
           </button>
 
           <button
-            onClick={() => navigateToTab("dubbing")}
+            onClick={() => {
+              setPendingDubbingJobId(null);
+              setDubbingListNavTrigger(prev => prev + 1);
+              navigateToTab("dubbing");
+            }}
             className={`w-full px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
               activeTab === "dubbing"
                 ? "bg-secondary text-foreground shadow-sm font-bold"
@@ -709,6 +715,7 @@ function App() {
                   currentUser={effectiveUser}
                   initialJobIdProp={pendingDubbingJobId}
                   onInitialJobConsumed={() => setPendingDubbingJobId(null)}
+                  listNavTrigger={dubbingListNavTrigger}
                 />
               </ErrorBoundary>
             </div>

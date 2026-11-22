@@ -51,6 +51,7 @@ interface DubbingStudioProps {
   currentUser?: { id: string; username: string; is_admin: boolean } | null;
   initialJobIdProp?: string | null;
   onInitialJobConsumed?: () => void;
+  listNavTrigger?: number;
 }
 
 interface ProxyTestResult {
@@ -161,12 +162,15 @@ export default function DubbingStudio({
   currentUser,
   initialJobIdProp,
   onInitialJobConsumed,
+  listNavTrigger,
 }: DubbingStudioProps) {
   const isAdmin = Boolean(currentUser?.is_admin);
   // Navigation / Multi-project states: 'create' | 'workspace' | 'list'
+  // Always land on the Projects management page ("list") unless opening a specific job directly
   const [viewMode, setViewMode] = useState<"create" | "workspace" | "list">(() => {
-    return localStorage.getItem("active_dubbing_job_id") ? "workspace" : "create";
+    return initialJobIdProp ? "workspace" : "list";
   });
+  const lastListNavTriggerRef = useRef<number>(listNavTrigger ?? 0);
   const [allJobs, setAllJobs] = useState<VideoDubbingJobResponse[]>([]);
   const [loadingAllJobs, setLoadingAllJobs] = useState(false);
   const [jobsFilter, setJobsFilter] = useState<string>("all");
@@ -225,7 +229,7 @@ export default function DubbingStudio({
 
   // Diagnostic Logs States
   const [jobLogs, setJobLogs] = useState("");
-  const logsEndRef = useRef<HTMLDivElement>(null);
+  const logsContainerRef = useRef<HTMLDivElement>(null);
 
   // Job States
   const [jobId, setJobId] = useState<string | null>(() => {
@@ -584,6 +588,7 @@ export default function DubbingStudio({
     }
     setOutputVideoTimestamp(Date.now());
     setPollRevision(r => r + 1);
+    window.scrollTo(0, 0);
     void fetchJobDetails(targetId);
   }, [allJobs, applyJobState, fetchJobDetails]);
 
@@ -593,7 +598,19 @@ export default function DubbingStudio({
     onInitialJobConsumed?.();
   }, [initialJobIdProp, openProjectInWorkspace, onInitialJobConsumed]);
 
-  // Restore active job from localStorage on mount & fetch settings & auth statuses
+  // Clicking the sidebar "Video Dubbing" button while already mounted returns straight to Projects ("list") at top
+  useEffect(() => {
+    if (listNavTrigger !== undefined && listNavTrigger !== lastListNavTriggerRef.current) {
+      lastListNavTriggerRef.current = listNavTrigger;
+      if (!initialJobIdProp) {
+        setViewMode("list");
+        window.scrollTo(0, 0);
+        void fetchAllJobs(false);
+      }
+    }
+  }, [listNavTrigger, initialJobIdProp, fetchAllJobs]);
+
+  // Fetch initial project list, settings & auth statuses on mount
   useEffect(() => {
     let cancelled = false;
     void Promise.resolve().then(() => {
@@ -601,11 +618,6 @@ export default function DubbingStudio({
       void fetchLlmProfiles();
       void fetchVoiceSamples();
       void fetchAllJobs(false);
-
-      const initialJobId = localStorage.getItem("active_dubbing_job_id");
-      if (initialJobId) {
-        void fetchJobDetails(initialJobId);
-      }
 
       if (isAdmin) {
         void fetchSystemLlmSettings();
@@ -842,9 +854,9 @@ export default function DubbingStudio({
     }
   };
 
-  // Poll active job status and logs
+  // Poll active job status and logs only while viewing that project's workspace
   useEffect(() => {
-    if (!jobId) return;
+    if (!jobId || viewMode !== "workspace") return;
     let cancelled = false;
 
     localStorage.setItem("active_dubbing_job_id", jobId);
@@ -898,12 +910,13 @@ export default function DubbingStudio({
       cancelled = true;
       clearInterval(interval);
     };
-  }, [jobId, pollRevision]);
+  }, [jobId, viewMode, pollRevision]);
 
-  // Autoscroll logs terminal to bottom
+  // Autoscroll ONLY inside the log terminal box (never scroll the outer browser window!)
   useEffect(() => {
-    if (logsEndRef.current) {
-      logsEndRef.current.scrollIntoView({ behavior: "smooth" });
+    const el = logsContainerRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
     }
   }, [jobLogs]);
 
@@ -2426,7 +2439,10 @@ export default function DubbingStudio({
                   <RefreshCw className="w-2.5 h-2.5" /> Làm mới log
                 </button>
               </div>
-              <div className="bg-[#18181b] border border-border/60 rounded-xl p-4 font-mono text-[11px] text-[#a1a1aa] overflow-y-auto max-h-60 flex flex-col gap-1.5 shadow-inner">
+              <div
+                ref={logsContainerRef}
+                className="bg-[#18181b] border border-border/60 rounded-xl p-4 font-mono text-[11px] text-[#a1a1aa] overflow-y-auto max-h-60 flex flex-col gap-1.5 shadow-inner"
+              >
                 {jobLogs ? (
                   jobLogs.split("\n").map((line, lIdx) => {
                     if (!line.trim()) return null;
@@ -2444,7 +2460,6 @@ export default function DubbingStudio({
                 ) : (
                   <div className="text-zinc-500 italic text-left">Đang tải nhật ký tiến trình...</div>
                 )}
-                <div ref={logsEndRef} />
               </div>
             </div>
           </div>
