@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { audioEngine } from "../services/audioEngine";
 import { 
   Play, 
   Pause, 
   ChevronDown, 
+  ChevronUp,
   Download, 
   Volume2, 
   VolumeX, 
@@ -246,13 +246,16 @@ export const PlaygroundPanel: React.FC = () => {
         if (cancelled) return;
         setJobStatus(status);
         setLoading(false);
-        if (status.status !== "completed" && status.status !== "failed") {
+        if (status.status !== "completed" && status.status !== "failed" && status.status !== "cancelled") {
           setIsPolling(true);
         }
       })
       .catch((err: unknown) => {
         if (cancelled) return;
         console.error("Lỗi khôi phục Playground job status:", err);
+        setJobId(null);
+        setJobStatus(null);
+        localStorage.removeItem("VITE_PLAYGROUND_JOB_ID");
         setLoading(false);
       });
 
@@ -282,7 +285,7 @@ export const PlaygroundPanel: React.FC = () => {
           const status = await api.getJobStatus(jobId);
           setJobStatus(status);
 
-          if (status.status === "completed" || status.status === "failed") {
+          if (status.status === "completed" || status.status === "failed" || status.status === "cancelled") {
             stopPolling();
           }
         } catch (err: unknown) {
@@ -371,7 +374,6 @@ export const PlaygroundPanel: React.FC = () => {
         }
         if (isObjectUrl) objectUrlToRevoke = blobUrl;
         setAudioBlobUrl(blobUrl);
-        void audioEngine.preload(blobUrl);
       })
       .catch((err: unknown) => {
         console.error("Không thể tải audio Playground:", err);
@@ -392,6 +394,7 @@ export const PlaygroundPanel: React.FC = () => {
     if (!audio) return;
 
     const handlePlay = () => {
+      window.dispatchEvent(new CustomEvent("omnivoice:pause-global-audio"));
       setIsPlaying(true);
       startPreciseTracking();
     };
@@ -494,13 +497,12 @@ export const PlaygroundPanel: React.FC = () => {
   };
 
   const handleDownload = () => {
-    if (!jobStatus?.audio_url) return;
-    const token = localStorage.getItem("VITE_JWT_TOKEN");
-    const downloadUrl = `${api.getApiBaseUrl()}${jobStatus.audio_url}${jobStatus.audio_url.includes("?") ? "&" : "?"}token=${token || ""}`;
-    
+    const targetUrl = audioBlobUrl || protectedAudioUrl;
+    if (!targetUrl) return;
+    const ext = jobStatus?.job_type === "asr" ? "mp3" : "wav";
     const link = document.createElement("a");
-    link.href = downloadUrl;
-    link.download = `playground_tts_${jobId}.wav`;
+    link.href = targetUrl;
+    link.download = `playground_${jobStatus?.job_type === "asr" ? "asr" : "tts"}_${jobId || "audio"}.${ext}`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -599,7 +601,7 @@ export const PlaygroundPanel: React.FC = () => {
 
       if (isPunctuationEnd || isPause || isTooLong || index === alignmentList.length - 1) {
         segments.push({
-          text: currentSegmentWords.join("").trim(),
+          text: currentSegmentWords.join(" ").replace(/\s+/g, " ").trim(),
           start: segmentStart,
           end: item.end
         });
@@ -617,15 +619,16 @@ export const PlaygroundPanel: React.FC = () => {
     if (subtitleSegments.length === 0) return;
 
     const formatTimeSRT = (seconds: number) => {
-      const h = Math.floor(seconds / 3600);
-      const m = Math.floor((seconds % 3600) / 60);
-      const s = Math.floor(seconds % 60);
-      const ms = Math.floor((seconds % 1) * 1000);
+      const totalMs = Math.max(0, Math.round(seconds * 1000));
+      const h = Math.floor(totalMs / 3600000);
+      const m = Math.floor((totalMs % 3600000) / 60000);
+      const s = Math.floor((totalMs % 60000) / 1000);
+      const ms = totalMs % 1000;
 
-      const hh = h < 10 ? `0${h}` : `${h}`;
-      const mm = m < 10 ? `0${m}` : `${m}`;
-      const ss = s < 10 ? `0${s}` : `${s}`;
-      const mss = ms < 10 ? `00${ms}` : ms < 100 ? `0${ms}` : `${ms}`;
+      const hh = String(h).padStart(2, "0");
+      const mm = String(m).padStart(2, "0");
+      const ss = String(s).padStart(2, "0");
+      const mss = String(ms).padStart(3, "0");
 
       return `${hh}:${mm}:${ss},${mss}`;
     };
@@ -645,6 +648,7 @@ export const PlaygroundPanel: React.FC = () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   return (
@@ -695,6 +699,7 @@ export const PlaygroundPanel: React.FC = () => {
                 <option value="clone_voice">Sử dụng giọng mẫu (Clone)</option>
                 <option value="auto_voice">Auto Voice (Random)</option>
                 <option value="voice_design">Voice Design Direct (Instruct)</option>
+                <option value="asr">Speech to Text (Whisper ASR)</option>
               </select>
             </div>
 
@@ -782,7 +787,7 @@ export const PlaygroundPanel: React.FC = () => {
                   <div className="flex flex-col gap-1">
                     <span className="text-[10px] font-bold text-muted-foreground uppercase">Số Steps: {numStep}</span>
                     <input
-                      type="range" min="10" max="64" step="1" value={numStep}
+                      type="range" min="16" max="64" step="1" value={numStep}
                       onChange={(e) => setNumStep(parseInt(e.target.value))}
                       className="seekbar w-full"
                     />
@@ -797,7 +802,7 @@ export const PlaygroundPanel: React.FC = () => {
                     className="w-full flex items-center justify-between text-fluid-xs text-muted-foreground hover:text-foreground font-bold uppercase tracking-wider transition-colors cursor-pointer select-none"
                   >
                     <span>Tham số nâng cao (Advanced)</span>
-                    <span>{showAdvanced ? "▲" : "▼"}</span>
+                    {showAdvanced ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
                   </button>
 
                   {showAdvanced && (
@@ -861,7 +866,7 @@ export const PlaygroundPanel: React.FC = () => {
                         <select
                           value={language}
                           onChange={(e) => setLanguage(e.target.value)}
-                          className="w-full bg-card border border-border rounded-lg text-xs p-1.5 focus:outline-none focus:ring-1 focus:ring-violet-500 text-foreground"
+                          className="w-full bg-card border border-border rounded-lg text-xs p-1.5 focus:outline-none focus:ring-1 focus:ring-primary text-foreground"
                         >
                           <option value="">Auto Detect (Mặc định)</option>
                           <option value="vi">Vietnamese (vi)</option>
@@ -883,7 +888,7 @@ export const PlaygroundPanel: React.FC = () => {
                           <input
                             type="number" min="0" max="2.0" step="0.05" placeholder="Mặc định" value={padDuration}
                             onChange={(e) => setPadDuration(e.target.value)}
-                            className="bg-card border border-border rounded-lg text-xs p-1.5 focus:outline-none focus:ring-1 focus:ring-violet-500 text-foreground w-full"
+                            className="bg-card border border-border rounded-lg text-xs p-1.5 focus:outline-none focus:ring-1 focus:ring-primary text-foreground w-full"
                           />
                         </div>
                         <div className="flex flex-col gap-1">
@@ -893,7 +898,7 @@ export const PlaygroundPanel: React.FC = () => {
                           <input
                             type="number" min="0" max="1.0" step="0.05" placeholder="Mặc định" value={fadeDuration}
                             onChange={(e) => setFadeDuration(e.target.value)}
-                            className="bg-card border border-border rounded-lg text-xs p-1.5 focus:outline-none focus:ring-1 focus:ring-violet-500 text-foreground w-full"
+                            className="bg-card border border-border rounded-lg text-xs p-1.5 focus:outline-none focus:ring-1 focus:ring-primary text-foreground w-full"
                           />
                         </div>
                       </div>
@@ -948,12 +953,12 @@ export const PlaygroundPanel: React.FC = () => {
             >
               {loading ? (
                 <>
-                  <Loader2 className="w-4 h-4 animate-spin text-white shrink-0" />
+                  <Loader2 className="w-4 h-4 animate-spin text-current shrink-0" />
                   <span>{mode === "asr" ? "Đang nhận dạng giọng nói..." : "Đang tổng hợp & lập lịch API..."}</span>
                 </>
               ) : (
                 <>
-                  <PlayCircle className="w-4 h-4 text-white" />
+                  <PlayCircle className="w-4 h-4 text-current" />
                   <span>{mode === "asr" ? "Bắt đầu nhận dạng giọng nói (ASR)" : "Gửi test & Căn thời gian (TTS API)"}</span>
                 </>
               )}

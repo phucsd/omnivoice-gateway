@@ -99,9 +99,9 @@ def debug_yt(
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
 
-    import threading, time, traceback
+    import threading, time, traceback, tempfile
     def bg_debug():
-        log_path = "/tmp/debug_log.txt"
+        log_path = os.path.join(tempfile.gettempdir(), "debug_log.txt")
         t0 = time.time()
         def write_log(line: str):
             with open(log_path, "a", encoding="utf-8") as f:
@@ -111,7 +111,7 @@ def debug_yt(
             f.write(f"[{time.strftime('%H:%M:%S')}] Bắt đầu debug download cho URL: {safe_url}\n")
 
         try:
-            tmp_dir = "/tmp/debug_yt"
+            tmp_dir = os.path.join(tempfile.gettempdir(), "debug_yt")
             os.makedirs(tmp_dir, exist_ok=True)
             write_log("Đang gọi VideoDubbingService.download_youtube_video...")
             path, title = VideoDubbingService.download_youtube_video(safe_url, tmp_dir, log_file=log_path)
@@ -128,8 +128,9 @@ def debug_yt(
 
 @router.get("/debug-log")
 def debug_log(admin: User = Depends(get_admin_user)):
+    import tempfile
     _ = admin
-    log_path = "/tmp/debug_log.txt"
+    log_path = os.path.join(tempfile.gettempdir(), "debug_log.txt")
     if os.path.exists(log_path):
         with open(log_path, "r", encoding="utf-8") as f:
             return {"log": f.read()}
@@ -440,10 +441,12 @@ def run_youtube_predownload(job_id: str):
         db.close()
 
 
-def run_dubbing_pipeline(job_id: str):
+def run_dubbing_pipeline(job_id: str, enable_separation: bool = True):
     """Background task to run the video dubbing stages (Download -> Extract Audio -> Separate -> Transcribe -> Translate)."""
     db = SessionLocal()
     try:
+        if VideoDubbingService.is_job_cancelled(job_id):
+            return
         job = None
         for _ in range(10):
             job = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
@@ -518,6 +521,9 @@ def run_dubbing_pipeline(job_id: str):
         elif job.source_type == "youtube" and job.input_file_path and os.path.exists(job.input_file_path):
             VideoDubbingService.log_to_job(job_id, f"Sử dụng video YouTube đã tải sẵn: {job.input_file_path}")
 
+        if VideoDubbingService.is_job_cancelled(job_id):
+            return
+
         # Stage 2: Extract audio from video
         job.status = "separating_audio"
         job.progress = 25
@@ -527,6 +533,8 @@ def run_dubbing_pipeline(job_id: str):
         orig_audio_path = os.path.join(job_dir, "original_audio.wav")
         VideoDubbingService.log_to_job(job_id, f"Đang trích xuất audio gốc từ file video {job.input_file_path} bằng FFmpeg...")
         duration = VideoDubbingService.extract_audio_ffmpeg(job.input_file_path, orig_audio_path)
+        if VideoDubbingService.is_job_cancelled(job_id):
+            return
         job.original_audio_path = orig_audio_path
         db.commit()
         VideoDubbingService.log_to_job(job_id, f"Trích xuất thành công WAV audio gốc. Thời lượng: {duration:.2f}s. File: {orig_audio_path}")
@@ -538,17 +546,23 @@ def run_dubbing_pipeline(job_id: str):
         from app.services.kaggle_orchestrator import KaggleOrchestrator
         is_worker_active = KaggleOrchestrator.has_live_worker(db)
 
-        VideoDubbingService.log_to_job(job_id, f"Kiểm tra Worker mode. Chế độ: {mode_val}, GPU Worker active: {is_worker_active}")
+        VideoDubbingService.log_to_job(job_id, f"Kiểm tra Worker mode. Chế độ: {mode_val}, GPU Worker active: {is_worker_active}, Tách nhạc: {enable_separation}")
 
         if mode_val == "mock":
-            VideoDubbingService.log_to_job(job_id, "[MOCK] Thực hiện tách âm thanh (Vocals & BGM bằng FFmpeg/Demucs)...")
             vocals_path = os.path.join(job_dir, "vocals.wav")
             bgm_path = os.path.join(job_dir, "bgm.wav")
-            VideoDubbingService.separate_audio_stems(orig_audio_path, vocals_path, bgm_path, job_id=job_id)
-            job.vocals_audio_path = vocals_path
-            job.bgm_audio_path = bgm_path
+            if enable_separation:
+                VideoDubbingService.log_to_job(job_id, "[MOCK] Thực hiện tách âm thanh (Vocals & BGM bằng FFmpeg/Demucs)...")
+                VideoDubbingService.separate_audio_stems(orig_audio_path, vocals_path, bgm_path, job_id=job_id)
+                job.vocals_audio_path = vocals_path
+                job.bgm_audio_path = bgm_path
+            else:
+                shutil.copy2(orig_audio_path, vocals_path)
+                job.vocals_audio_path = vocals_path
+                job.bgm_audio_path = None
+                job.bgm_volume = 0.0
             db.commit()
-            VideoDubbingService.log_to_job(job_id, f"[MOCK] Tách âm thanh thành công. Vocals: {vocals_path}, BGM: {bgm_path}")
+            VideoDubbingService.log_to_job(job_id, f"[MOCK] Xử lý stems hoàn tất. Vocals: {vocals_path}")
 
             # Mock Transcription (ASR)
             job.status = "transcribing"
@@ -590,6 +604,15 @@ def run_dubbing_pipeline(job_id: str):
             db.commit()
             VideoDubbingService.log_to_job(job_id, "Pipeline phân tích hoàn tất. Chuyển trạng thái sang: AWAITING_REVIEW.")
 
+        elif not enable_separation:
+            vocals_path = os.path.join(job_dir, "vocals.wav")
+            shutil.copy2(orig_audio_path, vocals_path)
+            job.vocals_audio_path = vocals_path
+            job.bgm_audio_path = None
+            job.bgm_volume = 0.0
+            db.commit()
+            VideoDubbingService.log_to_job(job_id, "Người dùng tắt tách nhạc Demucs — chuyển thẳng sang nhận dạng giọng nói Whisper ASR...")
+            trigger_transcription_stage(job_id, db)
         else:
             # Kaggle Worker / GPU Mode: Always submit job for audio separation
             job.status = "separating_audio"
@@ -829,7 +852,7 @@ def reconcile_dubbing_jobs_from_disk(db: Session, fallback_user_id: Optional[str
     import re
 
     for entry in os.listdir(dubbing_root):
-        if not entry.startswith("vd_") or entry in existing_ids:
+        if not entry.startswith("vd_") or entry in existing_ids or VideoDubbingService.is_job_deleted(entry):
             continue
         job_dir = os.path.join(dubbing_root, entry)
         if not os.path.isdir(job_dir):
@@ -1121,6 +1144,43 @@ def test_youtube_connection(
         }
 
 
+@router.post("/jobs/{job_id}/cancel", response_model=VideoDubbingJobResponse)
+def cancel_dubbing_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
+):
+    """Dừng/hủy tiến trình lồng tiếng đang chạy mà vẫn giữ lại dữ liệu dự án."""
+    from sqlalchemy import or_
+
+    job = _get_accessible_dubbing_job(db, job_id, current_user)
+    VideoDubbingService.mark_job_cancelled(job_id)
+    db.query(TTSJob).filter(
+        or_(
+            TTSJob.id.in_([f"sep_{job_id}", f"asr_{job_id}", f"dub_{job_id}"]),
+            TTSJob.batch_id == job_id,
+            TTSJob.id.like(f"dub_seg_{job_id}_%"),
+        ),
+        TTSJob.status.notin_(["completed", "failed", "cancelled"]),
+    ).update({TTSJob.status: "cancelled", TTSJob.error_message: "Cancelled by user"}, synchronize_session=False)
+    if job.original_subtitles and job.translated_subtitles:
+        job.status = "awaiting_review"
+        job.progress = 100
+        job.message = "Đã hủy tiến trình đang chạy. Bạn có thể chỉnh sửa phụ đề hoặc chạy lại."
+    elif job.input_file_path and os.path.exists(job.input_file_path):
+        job.status = "uploaded"
+        job.progress = 100
+        job.message = "Đã hủy tiến trình. Video gốc vẫn sẵn sàng để chạy lại."
+    else:
+        job.status = "cancelled"
+        job.error_message = "Đã hủy tác vụ theo yêu cầu người dùng."
+        job.message = "Đã hủy tác vụ."
+    db.commit()
+    db.refresh(job)
+    VideoDubbingService.log_to_job(job_id, "Người dùng đã yêu cầu hủy tiến trình đang chạy.")
+    return _format_dubbing_job_response(job)
+
+
 @router.post("/jobs/{job_id}/retry", response_model=VideoDubbingJobResponse)
 def retry_dubbing_job(
     job_id: str,
@@ -1131,12 +1191,26 @@ def retry_dubbing_job(
     """Thử lại tải video YouTube hoặc khởi chạy lại pipeline cho tác vụ bị lỗi/gián đoạn."""
     job = _get_accessible_dubbing_job(db, job_id, current_user)
 
-    if job.status not in ["failed", "downloading", "queued", "separating_audio", "transcribing"]:
-        raise HTTPException(status_code=400, detail="Chỉ có thể thử lại tác vụ đang lỗi hoặc bị kẹt ở bước tải/tách âm thanh/nhận diện.")
+    if job.status == "completed" and not payload.download_only:
+        raise HTTPException(status_code=400, detail="Tác vụ đã hoàn tất. Hãy dùng 'Chỉnh Sửa Phụ Đề & Lồng Tiếng Lại'.")
 
+    VideoDubbingService.clear_job_cancelled(job_id)
+    quality_changed = bool(
+        payload.preferred_quality
+        and payload.preferred_quality != (job.preferred_quality or "1080p")
+    )
     if payload.preferred_quality:
         job.preferred_quality = payload.preferred_quality
     job.error_message = None
+
+    # If user explicitly changed quality on a YouTube project (or requested download_only), remove stale input_video.mp4
+    if job.source_type == "youtube" and (payload.download_only or quality_changed):
+        if job.input_file_path and os.path.exists(job.input_file_path):
+            try:
+                os.remove(job.input_file_path)
+            except Exception:
+                pass
+        job.input_file_path = None
 
     import threading
     if payload.download_only:
@@ -1147,6 +1221,22 @@ def retry_dubbing_job(
         db.refresh(job)
         VideoDubbingService.log_to_job(job.id, f"Người dùng yêu cầu tải lại video YouTube (chất lượng: {job.preferred_quality or '1080p'}).")
         t = threading.Thread(target=run_youtube_predownload, args=(job.id,), daemon=True)
+        t.start()
+    elif (
+        not quality_changed
+        and job.translated_subtitles
+        and job.input_file_path
+        and os.path.exists(job.input_file_path)
+        and job.status in ("failed", "generating_tts", "mixing_audio", "muxing_video")
+    ):
+        # Preserve user-edited subtitles by resuming finalization instead of wiping Stage 1-2!
+        job.status = "generating_tts"
+        job.progress = 10
+        job.message = "Đang thử lại bước tổng hợp giọng đọc & kết xuất video (giữ nguyên phụ đề đã biên tập)..."
+        db.commit()
+        db.refresh(job)
+        VideoDubbingService.log_to_job(job.id, "Khởi chạy lại bước Finalization (bảo toàn phụ đề người dùng đã chỉnh sửa)...")
+        t = threading.Thread(target=run_finalization_pipeline, args=(job.id,), daemon=True)
         t.start()
     else:
         job.status = "queued"
@@ -1232,6 +1322,7 @@ async def create_dubbing_job(
     video_duration: Optional[float] = Form(None),
     voice_mode: Optional[str] = Form("auto_native"),
     voice_sample_id: Optional[str] = Form(None),
+    enable_separation: bool = Form(True),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key)
 ):
@@ -1286,7 +1377,8 @@ async def create_dubbing_job(
 
         # Trigger background execution pipeline with isolated daemon thread
         import threading
-        t = threading.Thread(target=run_dubbing_pipeline, args=(job.id,), daemon=True)
+        VideoDubbingService.clear_job_cancelled(job.id)
+        t = threading.Thread(target=run_dubbing_pipeline, args=(job.id, enable_separation), daemon=True)
         t.start()
 
         return _format_dubbing_job_response(job)
@@ -1335,7 +1427,8 @@ async def create_dubbing_job(
 
     # Trigger background execution pipeline with isolated daemon thread
     import threading
-    t = threading.Thread(target=run_dubbing_pipeline, args=(job_id,), daemon=True)
+    VideoDubbingService.clear_job_cancelled(job_id)
+    t = threading.Thread(target=run_dubbing_pipeline, args=(job_id, enable_separation), daemon=True)
     t.start()
 
     return _format_dubbing_job_response(job)
@@ -1519,7 +1612,19 @@ def delete_dubbing_job(
     current_user: User = Depends(get_user_or_api_key)
 ):
     """Xóa một tác vụ lồng tiếng và dọn dẹp các tệp liên quan."""
+    from sqlalchemy import or_
+
     job = _get_accessible_dubbing_job(db, job_id, current_user)
+    VideoDubbingService.mark_job_deleted(job_id)
+
+    # Xóa các sub-job GPU liên kết để tránh chạy ngầm lãng phí và hiện bóng ma trong History
+    db.query(TTSJob).filter(
+        or_(
+            TTSJob.id.in_([f"sep_{job_id}", f"asr_{job_id}", f"dub_{job_id}"]),
+            TTSJob.batch_id == job_id,
+            TTSJob.id.like(f"dub_seg_{job_id}_%"),
+        )
+    ).delete(synchronize_session=False)
         
     # Dọn dẹp thư mục lưu trữ cục bộ nếu có
     try:
@@ -1892,7 +1997,13 @@ def re_edit_dubbing_job(
 ):
     """Mở khóa tác vụ lồng tiếng để quay lại Step 3 (Biên tập phụ đề và bộ trộn)."""
     job = _get_accessible_dubbing_job(db, job_id, current_user)
-    
+    if not job.original_subtitles and not job.translated_subtitles:
+        raise HTTPException(status_code=400, detail="Tác vụ chưa có phụ đề để biên tập.")
+    # Cancel any in-flight dub_{job_id} worker task so late completion cannot overwrite re-edit state
+    db.query(TTSJob).filter(
+        TTSJob.id == f"dub_{job_id}",
+        TTSJob.status.notin_(["completed", "failed"]),
+    ).update({TTSJob.status: "failed", TTSJob.error_message: "Superseded by re-edit"}, synchronize_session=False)
     job.status = "awaiting_review"
     job.error_message = None
     job.message = "Đang mở lại chế độ biên tập phụ đề & hòa âm..."
@@ -1993,7 +2104,7 @@ def remix_dubbed_video(
         src_bgm = os.path.join(job_dir, "bgm.wav")
 
     VideoDubbingService.log_to_job(job_id, f"[REMIX] Hòa âm lại siêu tốc: Vocals={vocal_v}, BGM={bgm_v} với Auto-Ducking...")
-    VideoDubbingService.mix_and_mux_video(
+    actual_out = VideoDubbingService.mix_and_mux_video(
         video_path=src_video,
         bgm_path=src_bgm,
         vocal_path=dubbed_vocal_path,
@@ -2002,7 +2113,7 @@ def remix_dubbed_video(
         bgm_vol=bgm_v
     )
 
-    job.output_video_path = output_video_path
+    job.output_video_path = actual_out or output_video_path
     job.status = "completed"
     job.progress = 100
     job.message = "Hòa âm lại video thành công!"

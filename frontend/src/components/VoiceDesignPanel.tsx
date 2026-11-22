@@ -154,7 +154,14 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
         }
       } catch (err) {
         console.error("Lỗi khôi phục Voice Design job status:", err);
-        if (active) setLoading(false);
+        if (active) {
+          setJobId(null);
+          setPreviewId(null);
+          setJobStatus(null);
+          localStorage.removeItem("VITE_VOICE_DESIGN_JOB_ID");
+          localStorage.removeItem("VITE_VOICE_DESIGN_PREVIEW_ID");
+          setLoading(false);
+        }
       }
     })();
     return () => {
@@ -198,7 +205,10 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
   }, [isPolling, jobId, stopPolling]);
 
   const handleAccept = async () => {
-    if (!previewId) return;
+    if (!previewId) {
+      setErrorMsg("Không tìm thấy mã bản nghe thử (previewId). Vui lòng tạo lại bản nghe thử mới.");
+      return;
+    }
     setAccepting(true);
     setErrorMsg(null);
     setSuccessMsg(null);
@@ -214,37 +224,45 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
     }
   };
 
+  useEffect(() => {
+    if (!isSaveModalOpen) return;
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIsSaveModalOpen(false);
+    };
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [isSaveModalOpen]);
+
   const handleOpenSaveModal = (fullText: string) => {
     setSaveVoiceName(`Giọng Lưu - ${new Date().toLocaleDateString("vi-VN")} ${new Date().toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" })}`);
-    
-    // Suggest first 15 words of original text
-    const words = fullText.trim().split(/\s+/);
-    const suggestedText = words.slice(0, 15).join(" ") + (words.length > 15 ? "..." : "");
+    // Pre-fill full spoken preview transcript (up to ~35 words matching 8s trim) without literal "..."
+    const words = fullText.trim().split(/\s+/).filter(Boolean);
+    const suggestedText = words.slice(0, 32).join(" ");
     setSaveVoiceRefText(suggestedText);
     setSaveVoiceCustomId("");
-    
     setSaveVoiceIsPublic(false);
     setSaveVoiceStatus(null);
     setIsSaveModalOpen(true);
   };
 
   const handleSaveVoiceSubmit = async () => {
-    if (!previewId || !saveVoiceName || !saveVoiceRefText) return;
+    if (!previewId || !saveVoiceName.trim() || !saveVoiceRefText.trim()) return;
     setIsSavingVoice(true);
     setSaveVoiceStatus(null);
 
     try {
-      await api.saveFavoriteVoice({
+      const res = await api.saveFavoriteVoice({
         preview_id: previewId,
-        name: saveVoiceName,
+        name: saveVoiceName.trim(),
         is_public: saveVoiceIsPublic,
-        ref_text: saveVoiceRefText,
-        custom_id: saveVoiceCustomId || undefined,
+        ref_text: saveVoiceRefText.trim(),
+        custom_id: saveVoiceCustomId.trim() || undefined,
       });
+      onAcceptSuccess(res.voice_sample_id);
       setSaveVoiceStatus("Lưu giọng thành công vào Thư viện!");
       setTimeout(() => {
         setIsSaveModalOpen(false);
-      }, 1500);
+      }, 1200);
     } catch (err: unknown) {
       setSaveVoiceStatus(`Lỗi: ${getErrorMessage(err, "Không thể lưu giọng.")}`);
     } finally {
@@ -304,8 +322,8 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
             value={previewText}
             onChange={(e) => setPreviewText(e.target.value)}
             placeholder="Nhập nội dung ngắn để nghe thử giọng..."
-            rows={layout === "modern" ? 1.5 : 2}
-            className="bg-background border border-border/40 rounded-xl px-2.5 py-2 text-[11px] text-foreground focus:outline-none focus:border-primary/30 transition-all font-semibold w-full resize-none"
+            rows={2}
+            className="bg-background border border-border/40 rounded-xl px-2.5 py-2 text-xs text-foreground focus:outline-none focus:border-primary/30 transition-all font-medium w-full resize-y"
           />
         </div>
 
@@ -516,14 +534,14 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
 
         <button
           type="submit"
-          disabled={loading || !voiceRequest || !previewText}
+          disabled={loading || isPolling || !voiceRequest.trim() || !previewText.trim()}
           className={`w-full min-h-[44px] py-3 px-6 rounded-xl font-bold text-sm transition-colors active:translate-y-[1px] flex items-center justify-center gap-2 cursor-pointer ${
-            !loading && voiceRequest && previewText
+            !loading && !isPolling && voiceRequest.trim() && previewText.trim()
               ? "bg-primary hover:bg-primary-hover text-primary-foreground border-transparent"
               : "bg-muted text-muted-foreground cursor-not-allowed"
           }`}
         >
-          {loading ? (
+          {loading || isPolling ? (
             <>
               <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
               <span>Đang khởi tạo preview...</span>
@@ -629,17 +647,22 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
 
       {/* Save Voice Modal Overlay */}
       {isSaveModalOpen && (
-        <div 
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 lg:pl-64 bg-background/85 backdrop-blur-sm animate-fadeIn"
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="save-voice-design-modal-title"
+          className="fixed inset-0 z-[70] flex items-center justify-center p-4 lg:pl-fluid-sidebar bg-black/55 backdrop-blur-sm animate-fadeIn"
           onClick={() => setIsSaveModalOpen(false)}
         >
-          <div 
-            className="bg-card border border-border rounded-3xl p-6 w-full max-w-md flex flex-col gap-4 shadow-2xl relative"
+          <div
+            className="bg-card border border-border rounded-[20px] p-6 w-full max-w-md max-h-[90vh] overflow-y-auto flex flex-col gap-4 shadow-2xl relative"
             onClick={(e) => e.stopPropagation()}
           >
             <button
+              type="button"
+              aria-label="Đóng cửa sổ lưu giọng"
               onClick={() => setIsSaveModalOpen(false)}
-              className="absolute top-4 right-4 text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              className="min-w-[40px] min-h-[40px] flex items-center justify-center absolute top-3 right-3 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors cursor-pointer"
             >
               <X className="w-5 h-5" />
             </button>
@@ -649,7 +672,7 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
                 <Heart className="w-5 h-5 fill-emerald-400" />
               </div>
               <div>
-                <h3 className="font-bold text-sm text-foreground">Lưu giọng nói yêu thích</h3>
+                <h3 id="save-voice-design-modal-title" className="font-bold text-sm text-foreground">Lưu giọng nói yêu thích</h3>
                 <p className="text-[10px] text-muted-foreground font-semibold">Cắt 8 giây đầu và lưu làm mẫu clone giọng</p>
               </div>
             </div>

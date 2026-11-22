@@ -25,6 +25,7 @@ async def upload_voice_sample(
     ref_text: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
     custom_id: Optional[str] = Form(None),
+    tags: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_user_or_api_key)
 ):
@@ -101,6 +102,24 @@ async def upload_voice_sample(
             except Exception:
                 pass
 
+    # Normalize optional tags into JSON array string
+    import json as json_mod
+    normalized_tags: Optional[str] = None
+    if tags and tags.strip():
+        raw_tags = tags.strip()
+        parsed_list: List[str] = []
+        if raw_tags.startswith("["):
+            try:
+                loaded = json_mod.loads(raw_tags)
+                if isinstance(loaded, list):
+                    parsed_list = [str(t).strip() for t in loaded if str(t).strip()]
+            except Exception:
+                parsed_list = []
+        if not parsed_list:
+            parsed_list = [t.strip() for t in raw_tags.split(",") if t.strip()]
+        if parsed_list:
+            normalized_tags = json_mod.dumps(parsed_list, ensure_ascii=False)
+
     # Save details to database
     db_sample = VoiceSample(
         id=resolved_id,
@@ -111,6 +130,7 @@ async def upload_voice_sample(
         ref_text=ref_text,
         duration=duration,
         sample_rate=sample_rate,
+        tags=normalized_tags,
         status="ready"
     )
     

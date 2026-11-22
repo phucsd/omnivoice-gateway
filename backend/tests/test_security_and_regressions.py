@@ -17,7 +17,7 @@ os.environ["WORKER_TOKEN"] = "test_secret_token"
 from app.config import settings
 from app.database import Base, SessionLocal, auto_align_legacy_user_ids, engine
 from app.main import app
-from app.models import LLMProfile, SystemSetting, User, VoiceDesignPreview, VoiceSample
+from app.models import ApiKey, LLMProfile, SystemSetting, TTSJob, User, VideoDubbingJob, VoiceDesignPreview, VoiceSample
 from app.routers.compat import resolve_ref_audio
 from app.routers.internal_worker import _safe_extract_zip
 from app.services.job_service import JobService
@@ -446,3 +446,185 @@ def test_google_oauth_full_callback_flow(monkeypatch):
             db.commit()
     finally:
         db.close()
+
+
+def test_auto_align_deletes_dangling_api_keys_instead_of_admin_reassignment(tmp_path):
+    temp_db_file = tmp_path / "legacy_apikeys.sqlite"
+    db_url = f"sqlite:///{temp_db_file}"
+    temp_engine = create_engine(db_url, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=temp_engine)
+    temp_engine.dispose()
+
+    conn = sqlite3.connect(str(temp_db_file))
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO users (id, username, email, hashed_password, is_verified, is_approved, is_admin, created_at) "
+            "VALUES ('usr_admin_only', 'admin', 'admin@example.com', 'h', 1, 1, 1, CURRENT_TIMESTAMP)"
+        )
+        cur.execute(
+            "INSERT INTO api_keys (id, user_id, name, key, created_at) "
+            "VALUES ('ak_deleted_user', 'usr_deleted_999', 'Old Revoked User Key', 'ovg_live_deleted_999', CURRENT_TIMESTAMP)"
+        )
+        cur.execute(
+            "INSERT INTO api_keys (id, user_id, name, key, created_at) "
+            "VALUES ('ak_valid_admin', 'usr_admin_only', 'Admin Key', 'ovg_live_admin_ok', CURRENT_TIMESTAMP)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    auto_align_legacy_user_ids(db_url)
+
+    conn = sqlite3.connect(str(temp_db_file))
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, user_id FROM api_keys")
+        rows = cur.fetchall()
+        assert rows == [("ak_valid_admin", "usr_admin_only")]
+    finally:
+        conn.close()
+
+
+def test_xi_api_key_auth_female_tag_parsing_and_multiword_voice_resolution():
+    wav_bytes = _make_tiny_wav_bytes()
+    headers_a = _auth_headers("sec_user_a")
+
+    db = SessionLocal()
+    try:
+        user_a = db.query(User).filter(User.username == "sec_user_a").first()
+        xi_key = user_a.api_key
+    finally:
+        db.close()
+
+    up = client.post(
+        "/v1/voice-samples",
+        files={"file": ("mien_nam_female.wav", wav_bytes, "audio/wav")},
+        data={
+            "name": "Giọng Nữ Miền Nam Dịu Dàng",
+            "ref_text": "Xin chào quý khán giả",
+            "tags": "Nữ, Miền Nam, Truyền cảm",
+        },
+        headers=headers_a,
+    )
+    assert up.status_code == 200, up.text
+    sample_id = up.json()["voice_sample_id"]
+
+    try:
+        # 1. xi-api-key header authentication & "Nữ, Miền Nam" must classify as female (not male via substring "nam")
+        voices_res = client.get("/v1/voices", headers={"xi-api-key": xi_key})
+        assert voices_res.status_code == 200, voices_res.text
+        matched = [v for v in voices_res.json().get("voices", []) if v["voice_id"] == sample_id]
+        assert len(matched) == 1
+        assert matched[0]["labels"]["gender"] == "female"
+
+        # 2. Multi-word VoiceSample.name resolution in OpenAI /v1/audio/speech without treating spaces as instruct
+        speech_res = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "omnivoice-v1",
+                "input": "Xin chào từ kiểm thử tự động",
+                "voice": "Giọng Nữ Miền Nam Dịu Dàng",
+                "response_format": "wav",
+            },
+            headers={"xi-api-key": xi_key},
+        )
+        assert speech_res.status_code == 200, speech_res.text
+        assert len(speech_res.content) > 44
+    finally:
+        client.delete(f"/v1/voice-samples/{sample_id}", headers=headers_a)
+
+
+def test_asr_history_audio_url_and_settings_system_fallback():
+    headers_b = _auth_headers("sec_user_b")
+    wav_bytes = _make_tiny_wav_bytes()
+
+    # Global SystemSetting kaggle_timeout_seconds = 4200; user_b has no UserSetting override yet
+    db = SessionLocal()
+    try:
+        sys_row = db.query(SystemSetting).filter(SystemSetting.key == "kaggle_timeout_seconds").first()
+        if sys_row:
+            sys_row.value = "4200"
+        else:
+            db.add(SystemSetting(key="kaggle_timeout_seconds", value="4200"))
+        db.commit()
+    finally:
+        db.close()
+
+    settings_res = client.get("/v1/settings", headers=headers_b)
+    assert settings_res.status_code == 200
+    assert settings_res.json()["kaggle_timeout_seconds"] == 4200
+
+    # Create ASR job and verify History audio_url points to /v1/asr/jobs/{id}/audio
+    asr_res = client.post(
+        "/v1/asr",
+        files={"file": ("asr_hist.wav", wav_bytes, "audio/wav")},
+        headers=headers_b,
+    )
+    assert asr_res.status_code == 200, asr_res.text
+    asr_id = asr_res.json()["job_id"]
+
+    try:
+        job_detail = client.get(f"/v1/jobs/{asr_id}", headers=headers_b)
+        assert job_detail.status_code == 200
+        audio_url = job_detail.json().get("audio_url") or ""
+        assert audio_url == f"/v1/asr/jobs/{asr_id}/audio"
+
+        audio_stream = client.get(audio_url, headers=headers_b)
+        assert audio_stream.status_code == 200
+    finally:
+        client.delete(f"/v1/jobs/{asr_id}", headers=headers_b)
+
+
+def test_dubbing_cancel_and_delete_cleanup_child_tts_segments():
+    headers_a = _auth_headers("sec_user_a")
+    dub_id = f"dub_cleanup_{secrets.token_hex(4)}"
+    seg_job_id = f"dub_seg_{dub_id}_1_abcd"
+
+    db = SessionLocal()
+    try:
+        dub = VideoDubbingJob(
+            id=dub_id,
+            user_id="usr_sec_a",
+            status="generating_tts",
+            progress=65,
+            message="Generating segment 1",
+            source_type="upload",
+            target_language="Vietnamese",
+        )
+        seg = TTSJob(
+            id=seg_job_id,
+            user_id="usr_sec_a",
+            job_type="clone_voice",
+            text="Segment 1 text",
+            status="processing",
+            batch_id=dub_id,
+        )
+        db.add(dub)
+        db.add(seg)
+        db.commit()
+    finally:
+        db.close()
+
+    cancel_res = client.post(f"/v1/video-dubbing/jobs/{dub_id}/cancel", headers=headers_a)
+    assert cancel_res.status_code == 200, cancel_res.text
+    assert cancel_res.json()["status"] == "cancelled"
+
+    db = SessionLocal()
+    try:
+        seg_after_cancel = db.query(TTSJob).filter(TTSJob.id == seg_job_id).first()
+        assert seg_after_cancel is not None
+        assert seg_after_cancel.status == "cancelled"
+    finally:
+        db.close()
+
+    del_res = client.delete(f"/v1/jobs/{dub_id}", headers=headers_a)
+    assert del_res.status_code in (200, 204), del_res.text
+
+    db = SessionLocal()
+    try:
+        assert db.query(VideoDubbingJob).filter(VideoDubbingJob.id == dub_id).first() is None
+        assert db.query(TTSJob).filter(TTSJob.id == seg_job_id).first() is None
+    finally:
+        db.close()
+

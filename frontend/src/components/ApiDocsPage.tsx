@@ -18,6 +18,8 @@ export const ApiDocsPage: React.FC<ApiDocsPageProps> = ({ onBack, isLoggedIn }) 
     if (!isLoggedIn) return;
     let cancelled = false;
     (async () => {
+      await Promise.resolve();
+      if (cancelled) return;
       setLoadingKeys(true);
       try {
         const res = await api.getUserApiKeys();
@@ -162,8 +164,7 @@ edit_res = requests.put(f"{API_URL}/v1/voice-samples/YOUR_VOICE_ID", json=edit_p
 edit_res.raise_for_status()
 print("Đã chỉnh sửa giọng nói thành công!")`,
 
-    nodejs: `const fetch = require('node-fetch'); // Yêu cầu node-fetch đối với Node.js < 18
-const fs = require('fs');
+    nodejs: `const fs = require('fs'); // Node.js >= 18 hỗ trợ sẵn global fetch
 
 const API_URL = '${baseUrl}';
 const API_KEY = '${activeKey}';
@@ -219,7 +220,8 @@ async function generateSpeech() {
     // 3. Tải tệp âm thanh
     console.log("Đang tải tệp WAV về...");
     const audioRes = await fetch(\`\${API_URL}/v1/tts/jobs/\${job_id}/audio\`, { headers });
-    const buffer = await audioRes.buffer();
+    if (!audioRes.ok) throw new Error(\`Audio HTTP error! status: \${audioRes.status}\`);
+    const buffer = Buffer.from(await audioRes.arrayBuffer());
     
     fs.writeFileSync('output.wav', buffer);
     console.log("Tệp âm thanh WAV đã được lưu thành công: output.wav");
@@ -255,7 +257,7 @@ generateSpeech();`
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col font-sans select-text overflow-x-hidden relative">
       {/* Docs Header */}
-      <header className="sticky top-0 z-50 bg-background/85 backdrop-blur-md border-b border-border px-4 sm:px-6 py-3 flex items-center justify-between gap-2">
+      <header className={`sticky top-0 ${isLoggedIn ? "z-20" : "z-50"} bg-background/85 backdrop-blur-md border-b border-border px-4 sm:px-6 py-3 flex items-center justify-between gap-2`}>
         <div className="flex items-center gap-3 min-w-0">
           <button
             type="button"
@@ -335,9 +337,13 @@ generateSpeech();`
               </p>
             ) : loadingKeys ? (
               <p className="text-[10px] text-muted-foreground">Đang tải API Key của bạn...</p>
-            ) : (
+            ) : apiKeys.length > 0 ? (
               <p className="text-[10px] text-success bg-success/10 border border-success/20 p-2.5 rounded-lg font-medium leading-relaxed">
                 ✓ Đã áp dụng API Key thực tế của bạn vào các đoạn code mẫu tích hợp bên phải.
+              </p>
+            ) : (
+              <p className="text-[10px] text-warning bg-warning/10 border border-warning/20 p-2.5 rounded-lg font-medium leading-relaxed">
+                Bạn chưa có API Key nào. Hãy mở mục Quản lý API Keys ở thanh bên trái để tạo khóa trước khi chạy code mẫu.
               </p>
             )}
           </div>
@@ -516,7 +522,7 @@ generateSpeech();`
                 <span className="font-mono text-primary/90 font-bold">normalize_text</span>
                 <span className="text-muted-foreground text-[10px] ml-2 font-semibold">(Tùy chọn)</span>
                 <p className="text-[11px] text-muted-foreground mt-0.5">
-                  Tự động chuẩn hóa số (ví dụ: <code className="text-foreground bg-muted border border-border px-1 py-0.2 rounded font-mono">1.6</code> &rarr; <em>một chấm sáu</em>, <code className="text-foreground bg-muted border border-border px-1 py-0.2 rounded font-mono">1.600</code> &rarr; <em>một nghìn sáu trăm</em>, <code className="text-foreground bg-muted border border-border px-1 py-0.2 rounded font-mono">1,3456</code> &rarr; <em>một phẩy ba bốn năm sáu</em>), phần trăm, ngày tháng, tiền tệ thành chữ đọc tự nhiên. Mặc định là <code className="text-foreground bg-muted border border-border px-1.5 py-0.5 rounded font-mono font-semibold">true</code>.
+                  Tự động chuẩn hóa số (ví dụ: <code className="text-foreground bg-muted border border-border px-1 py-0.5 rounded font-mono">1.6</code> &rarr; <em>một chấm sáu</em>, <code className="text-foreground bg-muted border border-border px-1 py-0.5 rounded font-mono">1.600</code> &rarr; <em>một nghìn sáu trăm</em>, <code className="text-foreground bg-muted border border-border px-1 py-0.5 rounded font-mono">1,3456</code> &rarr; <em>một phẩy ba bốn năm sáu</em>), phần trăm, ngày tháng, tiền tệ thành chữ đọc tự nhiên. Mặc định là <code className="text-foreground bg-muted border border-border px-1.5 py-0.5 rounded font-mono font-semibold">true</code>.
                 </p>
               </div>
             </div>

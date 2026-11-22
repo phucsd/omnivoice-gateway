@@ -485,6 +485,35 @@ def download_batch_zip(
         filename=f"batch_{batch_id}.zip"
     )
 
+def _parse_voice_labels(raw_tags: Optional[str]) -> tuple[str, str, str]:
+    accent = "vietnamese"
+    gender = "unknown"
+    age = "adult"
+    tags_list: list[str] = []
+    if raw_tags:
+        stripped = raw_tags.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list):
+                    tags_list = [str(x).strip().lower() for x in parsed if str(x).strip()]
+            except Exception:
+                tags_list = [t.strip().strip('"\'[]').lower() for t in stripped.split(",") if t.strip()]
+        else:
+            tags_list = [t.strip().lower() for t in stripped.split(",") if t.strip()]
+
+    for t in tags_list:
+        if "nữ" in t or t == "female" or "female" in t:
+            gender = "female"
+        elif (t == "nam" or "giọng nam" in t or t == "male" or ("male" in t and "female" not in t)) and "miền nam" not in t:
+            gender = "male"
+        if "trẻ" in t or "young" in t:
+            age = "young"
+        elif "già" in t or "old" in t or "lớn tuổi" in t or "cao tuổi" in t or "trung niên" in t or "middle_aged" in t:
+            age = "middle_aged"
+    return accent, gender, age
+
+
 # ElevenLabs Compatibility API Router
 elevenlabs_compat_router = APIRouter(prefix="/v1", tags=["ElevenLabs Compatibility API"])
 
@@ -505,29 +534,8 @@ def list_voices_compat(
     voices = []
     base_url = str(request.base_url).rstrip("/")
     
-    # Try resolving auth token string from query params or headers to append to preview_url
-    token_str = request.query_params.get("token")
-    auth_header = request.headers.get("Authorization")
-    if not token_str and auth_header and auth_header.startswith("Bearer "):
-        token_str = auth_header.split(" ")[1]
-        
     for s in samples:
-        accent = "vietnamese"
-        gender = "unknown"
-        age = "adult"
-        
-        # Parse tags
-        tags_list = [t.strip().lower() for t in s.tags.split(",")] if s.tags else []
-        for t in tags_list:
-            if "nam" in t or "male" in t:
-                gender = "male"
-            elif "nữ" in t or "female" in t:
-                gender = "female"
-            elif "trẻ" in t or "young" in t:
-                age = "young"
-            elif "già" in t or "old" in t or "lớn tuổi" in t or "trung niên" in t:
-                age = "middle_aged"
-                
+        accent, gender, age = _parse_voice_labels(s.tags)
         # Never leak raw JWT/API keys in JSON preview_url responses
         preview_url = f"{base_url}/v1/voices/{s.id}/previews"
             
@@ -573,30 +581,11 @@ def get_voice_compat(
     if not s:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Không tìm thấy giọng đọc.")
         
-    if not s.is_public and s.user_id != current_user.id:
+    if not s.is_public and s.user_id != current_user.id and not current_user.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bạn không có quyền truy cập vào giọng đọc riêng tư này.")
         
     base_url = str(request.base_url).rstrip("/")
-    token_str = request.query_params.get("token")
-    auth_header = request.headers.get("Authorization")
-    if not token_str and auth_header and auth_header.startswith("Bearer "):
-        token_str = auth_header.split(" ")[1]
-        
-    accent = "vietnamese"
-    gender = "unknown"
-    age = "adult"
-    
-    tags_list = [t.strip().lower() for t in s.tags.split(",")] if s.tags else []
-    for t in tags_list:
-        if "nam" in t or "male" in t:
-            gender = "male"
-        elif "nữ" in t or "female" in t:
-            gender = "female"
-        elif "trẻ" in t or "young" in t:
-            age = "young"
-        elif "già" in t or "old" in t or "lớn tuổi" in t or "trung niên" in t:
-            age = "middle_aged"
-            
+    accent, gender, age = _parse_voice_labels(s.tags)
     preview_url = f"{base_url}/v1/voices/{s.id}/previews"
         
     return {
@@ -644,10 +633,17 @@ def get_voice_preview(
         
     # 2. Check auth if private
     if not sample.is_public:
-        auth_token = token
+        auth_token = (
+            token
+            or request.headers.get("xi-api-key")
+            or request.headers.get("X-API-Key")
+            or request.headers.get("X-OV-API-Key")
+        )
         auth_header = request.headers.get("Authorization")
         if not auth_token and auth_header and auth_header.startswith("Bearer "):
-            auth_token = auth_header.split(" ")[1]
+            auth_token = auth_header.split(" ", 1)[1]
+        elif auth_token and auth_token.startswith("Bearer "):
+            auth_token = auth_token.split(" ", 1)[1]
             
         if not auth_token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Yêu cầu xác thực tài khoản để truy cập giọng đọc riêng tư.")
@@ -678,7 +674,7 @@ def get_voice_preview(
         if not user or not user.is_approved:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Mã xác thực không hợp lệ hoặc tài khoản chưa được duyệt.")
             
-        if sample.user_id != user.id:
+        if sample.user_id != user.id and not user.is_admin:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bạn không có quyền truy cập vào giọng đọc riêng tư này.")
             
     # 3. Serve WAV file
@@ -686,4 +682,36 @@ def get_voice_preview(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tệp âm thanh nghe thử không tồn tại trên Gateway.")
         
     return FileResponse(sample.file_path, media_type="audio/wav")
+
+
+class ElevenLabsTTSRequest(BaseModel):
+    text: str
+    model_id: Optional[str] = "omnivoice"
+    voice_settings: Optional[dict] = None
+
+
+@elevenlabs_compat_router.post("/text-to-speech/{voice_id}")
+async def elevenlabs_text_to_speech(
+    voice_id: str,
+    payload: ElevenLabsTTSRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
+):
+    """ElevenLabs-compatible synchronous text-to-speech synthesis endpoint."""
+    from app.routers.audio import SpeechRequest, text_to_speech as openai_tts
+    speed = 1.0
+    if isinstance(payload.voice_settings, dict) and payload.voice_settings.get("speed") is not None:
+        try:
+            speed = float(payload.voice_settings["speed"])
+        except (TypeError, ValueError):
+            speed = 1.0
+    speech_req = SpeechRequest(
+        model=payload.model_id or "omnivoice",
+        input=payload.text,
+        voice=voice_id,
+        response_format="wav",
+        speed=speed,
+    )
+    return await openai_tts(speech_req, request, db, current_user)
 

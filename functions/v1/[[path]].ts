@@ -9,7 +9,8 @@ const HOP_BY_HOP_HEADERS = [
   "upgrade",
 ];
 
-const MEDIA_PATH_RE = /\/(video|output|vocals|bgm|audio)(\/|$)/i;
+const MEDIA_PATH_RE =
+  /\/(video|output|vocals|bgm|audio|dubbed-audio|previews|zip|ref-audio|voice-samples|inference)(\/|$)/i;
 
 export const onRequest: PagesFunction = async (context) => {
   const url = new URL(context.request.url);
@@ -35,14 +36,12 @@ export const onRequest: PagesFunction = async (context) => {
     headers.set("Accept-Encoding", "identity");
   }
 
+  const hasBody = context.request.method !== "GET" && context.request.method !== "HEAD";
   const proxyRequest = new Request(targetUrl, {
     method: context.request.method,
     headers,
-    body:
-      context.request.method !== "GET" && context.request.method !== "HEAD"
-        ? context.request.body
-        : null,
-    redirect: "follow",
+    body: hasBody ? context.request.body : null,
+    redirect: hasBody ? "manual" : "follow",
   });
 
   try {

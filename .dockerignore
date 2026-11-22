@@ -25,3 +25,7 @@ local_yt_bridge/bin
 local_yt_bridge/logs
 local_yt_bridge/.bridge_secrets.json
 local_yt_bridge/.env
+kaggle_worker/worker.py
+kaggle_worker/omnivoice_worker.py
+kaggle_worker/kernel-metadata.json
+kaggle_worker-*

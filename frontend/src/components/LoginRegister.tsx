@@ -94,8 +94,12 @@ export const LoginRegister: React.FC<LoginRegisterProps> = ({ onLoginSuccess }) 
           sessionStorage.setItem("ov_oauth_state", res.state);
         }
         if (isInIframe) {
-          window.open(res.auth_url, "_blank", "noopener,noreferrer");
-          setSuccessMsg("Đã mở trang đăng nhập Google ở cửa sổ mới do Space đang chạy trong iframe.");
+          const popup = window.open(res.auth_url, "_blank");
+          if (popup) {
+            setSuccessMsg("Đã mở trang đăng nhập Google ở cửa sổ mới. Sau khi đăng nhập xong, phiên sẽ tự động đồng bộ vào trang này.");
+          } else {
+            setErrorMsg("Trình duyệt đã chặn cửa sổ bật lên (Popup). Vui lòng cho phép mở cửa sổ mới cho trang này rồi thử lại.");
+          }
         } else {
           navigating = true;
           window.location.href = res.auth_url;
@@ -154,7 +158,11 @@ export const LoginRegister: React.FC<LoginRegisterProps> = ({ onLoginSuccess }) 
     setLoading(true);
     try {
       const res = await api.resendCode(username.trim());
-      setSuccessMsg(res.message || "Đã gửi lại mã OTP.");
+      const suffix = res.debug_code ? ` (Mã OTP thử nghiệm: ${res.debug_code})` : "";
+      if (res.debug_code) {
+        setOtpCode(res.debug_code);
+      }
+      setSuccessMsg((res.message || "Đã gửi lại mã OTP.") + suffix);
     } catch (err: unknown) {
       setErrorMsg(getErrorMessage(err, "Không thể gửi lại mã OTP."));
     } finally {

@@ -305,8 +305,16 @@ def auto_align_legacy_user_ids(db_url: str):
         row = cursor.fetchone()
         if row:
             admin_id = row[0]
+            legacy_empty_cond = "user_id IS NULL OR user_id = ''"
+            dangling_user_cond = "user_id IS NOT NULL AND user_id != '' AND user_id NOT IN (SELECT id FROM users)"
+            # Security: NEVER reassign API keys or user_settings of deleted users to Admin
+            for sec_tbl in ("api_keys", "user_settings"):
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (sec_tbl,))
+                if cursor.fetchone():
+                    cursor.execute(f"DELETE FROM {sec_tbl} WHERE {dangling_user_cond}")
+                    cursor.execute(f"UPDATE {sec_tbl} SET user_id = ? WHERE {legacy_empty_cond}", (admin_id,))
             orphan_cond = "user_id IS NULL OR user_id = '' OR user_id NOT IN (SELECT id FROM users)"
-            for tbl in ("voice_samples", "api_keys", "tts_jobs", "user_settings", "video_dubbing_jobs", "voice_design_previews"):
+            for tbl in ("voice_samples", "tts_jobs", "video_dubbing_jobs", "voice_design_previews"):
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (tbl,))
                 if cursor.fetchone():
                     cursor.execute(f"UPDATE {tbl} SET user_id = ? WHERE {orphan_cond}", (admin_id,))

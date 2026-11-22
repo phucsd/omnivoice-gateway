@@ -65,15 +65,21 @@ def get_user_or_api_key(
     token_query: Optional[str] = Query(None, alias="token"),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     x_ov_api_key: Optional[str] = Header(None, alias="X-OV-API-Key"),
+    xi_api_key: Optional[str] = Header(None, alias="xi-api-key"),
     db: Session = Depends(get_db)
 ) -> User:
     """
     Authenticates either via JWT Token (Authorization: Bearer <JWT>)
     OR via User Static API Key (Authorization: Bearer <API_KEY>) from ApiKey table.
     Allows query parameter fallback for browsers (?token=...)
-    Also supports custom headers X-API-Key / X-OV-API-Key.
+    Also supports custom headers X-API-Key / X-OV-API-Key / xi-api-key.
     """
-    auth_token = x_api_key or x_ov_api_key or token or token_query
+    x_api_key = x_api_key if isinstance(x_api_key, str) else None
+    x_ov_api_key = x_ov_api_key if isinstance(x_ov_api_key, str) else None
+    xi_api_key = xi_api_key if isinstance(xi_api_key, str) else None
+    token = token if isinstance(token, str) else None
+    token_query = token_query if isinstance(token_query, str) else None
+    auth_token = x_api_key or x_ov_api_key or xi_api_key or token or token_query
     if auth_token and auth_token.startswith("Bearer "):
         auth_token = auth_token.split(" ", 1)[1]
     

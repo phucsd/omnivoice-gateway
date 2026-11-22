@@ -38,7 +38,21 @@ async def auto_shutdown_monitor():
             db = SessionLocal()
             try:
                 active_job = db.query(TTSJob).filter(
-                    TTSJob.status.in_(["starting_worker", "booting_kaggle", "queued_kaggle", "running", "exporting_wav"])
+                    TTSJob.status.in_([
+                        "queued",
+                        "starting_worker",
+                        "booting_kaggle",
+                        "queued_kaggle",
+                        "running",
+                        "preparing_input",
+                        "loading_model",
+                        "generating_audio",
+                        "separating_audio",
+                        "transcribing",
+                        "generating_tts",
+                        "mixing_audio",
+                        "exporting_wav",
+                    ])
                 ).first()
                 active_dub = db.query(VideoDubbingJob).filter(
                     VideoDubbingJob.status.in_([
@@ -211,8 +225,23 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
         
+    # Resolve effective worker mode from SystemSetting override (unless in testing mode)
+    effective_worker_mode = settings.WORKER_MODE
+    if settings.APP_ENV != "testing":
+        db_wm = SessionLocal()
+        try:
+            from app.models import SystemSetting as _SysSetting
+            wm_row = db_wm.query(_SysSetting).filter(_SysSetting.key == "worker_mode").first()
+            if wm_row and wm_row.value.strip() in ("mock", "kaggle"):
+                effective_worker_mode = wm_row.value.strip()
+                settings.WORKER_MODE = effective_worker_mode
+        except Exception:
+            pass
+        finally:
+            db_wm.close()
+
     # Start mock background worker if configured
-    if settings.WORKER_MODE == "mock":
+    if effective_worker_mode == "mock":
         print("[Main] Running in MOCK worker mode. Initializing MockWorker background thread...")
         MockWorker.start()
     else:
@@ -240,13 +269,9 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
-    if settings.WORKER_MODE == "mock":
-        print("[Main] Shutting down MockWorker background thread...")
-        MockWorker.stop()
-    else:
-        print("[Main] Shutting down KaggleOrchestrator queue runner...")
-        from app.services.kaggle_orchestrator import KaggleOrchestrator
-        KaggleOrchestrator.stop_queue_runner()
+    MockWorker.stop()
+    from app.services.kaggle_orchestrator import KaggleOrchestrator
+    KaggleOrchestrator.stop_queue_runner()
     print("[Main] Gateway shutdown complete.")
 
 
@@ -255,16 +280,6 @@ app = FastAPI(
     description="Gateway managing job queues, audio storage, and polling orchestrations for OmniVoice GPU Workers.",
     version="1.0.0",
     lifespan=lifespan
-)
-
-# CORS setup
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_origin_regex=r"https://([a-z0-9-]+\.)?omnivoice-gateway\.pages\.dev",
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-OV-API-Key", "xi-api-key", "Accept"],
 )
 
 @app.middleware("http")
@@ -278,7 +293,7 @@ async def add_security_headers(request: Request, call_next):
     if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(), geolocation=(), payment=()"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(self), geolocation=(), payment=()"
 
     content_type = response.headers.get("content-type", "")
     if content_type.startswith("text/html") and "cache-control" not in response.headers:
@@ -292,15 +307,16 @@ async def add_security_headers(request: Request, call_next):
 async def log_api_usage(request: Request, call_next):
     path = request.url.path
     
-    # Exclude high-frequency polling and worker endpoints from DB logging
+    # Exclude high-frequency polling, media streams, and worker endpoints from DB logging
     is_polling = (
-        path.startswith("/v1/internal/worker")
+        path.startswith("/v1/internal/")
         or path.startswith("/v1/auth/me")
         or (request.method == "GET" and (
             (path.startswith("/v1/tts/jobs/") and len(path) > 13)
             or (path.startswith("/v1/voice-design/previews/") and len(path) > 26)
             or (path.startswith("/v1/jobs/") and len(path) > 9)
             or path.startswith("/v1/video-dubbing/jobs")
+            or path.endswith(("/audio", "/video", "/output", "/vocals", "/bgm", "/dubbed-audio", "/previews"))
         ))
         or (request.method == "POST" and path == "/v1/jobs/batch")
     )
@@ -404,6 +420,36 @@ async def update_last_request_time(request: Request, call_next):
         last_request_time = time.time()
         print(f"[AutoShutdown] Request to {path} updated last activity time.")
     return await call_next(request)
+
+# CORS setup (registered AFTER @app.middleware("http") so CORSMiddleware is the outermost layer)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_origin_regex=r"https://([a-z0-9-]+\.)?omnivoice-gateway\.pages\.dev",
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-API-Key",
+        "X-OV-API-Key",
+        "xi-api-key",
+        "Accept",
+        "Range",
+        "If-Range",
+        "Cache-Control",
+    ],
+    expose_headers=[
+        "Content-Range",
+        "Accept-Ranges",
+        "Content-Length",
+        "Content-Disposition",
+    ],
+)
+
+@app.get("/v1/openapi.json", include_in_schema=False)
+def get_v1_openapi():
+    return app.openapi()
 
 # Register routers
 app.include_router(health.router)

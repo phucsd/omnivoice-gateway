@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Download, Play, Pause, Volume1, Volume2, VolumeX, X, RotateCcw, RotateCw, Loader2, AlertCircle, RefreshCw } from "lucide-react";
 import { api } from "../api/client";
-import { audioEngine } from "../services/audioEngine";
 
 interface AudioPlayerProps {
   url: string;
@@ -9,6 +8,7 @@ interface AudioPlayerProps {
   isPlayingGlobal: boolean;
   onPlayingGlobalChange: (playing: boolean) => void;
   onClose: () => void;
+  canRegenerate?: boolean;
 }
 
 export const AudioPlayer: React.FC<AudioPlayerProps> = ({
@@ -17,12 +17,19 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   isPlayingGlobal,
   onPlayingGlobalChange,
   onClose,
+  canRegenerate = false,
 }) => {
   const audioRef = useRef<HTMLAudioElement>(null);
   const onPlayingChangeRef = useRef(onPlayingGlobalChange);
+  const isPlayingGlobalRef = useRef(isPlayingGlobal);
+
   useEffect(() => {
     onPlayingChangeRef.current = onPlayingGlobalChange;
   }, [onPlayingGlobalChange]);
+
+  useEffect(() => {
+    isPlayingGlobalRef.current = isPlayingGlobal;
+  }, [isPlayingGlobal]);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -35,6 +42,20 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [hasError, setHasError] = useState(false);
   const [blobUrl, setBlobUrl] = useState<string>("");
+  const [retrySeq, setRetrySeq] = useState(0);
+
+  // Pause global player when local media elements (<video> / ASR <audio> / Playground <audio>) start playing
+  useEffect(() => {
+    const handlePauseGlobal = () => {
+      if (audioRef.current && !audioRef.current.paused) {
+        audioRef.current.pause();
+      }
+      setIsPlaying(false);
+      onPlayingChangeRef.current(false);
+    };
+    window.addEventListener("omnivoice:pause-global-audio", handlePauseGlobal);
+    return () => window.removeEventListener("omnivoice:pause-global-audio", handlePauseGlobal);
+  }, []);
 
   useEffect(() => {
     let isCancelled = false;
@@ -50,6 +71,9 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       Promise.resolve().then(() => {
         if (!isCancelled) {
           setBlobUrl("");
+          setDuration(0);
+          setCurrentTime(0);
+          setIsPlaying(false);
           setIsLoading(false);
           setHasError(false);
         }
@@ -61,12 +85,14 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
 
     Promise.resolve().then(() => {
       if (!isCancelled) {
+        setBlobUrl("");
+        setDuration(0);
+        setCurrentTime(0);
+        setIsPlaying(false);
         setIsLoading(true);
         setHasError(false);
       }
     });
-
-    void audioEngine.preload(url);
 
     api
       .fetchProtectedAudioBlobUrl(url)
@@ -87,6 +113,8 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
           setBlobUrl("");
           setHasError(true);
           setIsLoading(false);
+          setIsPlaying(false);
+          onPlayingChangeRef.current(false);
         }
       });
 
@@ -96,11 +124,12 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
         URL.revokeObjectURL(createdObjectUrl);
       }
     };
-  }, [url]);
+  }, [url, retrySeq]);
 
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio || !blobUrl) return;
+    if (!isPlayingGlobalRef.current) return;
 
     audio
       .play()
@@ -110,7 +139,8 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
         onPlayingChangeRef.current(true);
       })
       .catch(() => {
-        // Play abort or autoplay policy block is expected before explicit click
+        setIsPlaying(false);
+        onPlayingChangeRef.current(false);
       });
   }, [blobUrl]);
 
@@ -128,7 +158,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
     };
     const handleTimeUpdate = () => setCurrentTime(audio.currentTime);
     const handleLoadedMetadata = () => {
-      setDuration(audio.duration);
+      setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
       setIsLoading(false);
       setHasError(false);
     };
@@ -150,6 +180,8 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       setIsLoading(false);
       if (blobUrl) {
         setHasError(true);
+        setIsPlaying(false);
+        onPlayingChangeRef.current(false);
       }
     };
 
@@ -178,16 +210,23 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
 
   useEffect(() => {
     const audio = audioRef.current;
-    if (!audio || !blobUrl) return;
+    if (!audio) return;
 
     if (isPlayingGlobal) {
-      if (audio.paused) {
-        audio.play().catch((err) => console.error("Global play error:", err));
+      if (hasError) {
+        Promise.resolve().then(() => setRetrySeq(prev => prev + 1));
+        return;
+      }
+      if (blobUrl && audio.paused) {
+        audio.play().catch((err) => {
+          console.error("Global play error:", err);
+          onPlayingChangeRef.current(false);
+        });
       }
     } else if (!audio.paused) {
       audio.pause();
     }
-  }, [isPlayingGlobal, blobUrl]);
+  }, [isPlayingGlobal, blobUrl, hasError]);
 
   useEffect(() => {
     if (audioRef.current) {
@@ -202,6 +241,11 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   }, [playbackRate]);
 
   const togglePlay = () => {
+    if (hasError) {
+      onPlayingChangeRef.current(true);
+      setRetrySeq(prev => prev + 1);
+      return;
+    }
     const audio = audioRef.current;
     if (!audio || !blobUrl) return;
     if (isPlaying) {
@@ -233,10 +277,17 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
 
   const handleDownload = async (e: React.MouseEvent) => {
     e.preventDefault();
-    if (!url) return;
+    if (!url || isLoading || hasError) return;
     try {
-      const targetHref = blobUrl || (await api.fetchProtectedAudioBlobUrl(url)).blobUrl;
-      const shouldRevoke = !blobUrl && targetHref.startsWith("blob:");
+      let targetHref = blobUrl;
+      let shouldRevoke = false;
+      if (!targetHref || !targetHref.startsWith("blob:")) {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const blob = await resp.blob();
+        targetHref = URL.createObjectURL(blob);
+        shouldRevoke = true;
+      }
       const link = document.createElement("a");
       link.href = targetHref;
       link.download = title ? `${title.replace(/\s+/g, "_")}.wav` : "audio.wav";
@@ -266,7 +317,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   };
 
   const formatTime = (time: number) => {
-    if (isNaN(time)) return "00:00";
+    if (!Number.isFinite(time) || isNaN(time)) return "00:00";
     const minutes = Math.floor(time / 60);
     const seconds = Math.floor(time % 60);
     const mm = minutes < 10 ? `0${minutes}` : `${minutes}`;
@@ -275,7 +326,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   };
 
   const speeds = [0.75, 1.0, 1.25, 1.5, 2.0];
-  const percentage = duration ? (currentTime / duration) * 100 : 0;
+  const percentage = duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
 
   const renderVolumeIcon = () => {
     if (isMuted || volumeVal === 0) {
@@ -288,24 +339,35 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   };
 
   if (!url) {
-    return (
-      <div className="w-full h-full flex items-center justify-center text-sm text-muted-foreground font-medium relative px-4">
-        <div className="flex items-center gap-2">
-          <Volume2 className="w-4 h-4 text-muted-foreground shrink-0" />
-          <span className="truncate">Chưa có audio được phát. Chọn một bản ghi để nghe.</span>
-        </div>
-      </div>
-    );
+    return null;
   }
 
   return (
     <div className="w-full h-full relative">
-      <div className="h-full px-3 sm:px-6 flex items-center justify-between gap-3 sm:gap-4 relative z-10">
+      {/* Mobile top-edge interactive seekbar (< 640px) */}
+      <div className="sm:hidden absolute -top-1.5 left-0 right-0 z-20 px-2">
+        <input
+          type="range"
+          aria-label="Thanh tua âm thanh di động"
+          min={0}
+          max={duration || 100}
+          step={0.1}
+          value={currentTime}
+          onChange={handleSeekChange}
+          className="seekbar w-full"
+          disabled={hasError || isLoading}
+          style={{
+            background: `linear-gradient(to right, var(--primary) 0%, var(--primary) ${percentage}%, var(--slider-track) ${percentage}%, var(--slider-track) 100%)`
+          }}
+        />
+      </div>
+
+      <div className="h-full px-2.5 sm:px-6 flex items-center justify-between gap-2 sm:gap-4 relative z-10">
         <audio ref={audioRef} src={blobUrl || undefined} preload="auto" />
 
         {/* Left: Controls & Metadata */}
-        <div className="flex items-center gap-3 min-w-0">
-          <div className="flex items-center gap-1 shrink-0">
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1 sm:flex-initial">
+          <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
             <button
               type="button"
               onClick={handleRewind}
@@ -319,13 +381,15 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
             <button
               type="button"
               onClick={togglePlay}
-              aria-label={isPlaying ? "Tạm dừng âm thanh" : "Phát âm thanh"}
+              aria-label={hasError ? "Thử tải lại âm thanh" : isPlaying ? "Tạm dừng âm thanh" : "Phát âm thanh"}
               className="w-11 h-11 rounded-full bg-primary hover:bg-primary-hover text-primary-foreground flex items-center justify-center cursor-pointer shrink-0 transition-colors active:translate-y-[1px]"
-              title={isPlaying ? "Tạm dừng" : "Phát"}
-              disabled={hasError || isLoading}
+              title={hasError ? "Thử lại" : isPlaying ? "Tạm dừng" : "Phát"}
+              disabled={isLoading}
             >
               {isLoading ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
+              ) : hasError ? (
+                <RefreshCw className="w-4 h-4" />
               ) : isPlaying ? (
                 <Pause className="w-4 h-4 fill-current" />
               ) : (
@@ -345,33 +409,34 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
           </div>
 
           <div className="flex flex-col min-w-0 leading-tight">
-            <span className="text-sm font-semibold text-foreground truncate max-w-[120px] sm:max-w-[180px]" title={title}>
+            <span className="text-xs sm:text-sm font-semibold text-foreground truncate max-w-[110px] xs:max-w-[140px] sm:max-w-[200px]" title={title}>
               {title}
             </span>
             {hasError ? (
-              <span className="text-xs text-destructive font-semibold flex items-center gap-1">
-                <AlertCircle className="w-3.5 h-3.5" />
-                <span>Lỗi phát âm thanh</span>
+              <span className="text-[11px] text-destructive font-semibold flex items-center gap-1">
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">Lỗi phát — bấm để thử lại</span>
               </span>
             ) : (
-              <span className="text-xs font-mono font-medium text-muted-foreground mt-0.5 tabular-nums">
+              <span className="text-[11px] sm:text-xs font-mono font-medium text-muted-foreground mt-0.5 tabular-nums">
                 {formatTime(currentTime)} / {formatTime(duration)}
               </span>
             )}
           </div>
         </div>
 
-        {/* Center: Seekbar */}
-        <div className="flex-grow max-w-[400px] hidden sm:flex items-center">
+        {/* Center: Desktop Seekbar */}
+        <div className="flex-grow max-w-[420px] hidden sm:flex items-center">
           <input
             type="range"
             aria-label="Thanh tua âm thanh"
             min={0}
             max={duration || 100}
+            step={0.1}
             value={currentTime}
             onChange={handleSeekChange}
             className="seekbar w-full"
-            disabled={hasError}
+            disabled={hasError || isLoading}
             style={{
               background: `linear-gradient(to right, var(--primary) 0%, var(--primary) ${percentage}%, var(--slider-track) ${percentage}%, var(--slider-track) 100%)`
             }}
@@ -379,13 +444,13 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
         </div>
 
         {/* Right: Tools & Dismiss */}
-        <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+        <div className="flex items-center gap-0.5 sm:gap-1.5 shrink-0">
           <div className="relative flex items-center">
             <button
               type="button"
               onClick={() => setShowSpeedMenu(!showSpeedMenu)}
               aria-label="Tốc độ phát"
-              className="min-h-[44px] px-2.5 py-1.5 bg-background hover:bg-secondary border border-border rounded-xl text-xs font-semibold text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              className="min-h-[44px] px-2 sm:px-2.5 py-1.5 bg-background hover:bg-secondary border border-border rounded-xl text-xs font-semibold text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
             >
               {playbackRate.toFixed(2)}x
             </button>
@@ -393,7 +458,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
             {showSpeedMenu && (
               <>
                 <div className="fixed inset-0 z-10" onClick={() => setShowSpeedMenu(false)} />
-                <div className="absolute bottom-full right-0 mb-2.5 z-25 bg-card border border-border rounded-xl p-1.5 shadow-lg flex flex-col gap-0.5 min-w-[75px]">
+                <div className="absolute bottom-full right-0 mb-2.5 z-25 bg-card border border-border rounded-xl p-1.5 shadow-lg flex flex-col gap-0.5 min-w-[80px]">
                   {speeds.map((s) => (
                     <button
                       type="button"
@@ -402,7 +467,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
                         setPlaybackRate(s);
                         setShowSpeedMenu(false);
                       }}
-                      className={`min-h-[36px] px-3 py-1.5 text-left rounded-lg text-xs font-semibold transition-colors cursor-pointer w-full ${
+                      className={`min-h-[40px] px-3 py-1.5 text-left rounded-lg text-xs font-semibold transition-colors cursor-pointer w-full ${
                         playbackRate === s
                           ? "bg-primary text-primary-foreground"
                           : "text-muted-foreground hover:text-foreground hover:bg-secondary"
@@ -416,7 +481,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
             )}
           </div>
 
-          <div className="flex items-center gap-1.5 group/volume relative py-1">
+          <div className="hidden xs:flex items-center gap-1.5 group/volume relative py-1">
             <button
               type="button"
               onClick={toggleMute}
@@ -445,24 +510,27 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
           <button
             type="button"
             onClick={handleDownload}
+            disabled={isLoading || hasError}
             aria-label="Tải xuống tệp WAV"
-            className="min-w-[44px] min-h-[44px] flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-secondary rounded-xl transition-colors cursor-pointer shrink-0"
+            className="min-w-[44px] min-h-[44px] flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-secondary rounded-xl transition-colors cursor-pointer shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
             title="Tải xuống tệp WAV"
           >
             <Download className="w-4 h-4" />
           </button>
 
-          <button
-            type="button"
-            onClick={() => {
-              window.dispatchEvent(new CustomEvent("omnivoice:regenerate"));
-            }}
-            aria-label="Tạo lại âm thanh"
-            className="min-w-[44px] min-h-[44px] flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-secondary rounded-xl transition-colors cursor-pointer shrink-0"
-            title="Tạo lại âm thanh (Regenerate)"
-          >
-            <RefreshCw className="w-4 h-4" />
-          </button>
+          {canRegenerate && (
+            <button
+              type="button"
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent("omnivoice:regenerate"));
+              }}
+              aria-label="Tạo lại âm thanh"
+              className="min-w-[44px] min-h-[44px] hidden sm:flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-secondary rounded-xl transition-colors cursor-pointer shrink-0"
+              title="Tạo lại âm thanh (Regenerate)"
+            >
+              <RefreshCw className="w-4 h-4" />
+            </button>
+          )}
 
           <div className="h-5 w-[1px] bg-border mx-0.5 shrink-0" />
 

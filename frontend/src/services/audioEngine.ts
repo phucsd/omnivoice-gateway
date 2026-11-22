@@ -1,8 +1,11 @@
 // High-Performance Web Audio API Engine for Instant Playback
+import { getApiBaseUrl } from "../api/client";
 
 interface WindowWithWebkitAudio extends Window {
   webkitAudioContext?: typeof AudioContext;
 }
+
+const MAX_CACHE_ENTRIES = 12;
 
 class AudioEngineService {
   private audioCtx: AudioContext | null = null;
@@ -35,7 +38,7 @@ class AudioEngineService {
   }
 
   /**
-   * Pre-fetches audio data over HTTPS with Bearer auth when needed and decodes into AudioBuffer.
+   * Pre-fetches audio data over HTTPS with Bearer auth only for trusted gateway origins.
    */
   async preload(url: string): Promise<AudioBuffer | null> {
     if (!url) return null;
@@ -47,7 +50,13 @@ class AudioEngineService {
       const ctx = this.getContext();
       const headers: HeadersInit = {};
       const token = localStorage.getItem("VITE_JWT_TOKEN");
-      if (token && !url.startsWith("blob:") && !url.startsWith("data:") && !url.includes("huggingface.co/datasets")) {
+      const allowedPrefix = getApiBaseUrl() || (typeof window !== "undefined" ? window.location.origin : "");
+      if (
+        token &&
+        !url.startsWith("blob:") &&
+        !url.startsWith("data:") &&
+        (!url.startsWith("http") || (allowedPrefix && url.startsWith(allowedPrefix)))
+      ) {
         headers["Authorization"] = `Bearer ${token}`;
       }
       const response = await fetch(url, { headers });
@@ -56,6 +65,10 @@ class AudioEngineService {
       const arrayBuffer = await response.arrayBuffer();
       const decodedBuffer = await ctx.decodeAudioData(arrayBuffer);
 
+      if (this.bufferCache.size >= MAX_CACHE_ENTRIES) {
+        const oldestKey = this.bufferCache.keys().next().value;
+        if (oldestKey) this.bufferCache.delete(oldestKey);
+      }
       this.bufferCache.set(url, decodedBuffer);
       return decodedBuffer;
     } catch (err) {
@@ -135,6 +148,12 @@ class AudioEngineService {
     }
     this.isPlaying = false;
     this.startOffset = 0;
+  }
+
+  clearCache(): void {
+    this.stop();
+    this.bufferCache.clear();
+    this.currentUrl = null;
   }
 
   setVolume(vol: number): void {

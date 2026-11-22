@@ -26,6 +26,7 @@ function getTagColor(tag: string): string {
 
 interface VoiceLibraryPanelProps {
   onUseVoice: (voiceId: string) => void;
+  onVoiceDeleted?: (deletedId: string) => void;
   layout?: "classic" | "modern";
   currentPlayUrl: string | null;
   globalPlayerPlaying: boolean;
@@ -37,6 +38,7 @@ interface VoiceLibraryPanelProps {
 
 export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
   onUseVoice,
+  onVoiceDeleted,
   currentPlayUrl,
   globalPlayerPlaying,
   onPlayAudio,
@@ -47,7 +49,8 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
   const [voices, setVoices] = useState<VoiceSampleResponse[]>([]);
   const [filter, setFilter] = useState<"all" | "private" | "public">("all");
   const [searchQuery, setSearchQuery] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
@@ -113,12 +116,17 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
   };
 
   const handleDelete = async (id: string) => {
+    if (deletingId === id) return;
+    setDeletingId(id);
     try {
       await api.deleteVoiceSample(id);
       setVoices(prev => prev.filter(v => v.id !== id));
       setDeleteConfirmId(null);
+      onVoiceDeleted?.(id);
     } catch (err: unknown) {
       setErrorMsg(`Lỗi khi xóa giọng: ${getErrorMessage(err, "Vui lòng thử lại sau.")}`);
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -338,7 +346,7 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-fluid">
           {filteredVoices.map((voice) => {
-            const audioUrl = `${api.getApiBaseUrl()}/v1/voice-samples/${voice.id}/audio`;
+            const audioUrl = api.getVoiceSampleAudioUrl(voice.id);
             return (
               <div
                 key={voice.id}
@@ -538,7 +546,7 @@ export const VoiceLibraryPanel: React.FC<VoiceLibraryPanelProps> = ({
           role="dialog"
           aria-modal="true"
           aria-labelledby="edit-voice-modal-title"
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fadeIn p-4 lg:pl-64"
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/55 backdrop-blur-sm animate-fadeIn p-4 lg:pl-fluid-sidebar"
           onClick={closeEditModal}
         >
           <div

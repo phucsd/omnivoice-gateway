@@ -35,6 +35,10 @@ class SpeechRequest(BaseModel):
     audio_chunk_duration: Optional[float] = 15.0
     audio_chunk_threshold: Optional[float] = 30.0
     with_alignment: Optional[bool] = Field(False, description="Nếu true, hệ thống chặn đồng bộ và trả về kết quả JSON chứa thông tin thời gian khớp từng từ (alignment) thay vì file âm thanh thô.")
+    language: Optional[str] = None
+    pad_duration: Optional[float] = None
+    fade_duration: Optional[float] = None
+    normalize_text: Optional[bool] = True
 
 @router.post("/speech")
 async def text_to_speech(
@@ -46,40 +50,38 @@ async def text_to_speech(
     """
     OpenAI-compatible speech endpoint. Synthesizes text into speech.
     Resolves `voice` as:
-    1. A voice_sample_id (if it starts with 'usr_' or 'vsp_' or matches UUID).
-    2. An instruct prompt (if it contains multiple words or description terms).
-    3. Auto voice (otherwise).
+    1. Exact VoiceSample ID or Name owned by user or public in DB.
+    2. Explicit 'auto' / empty -> auto_voice.
+    3. Otherwise -> voice_design instruct prompt.
     """
     # 1. Resolve voice parameters
     mode = "auto_voice"
     voice_sample_id = None
     instruct = None
     
-    voice_val = payload.voice.strip()
+    voice_val = (payload.voice or "").strip()
     
-    # Check if voice_val is a voice sample ID
     import re
-    is_uuid = bool(re.match(r'^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$', voice_val))
-    if voice_val.startswith("usr_") or voice_val.startswith("vsp_") or is_uuid:
-        mode = "clone_voice"
-        voice_sample_id = voice_val
-    elif "," in voice_val or " " in voice_val or any(desc in voice_val.lower() for desc in ["male", "female", "accent", "elderly", "teenager", "whisper", "adult"]):
-        mode = "voice_design"
-        instruct = voice_val
-    else:
-        # Check if the user has a voice sample with this exact name or ID in DB
-        from app.models import VoiceSample
+    from app.models import VoiceSample
+    db_sample = None
+    if voice_val:
         db_sample = db.query(VoiceSample).filter(
             (VoiceSample.id == voice_val) | (VoiceSample.name == voice_val),
             (VoiceSample.user_id == current_user.id) | (VoiceSample.is_public == True),
         ).first()
-        if db_sample:
-            mode = "clone_voice"
-            voice_sample_id = db_sample.id
-        else:
-            # Fallback to voice design with the voice name as instruct, or auto voice
-            mode = "voice_design"
-            instruct = voice_val
+
+    is_uuid = bool(re.match(r'^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$', voice_val))
+    if db_sample:
+        mode = "clone_voice"
+        voice_sample_id = db_sample.id
+    elif voice_val.startswith(("usr_", "vsp_", "vs_")) or is_uuid:
+        mode = "clone_voice"
+        voice_sample_id = voice_val
+    elif not voice_val or voice_val.lower() in ("auto", "auto_voice", "default"):
+        mode = "auto_voice"
+    else:
+        mode = "voice_design"
+        instruct = voice_val
 
     # 2. Use user specified values or defaults
     num_step = payload.num_step if payload.num_step is not None else 32
@@ -108,7 +110,11 @@ async def text_to_speech(
             postprocess_output=payload.postprocess_output,
             audio_chunk_duration=payload.audio_chunk_duration,
             audio_chunk_threshold=payload.audio_chunk_threshold,
-            with_alignment=payload.with_alignment
+            with_alignment=payload.with_alignment,
+            language=payload.language,
+            pad_duration=payload.pad_duration,
+            fade_duration=payload.fade_duration,
+            normalize_text=payload.normalize_text if payload.normalize_text is not None else True,
         )
     except ValueError as e:
         raise HTTPException(

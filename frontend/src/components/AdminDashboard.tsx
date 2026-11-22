@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Users, Activity, BarChart3, ArrowLeft, Trash2, ShieldCheck, ShieldAlert, CheckCircle, RefreshCw, Clock, Globe, Settings, UserPlus, Pencil, KeyRound, Plus, Eye, EyeOff, Save, X, Search, Loader2, Bot, Zap, Check, AlertCircle, FlaskConical, Radio } from "lucide-react";
+import { Users, Activity, BarChart3, ArrowLeft, Trash2, ShieldCheck, ShieldAlert, CheckCircle, RefreshCw, Clock, Globe, Settings, UserPlus, Pencil, KeyRound, Plus, Eye, EyeOff, Save, X, Search, Loader2, Bot, Zap, Check, AlertCircle, FlaskConical, Radio, Copy } from "lucide-react";
 import { api, getErrorMessage } from "../api/client";
 import type { UserAdminResponse, AdminStatsResponse, ApiLogResponse, AdminApiKeyResponse, LLMProfile, SystemSettingsResponse, UserUpdateRequest } from "../api/client";
 
@@ -56,6 +56,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
   const [userKeys, setUserKeys] = useState<AdminApiKeyResponse[]>([]);
   const [newKeyName, setNewKeyName] = useState("");
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
+  const [copiedAdminKeyId, setCopiedAdminKeyId] = useState<string | null>(null);
+  const [useManualModelInput, setUseManualModelInput] = useState(false);
 
   const [settingsData, setSettingsData] = useState<SystemSettingsResponse>({
     worker_mode: "mock",
@@ -190,6 +192,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
     setProfCustomEndpoint("");
     setProfThinkingEffort("none");
     setProfIsActive(false);
+    setScannedModels([]);
+    setScanMsg(null);
+    setUseManualModelInput(false);
     setShowProfileModal(true);
   };
 
@@ -203,6 +208,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
     setProfCustomEndpoint(p.custom_endpoint || "");
     setProfThinkingEffort(p.thinking_effort || "none");
     setProfIsActive(p.is_active);
+    setScannedModels([]);
+    setScanMsg(null);
+    setUseManualModelInput(false);
     setShowProfileModal(true);
   };
 
@@ -249,10 +257,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
     setScanningModels(true);
     setScanMsg(null);
     try {
-      const res = await api.scanLlmModels(profProvider, profApiKey, profCustomEndpoint);
+      const res = await api.scanLlmModels(
+        profProvider,
+        profApiKey,
+        profCustomEndpoint,
+        editingProfileId || undefined
+      );
       if (res.models && res.models.length > 0) {
         setScannedModels(res.models);
-        setProfModel(res.models[0]);
+        setUseManualModelInput(false);
+        if (!res.models.includes(profModel)) {
+          setProfModel(res.models[0]);
+        }
         setScanMsg(`Đã tìm thấy ${res.models.length} mô hình khả dụng!`);
       } else {
         setScanMsg("Không tìm thấy mô hình nào từ Endpoint / Key.");
@@ -280,6 +296,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
     }
     setLoading(false);
   }, [activeTab, fetchLlmProfiles, fetchLogs, fetchStats, fetchSystemSettings, fetchUsers]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api.listLlmProfiles().then((res) => {
+      if (!cancelled) setLlmProfiles(res);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -407,7 +433,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
     try {
       const payload: UserUpdateRequest = {
         username: editUsername,
-        email: editEmail,
+        email: editEmail.trim() || undefined,
         is_verified: editIsVerified,
         is_approved: editIsApproved,
         is_admin: editIsAdmin,
@@ -507,7 +533,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
           {activeTab === "users" && (
             <button
               onClick={() => setShowCreateModal(true)}
-              className="flex items-center gap-1.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white text-xs font-bold px-4 py-2 rounded-xl transition-colors cursor-pointer shadow-md shadow-primary/10"
+              className="flex items-center gap-1.5 bg-primary hover:bg-primary-hover text-primary-foreground text-xs font-bold px-4 py-2 rounded-xl transition-colors cursor-pointer shadow-sm"
             >
               <UserPlus className="w-4 h-4" />
               <span>Tạo tài khoản</span>
@@ -517,7 +543,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
           {activeTab === "llm" && (
             <button
               onClick={handleOpenCreateProfileModal}
-              className="flex items-center gap-1.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white text-xs font-bold px-4 py-2 rounded-xl transition-colors cursor-pointer shadow-md shadow-primary/10"
+              className="flex items-center gap-1.5 bg-primary hover:bg-primary-hover text-primary-foreground text-xs font-bold px-4 py-2 rounded-xl transition-colors cursor-pointer shadow-sm"
             >
               <Plus className="w-4 h-4" />
               <span>Thêm LLM Profile</span>
@@ -543,7 +569,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
             setStatusMsg(null);
           }}
           className={`px-4 py-2 text-xs font-bold rounded-lg flex items-center gap-2 transition-all cursor-pointer ${
-            activeTab === "users" ? "bg-gradient-to-r from-primary to-accent text-white shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
+            activeTab === "users" ? "bg-primary text-primary-foreground shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
           }`}
         >
           <Users className="w-4 h-4" />
@@ -554,10 +580,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
           onClick={() => {
             setActiveTab("llm");
             setStatusMsg(null);
-            fetchLlmProfiles();
           }}
           className={`px-4 py-2 text-xs font-bold rounded-lg flex items-center gap-2 transition-all cursor-pointer ${
-            activeTab === "llm" ? "bg-gradient-to-r from-primary to-accent text-white shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
+            activeTab === "llm" ? "bg-primary text-primary-foreground shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
           }`}
         >
           <Bot className="w-4 h-4" />
@@ -570,7 +595,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
             setStatusMsg(null);
           }}
           className={`px-4 py-2 text-xs font-bold rounded-lg flex items-center gap-2 transition-all cursor-pointer ${
-            activeTab === "settings" ? "bg-gradient-to-r from-primary to-accent text-white shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
+            activeTab === "settings" ? "bg-primary text-primary-foreground shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
           }`}
         >
           <Settings className="w-4 h-4" />
@@ -582,7 +607,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
             setStatusMsg(null);
           }}
           className={`px-4 py-2 text-xs font-bold rounded-lg flex items-center gap-2 transition-all cursor-pointer ${
-            activeTab === "stats" ? "bg-gradient-to-r from-primary to-accent text-white shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
+            activeTab === "stats" ? "bg-primary text-primary-foreground shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
           }`}
         >
           <BarChart3 className="w-4 h-4" />
@@ -594,7 +619,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
             setStatusMsg(null);
           }}
           className={`px-4 py-2 text-xs font-bold rounded-lg flex items-center gap-2 transition-all cursor-pointer ${
-            activeTab === "logs" ? "bg-gradient-to-r from-primary to-accent text-white shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
+            activeTab === "logs" ? "bg-primary text-primary-foreground shadow-sm border-none" : "text-muted-foreground hover:text-foreground"
           }`}
         >
           <Activity className="w-4 h-4" />
@@ -646,7 +671,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
 
               <button
                 onClick={handleOpenCreateProfileModal}
-                className="flex items-center gap-2 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white text-xs font-bold px-4 py-2.5 rounded-xl transition-all cursor-pointer shadow-md shadow-primary/20 flex-shrink-0"
+                className="flex items-center gap-2 bg-primary hover:bg-primary-hover text-primary-foreground text-xs font-bold px-4 py-2.5 rounded-xl transition-all cursor-pointer shadow-sm flex-shrink-0"
               >
                 <Plus className="w-4 h-4" />
                 <span>Thêm Profile Mới</span>
@@ -692,10 +717,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                             <span
                               className={`px-2.5 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-wider font-mono border ${
                                 p.provider === "gemini"
-                                  ? "bg-sky-500/10 text-sky-400 border-sky-500/20"
+                                  ? "bg-sky-500/10 text-sky-700 dark:text-sky-400 border-sky-500/20"
                                   : p.provider === "openai"
-                                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-                                  : "bg-purple-500/10 text-purple-400 border-purple-500/20"
+                                  ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20"
+                                  : "bg-purple-500/10 text-purple-700 dark:text-purple-400 border-purple-500/20"
                               }`}
                             >
                               {p.provider === "gemini" ? "Google Gemini" : p.provider === "openai" ? "OpenAI API" : "Custom Proxy"}
@@ -706,16 +731,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                           </div>
 
                           {p.is_active ? (
-                            <span className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 rounded-full text-[10px] font-black uppercase tracking-wider shadow-xs">
+                            <span className="flex items-center gap-1.5 px-3 py-1 bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 rounded-full text-[10px] font-black uppercase tracking-wider shadow-xs">
                               <Radio className="w-3 h-3 animate-pulse fill-emerald-500" />
                               Đang dùng (Active)
                             </span>
                           ) : (
                             <button
                               onClick={() => handleActivateLlmProfile(p.id)}
-                              className="text-xs font-bold text-primary bg-primary/10 hover:bg-primary hover:text-white px-3.5 py-1 rounded-full border border-primary/40 transition-all cursor-pointer shadow-xs flex items-center gap-1"
+                              className="text-xs font-bold text-primary bg-primary/10 hover:bg-primary hover:text-primary-foreground px-3.5 py-1 rounded-full border border-primary/40 transition-all cursor-pointer shadow-xs flex items-center gap-1"
                             >
-                              <span>✔ Kích hoạt sử dụng</span>
+                              <Check className="w-3 h-3" />
+                              <span>Kích hoạt sử dụng</span>
                             </button>
                           )}
                         </div>
@@ -731,7 +757,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                             </p>
                           )}
                           {p.thinking_effort && p.thinking_effort !== "none" && (
-                            <span className="inline-block text-[10px] font-bold text-amber-400 bg-amber-400/10 border border-amber-400/20 px-2 py-0.5 rounded-md mt-1.5">
+                            <span className="inline-block text-[10px] font-bold text-amber-700 dark:text-amber-400 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded-md mt-1.5">
                               Reasoning Effort: {p.thinking_effort.toUpperCase()}
                             </span>
                           )}
@@ -741,18 +767,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                         <div
                           className={`p-3 rounded-2xl border text-xs flex flex-col gap-1 ${
                             isSuccess
-                              ? "bg-emerald-500/5 border-emerald-500/20 text-emerald-400"
+                              ? "bg-emerald-500/5 border-emerald-500/20 text-emerald-700 dark:text-emerald-400"
                               : isFailed
-                              ? "bg-rose-500/5 border-rose-500/20 text-rose-400"
+                              ? "bg-rose-500/5 border-rose-500/20 text-rose-700 dark:text-rose-400"
                               : "bg-muted/30 border-border/60 text-muted-foreground"
                           }`}
                         >
                           <div className="flex items-center justify-between">
                             <span className="font-bold text-[11px] flex items-center gap-1.5">
                               {isSuccess ? (
-                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                <Check className="w-3.5 h-3.5 text-emerald-700 dark:text-emerald-400" />
                               ) : isFailed ? (
-                                <AlertCircle className="w-3.5 h-3.5 text-rose-400" />
+                                <AlertCircle className="w-3.5 h-3.5 text-rose-700 dark:text-rose-400" />
                               ) : (
                                 <FlaskConical className="w-3.5 h-3.5 text-muted-foreground" />
                               )}
@@ -822,7 +848,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                   <th className="px-5 py-4 text-right">Thao tác</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-800 text-xs">
+              <tbody className="divide-y divide-border text-xs">
                 {users.length === 0 ? (
                   <tr>
                     <td colSpan={7} className="text-center py-10 text-muted-foreground">
@@ -851,7 +877,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                             <button
                               onClick={() => handleApproveUserQuick(user.id, user.username)}
                               disabled={actionLoading !== null}
-                              className="text-[9px] bg-gradient-to-r from-primary to-accent hover:brightness-105 font-bold px-2 py-0.5 rounded text-white cursor-pointer transition-colors shadow-sm"
+                              className="text-[9px] bg-primary hover:bg-primary-hover font-bold px-2 py-0.5 rounded text-primary-foreground cursor-pointer transition-colors shadow-sm"
                             >
                               Duyệt
                             </button>
@@ -873,7 +899,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                           disabled={actionLoading !== null}
                           className={`px-2.5 py-1 rounded-lg font-bold text-[10px] cursor-pointer transition-colors border ${
                             user.is_verified
-                              ? "bg-success/10 border-success/20 text-success hover:bg-success/90/20"
+                              ? "bg-success/10 border-success/20 text-success hover:bg-success/20"
                               : "bg-warning/10 border-warning/20 text-warning hover:bg-warning/20"
                           }`}
                         >
@@ -886,7 +912,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                           disabled={actionLoading !== null}
                           className={`px-2.5 py-1 rounded-lg font-bold text-[10px] cursor-pointer transition-colors border ${
                             user.is_admin
-                              ? "bg-destructive/10 border-destructive/20 text-destructive hover:bg-destructive/90/20"
+                              ? "bg-destructive/10 border-destructive/20 text-destructive hover:bg-destructive/20"
                               : "bg-muted border-border text-muted-foreground hover:bg-muted"
                           }`}
                         >
@@ -1128,7 +1154,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
             <div className="md:col-span-2 flex justify-end gap-3 mt-4">
               <button
                 type="submit"
-                className="flex items-center gap-1.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white text-xs font-bold px-5 py-2.5 rounded-xl shadow-md transition-colors cursor-pointer shadow-primary/10"
+                className="flex items-center gap-1.5 bg-primary hover:bg-primary-hover text-primary-foreground text-xs font-bold px-5 py-2.5 rounded-xl shadow-sm transition-colors cursor-pointer"
               >
                 <Save className="w-4 h-4" />
                 <span>Lưu cấu hình hệ thống</span>
@@ -1182,7 +1208,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                     <th className="px-5 py-4">IP Client</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-800 text-xs font-mono">
+                <tbody className="divide-y divide-border text-xs font-mono">
                   {logs.length === 0 ? (
                     <tr>
                       <td colSpan={7} className="text-center py-10 text-muted-foreground font-sans">
@@ -1253,14 +1279,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       {/* --- CREATE USER MODAL --- */}
       {showCreateModal && (
         <div
-          className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+          className="fixed inset-0 bg-black/55 backdrop-blur-sm flex items-center justify-center z-[70] p-4 lg:pl-fluid-sidebar animate-fadeIn"
           role="dialog"
           aria-modal="true"
           aria-labelledby="create-user-modal-title"
           onClick={() => setShowCreateModal(false)}
         >
           <div
-            className="bg-card border border-border rounded-2xl max-w-md w-full p-6 flex flex-col gap-4 shadow-2xl relative"
+            className="bg-card border border-border rounded-2xl max-w-md w-full max-h-[90vh] overflow-y-auto p-6 flex flex-col gap-4 shadow-2xl relative"
             onClick={(e) => e.stopPropagation()}
           >
             <button
@@ -1366,14 +1392,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       {/* --- EDIT USER MODAL --- */}
       {editingUser && (
         <div
-          className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+          className="fixed inset-0 bg-black/55 backdrop-blur-sm flex items-center justify-center z-[70] p-4 lg:pl-fluid-sidebar animate-fadeIn"
           role="dialog"
           aria-modal="true"
           aria-labelledby="edit-user-modal-title"
           onClick={() => setEditingUser(null)}
         >
           <div
-            className="bg-card border border-border rounded-2xl max-w-md w-full p-6 flex flex-col gap-4 shadow-2xl relative"
+            className="bg-card border border-border rounded-2xl max-w-md w-full max-h-[90vh] overflow-y-auto p-6 flex flex-col gap-4 shadow-2xl relative"
             onClick={(e) => e.stopPropagation()}
           >
             <button
@@ -1403,13 +1429,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
               </div>
 
               <div className="flex flex-col gap-1">
-                <label className="text-[10px] font-semibold text-muted-foreground">Địa chỉ Email</label>
+                <label className="text-[10px] font-semibold text-muted-foreground">Địa chỉ Email (Không bắt buộc với OAuth)</label>
                 <input
                   type="email"
                   value={editEmail}
                   onChange={(e) => setEditEmail(e.target.value)}
+                  placeholder="Để trống nếu tài khoản không dùng email..."
                   className="bg-background border border-border rounded-lg p-2 text-xs text-foreground focus:outline-none"
-                  required
                 />
               </div>
 
@@ -1479,14 +1505,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       {/* --- USER API KEYS MODAL --- */}
       {keysUser && (
         <div
-          className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+          className="fixed inset-0 bg-black/55 backdrop-blur-sm flex items-center justify-center z-[70] p-4 lg:pl-fluid-sidebar animate-fadeIn"
           role="dialog"
           aria-modal="true"
           aria-labelledby="user-keys-modal-title"
           onClick={() => setKeysUser(null)}
         >
           <div
-            className="bg-card border border-border rounded-2xl max-w-xl w-full p-6 flex flex-col gap-4 shadow-2xl relative max-h-[85vh] overflow-y-auto"
+            className="bg-card border border-border rounded-2xl max-w-xl w-full p-6 flex flex-col gap-4 shadow-2xl relative max-h-[90vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
             <button
@@ -1547,13 +1573,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
                         </span>
                       </div>
 
-                      <button
-                        onClick={() => handleDeleteUserKey(k.id)}
-                        className="p-1.5 bg-card border border-border text-destructive hover:bg-destructive/10 hover:border-destructive/20 rounded-lg cursor-pointer transition-colors"
-                        title="Thu hồi khóa"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard.writeText(k.key);
+                            setCopiedAdminKeyId(k.id);
+                            setTimeout(() => setCopiedAdminKeyId(null), 2000);
+                          }}
+                          className="p-1.5 bg-card border border-border text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg cursor-pointer transition-colors"
+                          title="Sao chép khóa"
+                        >
+                          {copiedAdminKeyId === k.id ? (
+                            <Check className="w-3.5 h-3.5 text-success" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteUserKey(k.id)}
+                          className="p-1.5 bg-card border border-border text-destructive hover:bg-destructive/10 hover:border-destructive/20 rounded-lg cursor-pointer transition-colors"
+                          title="Thu hồi khóa"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -1570,7 +1615,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
       {/* --- LLM PROFILE CREATE / EDIT MODAL --- */}
       {showProfileModal && (
         <div
-          className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+          className="fixed inset-0 bg-black/55 backdrop-blur-sm flex items-center justify-center z-[70] p-4 lg:pl-fluid-sidebar animate-fadeIn"
           role="dialog"
           aria-modal="true"
           aria-labelledby="llm-profile-modal-title"
@@ -1664,34 +1709,48 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, onSettin
 
               {/* Model Name & Scan Button */}
               <div className="flex flex-col gap-1.5">
-                <div className="flex justify-between items-center">
+                <div className="flex justify-between items-center gap-2">
                   <label className="text-xs font-semibold text-muted-foreground">Mã Mô hình (LLM Model Name)</label>
-                  <button
-                    type="button"
-                    onClick={handleScanModelsModal}
-                    disabled={scanningModels}
-                    className="text-[10px] font-bold text-primary hover:underline flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                  >
-                    {scanningModels ? (
-                      <>
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                        <span>Đang quét...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Search className="w-3 h-3" />
-                        <span>Quét danh sách Model</span>
-                      </>
+                  <div className="flex items-center gap-2.5">
+                    {scannedModels.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setUseManualModelInput((v) => !v)}
+                        className="text-[10px] font-bold text-muted-foreground hover:text-foreground underline cursor-pointer"
+                      >
+                        {useManualModelInput ? "Chọn từ danh sách" : "Nhập thủ công"}
+                      </button>
                     )}
-                  </button>
+                    <button
+                      type="button"
+                      onClick={handleScanModelsModal}
+                      disabled={scanningModels}
+                      className="text-[10px] font-bold text-primary hover:underline flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                    >
+                      {scanningModels ? (
+                        <>
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          <span>Đang quét...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Search className="w-3 h-3" />
+                          <span>Quét danh sách Model</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
 
-                {scannedModels.length > 0 ? (
+                {scannedModels.length > 0 && !useManualModelInput ? (
                   <select
                     value={profModel}
                     onChange={(e) => setProfModel(e.target.value)}
                     className="bg-background border border-border rounded-xl p-2.5 text-xs text-foreground focus:outline-none focus:border-primary font-mono cursor-pointer"
                   >
+                    {!scannedModels.includes(profModel) && profModel && (
+                      <option value={profModel}>{profModel}</option>
+                    )}
                     {scannedModels.map((m) => (
                       <option key={m} value={m}>{m}</option>
                     ))}

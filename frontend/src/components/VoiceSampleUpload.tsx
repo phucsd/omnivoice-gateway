@@ -18,7 +18,13 @@ export const VoiceSampleUpload: React.FC<VoiceSampleUploadProps> = ({ onUploadSu
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
+      const picked = e.target.files[0];
+      if (picked.size > 25 * 1024 * 1024) {
+        setStatusMsg({ type: "error", text: "Kích thước tệp vượt quá giới hạn 25MB." });
+        e.target.value = "";
+        return;
+      }
+      setFile(picked);
       setStatusMsg(null);
     }
   };
@@ -103,15 +109,24 @@ export const VoiceSampleUpload: React.FC<VoiceSampleUploadProps> = ({ onUploadSu
       <form onSubmit={handleUpload} className="flex flex-col gap-3.5 relative z-10">
         {/* Dropzone */}
         <div
+          role="button"
+          tabIndex={0}
+          aria-label="Chọn hoặc kéo thả tệp âm thanh mẫu giọng"
           onDragOver={handleDragOver}
           onDrop={handleDrop}
           onClick={() => fileInputRef.current?.click()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              fileInputRef.current?.click();
+            }
+          }}
           className={`border-2 border-dashed rounded-xl text-center cursor-pointer transition-all flex flex-col items-center justify-center gap-2 ${
             layout === "modern" ? "p-3.5 bg-background/20" : "p-5 bg-background/40 hover:bg-background/60"
           } ${
             file
               ? "border-success/50 bg-success/5"
-              : "border-border hover:border-border"
+              : "border-border hover:border-primary/40"
           }`}
         >
           <input
@@ -140,8 +155,8 @@ export const VoiceSampleUpload: React.FC<VoiceSampleUploadProps> = ({ onUploadSu
                 <span className="text-[10px] font-bold text-muted-foreground">
                   Duyệt tệp âm thanh
                 </span>
-                <span className="text-[8px] text-muted-foreground font-semibold">
-                  WAV, MP3, FLAC (Max 10MB)
+                <span className="text-[10px] text-muted-foreground font-semibold">
+                  WAV, MP3, FLAC (Tối đa 25MB)
                 </span>
               </div>
             </>
@@ -150,16 +165,17 @@ export const VoiceSampleUpload: React.FC<VoiceSampleUploadProps> = ({ onUploadSu
 
         {/* Ref Text */}
         <div className="flex flex-col gap-1">
-          <label className="text-[9px] font-bold text-muted-foreground uppercase tracking-wider">
+          <label htmlFor="vs-upload-reftext" className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
             Nội dung chữ nói (ref_text)
           </label>
           <div className="relative flex flex-col bg-background border border-border/40 rounded-xl p-2.5 focus-within:border-primary/30 transition-all shadow-inner">
             <textarea
+              id="vs-upload-reftext"
               value={refText}
               onChange={(e) => setRefText(e.target.value)}
               placeholder="Nhập chữ trong file ghi âm (tùy chọn)..."
-              rows={layout === "modern" ? 1.5 : 2}
-              className="w-full bg-transparent text-[11px] text-foreground placeholder:text-muted-foreground focus:outline-none resize-none font-semibold leading-normal"
+              rows={2}
+              className="w-full bg-transparent text-xs text-foreground placeholder:text-muted-foreground focus:outline-none resize-y font-medium leading-normal"
             />
           </div>
         </div>

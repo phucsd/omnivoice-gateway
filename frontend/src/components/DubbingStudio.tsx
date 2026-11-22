@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { 
   Sparkles, 
   CheckCircle2, 
@@ -41,7 +41,8 @@ import {
   ChevronLeft,
   ChevronRight,
   ArrowUpDown,
-  FolderOpen
+  FolderOpen,
+  Square
 } from "lucide-react";
 import { api, getErrorMessage, type VideoDubbingJobResponse, type SubtitleSegment, type LLMProfilePublic, type YouTubeVideoInfo, type VoiceSampleResponse } from "../api/client";
 import { PageHeader } from "./ui/PageHeader";
@@ -97,8 +98,52 @@ function formatDuration(seconds?: number | null): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+const MAX_DUBBING_UPLOAD_BYTES = 300 * 1024 * 1024; // 300MB
+
+function recordRecentDelete(map: Map<string, number>, id: string): void {
+  map.set(id, Date.now());
+}
+
+function recordRecentCreate(
+  map: Map<string, { job: VideoDubbingJobResponse; ts: number }>,
+  id: string,
+  job: VideoDubbingJobResponse
+): void {
+  map.set(id, { job, ts: Date.now() });
+}
+
+function pruneRecentTracking(
+  deletedMap: Map<string, number>,
+  createdMap: Map<string, { job: VideoDubbingJobResponse; ts: number }>
+): void {
+  const now = Date.now();
+  for (const [k, ts] of deletedMap.entries()) {
+    if (now - ts > 15000) deletedMap.delete(k);
+  }
+  for (const [k, entry] of createdMap.entries()) {
+    if (now - entry.ts > 30000) createdMap.delete(k);
+  }
+}
+
+function pickBestQuality(available: string[], current: string): string {
+  if (!Array.isArray(available) || available.length === 0) return current || "1080p";
+  if (available.includes(current)) return current;
+  if (available.includes("1080p")) return "1080p";
+  if (available.includes("720p")) return "720p";
+  return available[0];
+}
+
+function formatSrtTimestamp(seconds: number): string {
+  const totalMs = Math.max(0, Math.round(seconds * 1000));
+  const h = Math.floor(totalMs / 3600000);
+  const m = Math.floor((totalMs % 3600000) / 60000);
+  const s = Math.floor((totalMs % 60000) / 1000);
+  const ms = totalMs % 1000;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")},${String(ms).padStart(3, "0")}`;
+}
+
 function estimateDubbingSpokenStats(text: string, targetLanguage?: string): { syllables: number; estSeconds: number } {
-  const cleaned = (text || "").replace(/\[[^\[\]\n]{1,64}\]/g, " ").trim();
+  const cleaned = (text || "").replace(/\[[^[\]\n]{1,64}\]/g, " ").trim();
   if (!cleaned) return { syllables: 0, estSeconds: 0 };
 
   const lang = (targetLanguage || "vietnamese").toLowerCase();
@@ -110,8 +155,8 @@ function estimateDubbingSpokenStats(text: string, targetLanguage?: string): { sy
   }
 
   // Approximate phonetic expansion matching backend vietnamese_normalizer.py
-  let s = cleaned
-    .replace(/(\d)\s*(?:N[\s·.\-]*cm|NCM)\b/g, "$1 niu tơn xen ti mét")
+  const s = cleaned
+    .replace(/(\d)\s*(?:N[-\s·.]*cm|NCM)\b/g, "$1 niu tơn xen ti mét")
     .replace(/\bN[·.]?cm\b/g, "niu tơn xen ti mét")
     .replace(/(\d)\s*(?:N[·.]m|Nm)\b/g, "$1 niu tơn mét")
     .replace(/(\d)\s*RPM\b/gi, "$1 vòng một phút")
@@ -123,12 +168,12 @@ function estimateDubbingSpokenStats(text: string, targetLanguage?: string): { sy
     .replace(/(\d)\s*°\s*C\b/gi, "$1 độ xê")
     .replace(/(\d)\s*°/g, "$1 độ");
 
-  const tokens = s.split(/[\s\-–—/]+/).filter(Boolean);
+  const tokens = s.split(/[-\s–—/]+/).filter(Boolean);
   let syllables = 0;
   for (const rawTok of tokens) {
     const tok = rawTok.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
     if (!tok) continue;
-    if (/[^\x00-\x7F]/.test(tok)) {
+    if (Array.from(tok).some((ch) => ch.charCodeAt(0) > 127)) {
       syllables += 1;
     } else if (/^\d+(?:[.,]\d+)?$/.test(tok)) {
       const n = Number(tok.replace(",", "."));
@@ -212,6 +257,7 @@ export default function DubbingStudio({
   const [uploadedJobId, setUploadedJobId] = useState<string | null>(null);
   const [uploadedVideoUrl, setUploadedVideoUrl] = useState<string | null>(null);
   const [uploadedVideoTitle, setUploadedVideoTitle] = useState<string | null>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
 
   // YouTube Preview, Quality & Pre-Download States
   const [ytInfo, setYtInfo] = useState<YouTubeVideoInfo | null>(null);
@@ -224,6 +270,7 @@ export default function DubbingStudio({
   const [ytDownloadMessage, setYtDownloadMessage] = useState<string>("");
   const ytPreDownloadPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [retryingJob, setRetryingJob] = useState(false);
+  const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
   const [retryQuality, setRetryQuality] = useState<string>("1080p");
   const [pollRevision, setPollRevision] = useState(0);
 
@@ -236,9 +283,22 @@ export default function DubbingStudio({
     return localStorage.getItem("active_dubbing_job_id") || null;
   });
   const [job, setJob] = useState<VideoDubbingJobResponse | null>(null);
+  const jobRef = useRef<VideoDubbingJobResponse | null>(null);
+  const jobIdRef = useRef<string | null>(jobId);
+  useEffect(() => {
+    jobRef.current = job;
+  }, [job]);
+  useEffect(() => {
+    jobIdRef.current = jobId;
+  }, [jobId]);
   const [loadingJobDetails, setLoadingJobDetails] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Workspace-scoped project settings (decoupled from Create Form defaults!)
+  const [workspaceTargetLang, setWorkspaceTargetLang] = useState<string>("Vietnamese");
+  const [workspaceLlmProfileId, setWorkspaceLlmProfileId] = useState<string>("");
+  const [workspaceSeparation, setWorkspaceSeparation] = useState<boolean>(true);
 
   // LLM Config state
   const [llmProvider, setLlmProvider] = useState("gemini");
@@ -257,6 +317,12 @@ export default function DubbingStudio({
   // Subtitle editor state
   const [originalSubs, setOriginalSubs] = useState<SubtitleSegment[]>([]);
   const [translatedSubs, setTranslatedSubs] = useState<SubtitleSegment[]>([]);
+  const [subsDirty, setSubsDirty] = useState(false);
+  const subsDirtyRef = useRef(false);
+  useEffect(() => {
+    subsDirtyRef.current = subsDirty;
+  }, [subsDirty]);
+  const [subsSavedMsg, setSubsSavedMsg] = useState<string | null>(null);
   const [selectedSegId, setSelectedSegId] = useState<number | null>(null);
   const [savingSubs, setSavingSubs] = useState(false);
   const [retranslating, setRetranslating] = useState(false);
@@ -275,13 +341,13 @@ export default function DubbingStudio({
   const [bgmMuted, setBgmMuted] = useState(false);
   const [reseparating, setReseparating] = useState(false);
 
-  // New: AI Subtitle Shortening, Re-Edit & Fast Remix states
+  // AI Subtitle Shortening, Re-Edit & Fast Remix states
   const [shorteningSegId, setShorteningSegId] = useState<number | null>(null);
   const [reEditing, setReEditing] = useState(false);
   const [remixing, setRemixing] = useState(false);
   const [remixVocalVol, setRemixVocalVol] = useState(1.2);
   const [remixBgmVol, setRemixBgmVol] = useState(0.3);
-  const [outputVideoTimestamp, setOutputVideoTimestamp] = useState<number>(() => Date.now());
+  const [mediaRevision, setMediaRevision] = useState<number>(1);
   const [showRemixPanel, setShowRemixPanel] = useState(false);
 
   // YouTube Authentication States (OAuth, Cookie, Residential Proxy Pool)
@@ -334,9 +400,22 @@ export default function DubbingStudio({
 
   const applyJobState = useCallback((data: VideoDubbingJobResponse) => {
     setJob(data);
+    if (data.target_language) setWorkspaceTargetLang(data.target_language);
+    setWorkspaceLlmProfileId(data.llm_profile_id || "");
+    setWorkspaceSeparation(data.enable_separation ?? true);
     if (data.preferred_quality) setRetryQuality(data.preferred_quality);
-    if (typeof data.vocals_volume === "number") setVocalsVolume(Math.min(1, Math.max(0, data.vocals_volume)));
-    if (typeof data.bgm_volume === "number") setBgmVolume(Math.min(1, Math.max(0, data.bgm_volume)));
+    if (typeof data.vocals_volume === "number") {
+      const clampedVocal = Math.min(2, Math.max(0, data.vocals_volume));
+      setVocalsVolume(clampedVocal > 0 ? clampedVocal : 1.0);
+      setVocalsMuted(clampedVocal === 0);
+      setRemixVocalVol(clampedVocal);
+    }
+    if (typeof data.bgm_volume === "number") {
+      const clampedBgm = Math.min(1, Math.max(0, data.bgm_volume));
+      setBgmVolume(clampedBgm > 0 ? clampedBgm : 0.35);
+      setBgmMuted(clampedBgm === 0);
+      setRemixBgmVol(clampedBgm);
+    }
     if (data.voice_mode === "auto_native" || data.voice_mode === "voice_sample" || data.voice_mode === "clone_original") {
       setVoiceMode(data.voice_mode);
     } else {
@@ -345,6 +424,8 @@ export default function DubbingStudio({
     setSelectedVoiceSampleId(data.voice_sample_id || "");
     setOriginalSubs(Array.isArray(data.original_subtitles) ? data.original_subtitles : []);
     setTranslatedSubs(Array.isArray(data.translated_subtitles) ? data.translated_subtitles : []);
+    setSubsDirty(false);
+    subsDirtyRef.current = false;
   }, []);
 
   const fetchAllJobs = useCallback(async (showLoading = false) => {
@@ -355,13 +436,7 @@ export default function DubbingStudio({
       // Ignore stale in-flight poll responses superseded by a newer fetch, create, or delete
       if (reqSeq !== jobsFetchSeqRef.current) return;
 
-      const now = Date.now();
-      for (const [k, ts] of recentlyDeletedIdsRef.current.entries()) {
-        if (now - ts > 15000) recentlyDeletedIdsRef.current.delete(k);
-      }
-      for (const [k, entry] of recentlyCreatedJobsRef.current.entries()) {
-        if (now - entry.ts > 30000) recentlyCreatedJobsRef.current.delete(k);
-      }
+      pruneRecentTracking(recentlyDeletedIdsRef.current, recentlyCreatedJobsRef.current);
 
       const rawList = Array.isArray(res.jobs) ? res.jobs : [];
       const filteredServer = rawList.filter(j => !recentlyDeletedIdsRef.current.has(j.id));
@@ -390,28 +465,19 @@ export default function DubbingStudio({
       });
 
       // Keep active workspace job hydrated without ever hijacking/jumping to another project
-      setJobId(currId => {
-        if (currId && validIds.has(currId)) {
-          const matched = jobsList.find(j => j.id === currId);
-          if (matched) {
-            setJob(prevJob => {
-              if (!prevJob || prevJob.id !== currId) {
-                setOriginalSubs(Array.isArray(matched.original_subtitles) ? matched.original_subtitles : []);
-                setTranslatedSubs(Array.isArray(matched.translated_subtitles) ? matched.translated_subtitles : []);
-                return matched;
-              }
-              return prevJob;
-            });
-          }
+      const currId = jobIdRef.current;
+      if (currId && validIds.has(currId)) {
+        const matched = jobsList.find(j => j.id === currId);
+        if (matched && (!jobRef.current || jobRef.current.id !== currId)) {
+          applyJobState(matched);
         }
-        return currId;
-      });
+      }
     } catch (err: unknown) {
       console.error("Lỗi lấy danh sách dự án:", err);
     } finally {
       if (showLoading) setLoadingAllJobs(false);
     }
-  }, []);
+  }, [applyJobState]);
 
   const fetchOAuthStatus = useCallback(async () => {
     try {
@@ -485,6 +551,7 @@ export default function DubbingStudio({
       voicePreviewAudioRef.current.pause();
       voicePreviewAudioRef.current = null;
     }
+    window.dispatchEvent(new CustomEvent("omnivoice:pause-global-audio"));
     const audio = new Audio(api.getVoiceSampleAudioUrl(sampleId));
     voicePreviewAudioRef.current = audio;
     setPreviewingVoiceId(sampleId);
@@ -565,9 +632,16 @@ export default function DubbingStudio({
 
   const openProjectInWorkspace = useCallback((targetId: string, cached?: VideoDubbingJobResponse | null) => {
     if (!targetId) return;
+    // Flush any pending subtitle edits for the current job before switching tabs
+    if (subsDirtyRef.current && jobIdRef.current && jobIdRef.current !== targetId) {
+      const prevId = jobIdRef.current;
+      void api.updateDubbingSubtitles(prevId, originalSubs, translatedSubs).catch(() => {});
+    }
     activeJobFetchIdRef.current = targetId;
     setError(null);
     setSelectedSegId(null);
+    setEditingOrigSegId(null);
+    setSubsSavedMsg(null);
     setOpenJobTabs(prev => {
       const next = [targetId, ...prev.filter(id => id !== targetId)].slice(0, 8);
       localStorage.setItem("open_dubbing_job_tabs", JSON.stringify(next));
@@ -584,18 +658,27 @@ export default function DubbingStudio({
       setJob(prev => (prev?.id === targetId ? prev : null));
       setOriginalSubs([]);
       setTranslatedSubs([]);
+      setSubsDirty(false);
+      subsDirtyRef.current = false;
       setJobLogs("");
     }
-    setOutputVideoTimestamp(Date.now());
+    setMediaRevision(r => r + 1);
     setPollRevision(r => r + 1);
     window.scrollTo(0, 0);
     void fetchJobDetails(targetId);
-  }, [allJobs, applyJobState, fetchJobDetails]);
+  }, [allJobs, applyJobState, fetchJobDetails, originalSubs, translatedSubs]);
 
   useEffect(() => {
     if (!initialJobIdProp) return;
-    openProjectInWorkspace(initialJobIdProp);
-    onInitialJobConsumed?.();
+    let cancelled = false;
+    void Promise.resolve().then(() => {
+      if (cancelled) return;
+      openProjectInWorkspace(initialJobIdProp);
+      onInitialJobConsumed?.();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [initialJobIdProp, openProjectInWorkspace, onInitialJobConsumed]);
 
   // Clicking the sidebar "Video Dubbing" button while already mounted returns straight to Projects ("list") at top
@@ -603,9 +686,11 @@ export default function DubbingStudio({
     if (listNavTrigger !== undefined && listNavTrigger !== lastListNavTriggerRef.current) {
       lastListNavTriggerRef.current = listNavTrigger;
       if (!initialJobIdProp) {
-        setViewMode("list");
-        window.scrollTo(0, 0);
-        void fetchAllJobs(false);
+        void Promise.resolve().then(() => {
+          setViewMode("list");
+          window.scrollTo(0, 0);
+          void fetchAllJobs(false);
+        });
       }
     }
   }, [listNavTrigger, initialJobIdProp, fetchAllJobs]);
@@ -650,6 +735,7 @@ export default function DubbingStudio({
       cancelled = true;
       if (pollTimerRef.current) clearInterval(pollTimerRef.current);
       if (ytPreDownloadPollRef.current) clearInterval(ytPreDownloadPollRef.current);
+      if (uploadAbortRef.current) uploadAbortRef.current.abort();
       if (voicePreviewAudioRef.current) {
         voicePreviewAudioRef.current.pause();
         voicePreviewAudioRef.current = null;
@@ -659,8 +745,8 @@ export default function DubbingStudio({
   }, [
     isAdmin,
     fetchAllJobs,
+    fetchBridgeStatus,
     fetchCookieStatus,
-    fetchJobDetails,
     fetchLlmProfiles,
     fetchVoiceSamples,
     fetchOAuthStatus,
@@ -668,17 +754,27 @@ export default function DubbingStudio({
     fetchSystemLlmSettings,
   ]);
 
+  const closeCookieModal = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+    setOauthPolling(false);
+    setShowCookieModal(false);
+    setCookieMsg(null);
+    setYtDiagResult(null);
+  }, []);
+
   useEffect(() => {
     if (!showCookieModal) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        setShowCookieModal(false);
-        setCookieMsg(null);
+        closeCookieModal();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [showCookieModal]);
+  }, [showCookieModal, closeCookieModal]);
 
   const handleStartOAuth = async () => {
     setOauthStarting(true);
@@ -858,6 +954,7 @@ export default function DubbingStudio({
   useEffect(() => {
     if (!jobId || viewMode !== "workspace") return;
     let cancelled = false;
+    let pollInFlight = false;
 
     localStorage.setItem("active_dubbing_job_id", jobId);
 
@@ -872,23 +969,43 @@ export default function DubbingStudio({
     };
     void fetchLogs();
 
+    const currentJob = jobRef.current;
+    if (
+      currentJob &&
+      currentJob.id === jobId &&
+      ["completed", "failed", "cancelled", "awaiting_review", "uploaded"].includes(currentJob.status)
+    ) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
     const interval = setInterval(async () => {
+      if (pollInFlight || cancelled) return;
+      pollInFlight = true;
       try {
         const data = await api.getDubbingJob(jobId);
         if (cancelled) return;
-        setJob(prev => {
-          const wasReview = prev?.status === "awaiting_review";
-          const isNowReview = data.status === "awaiting_review";
-          if (!wasReview || !isNowReview) {
-            if (data.original_subtitles && data.original_subtitles.length > 0) {
-              setOriginalSubs(data.original_subtitles);
-            }
-            if (data.translated_subtitles && data.translated_subtitles.length > 0) {
-              setTranslatedSubs(data.translated_subtitles);
-            }
-          }
-          return data;
+        const prevJob = jobRef.current;
+        setJob(data);
+        setAllJobs(prev => {
+          const exists = prev.some(item => item.id === data.id);
+          return exists ? prev.map(item => (item.id === data.id ? data : item)) : [data, ...prev];
         });
+
+        const wasReview = prevJob?.status === "awaiting_review";
+        const isNowReview = data.status === "awaiting_review";
+        if (!subsDirtyRef.current && (!wasReview || !isNowReview)) {
+          if (Array.isArray(data.original_subtitles) && data.original_subtitles.length > 0) {
+            setOriginalSubs(data.original_subtitles);
+          }
+          if (Array.isArray(data.translated_subtitles) && data.translated_subtitles.length > 0) {
+            setTranslatedSubs(data.translated_subtitles);
+          }
+        }
+        if (data.status === "completed" && prevJob?.status !== "completed") {
+          setMediaRevision(r => r + 1);
+        }
 
         // Fetch logs
         try {
@@ -898,11 +1015,13 @@ export default function DubbingStudio({
           // Ignore transient log poll errors
         }
 
-        if (data.status === "completed" || data.status === "failed") {
+        if (["completed", "failed", "cancelled", "awaiting_review", "uploaded"].includes(data.status)) {
           clearInterval(interval);
         }
       } catch (err: unknown) {
         if (!cancelled) console.error("Lỗi đồng bộ Job status:", err);
+      } finally {
+        pollInFlight = false;
       }
     }, 2500);
 
@@ -912,10 +1031,33 @@ export default function DubbingStudio({
     };
   }, [jobId, viewMode, pollRevision]);
 
-  // Autoscroll ONLY inside the log terminal box (never scroll the outer browser window!)
+  // Debounced auto-save for subtitle edits in awaiting_review
+  useEffect(() => {
+    if (!subsDirty || !jobId || job?.status !== "awaiting_review") return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        await api.updateDubbingSubtitles(jobId, originalSubs, translatedSubs);
+        if (cancelled) return;
+        setSubsDirty(false);
+        subsDirtyRef.current = false;
+        setSubsSavedMsg("Đã tự động lưu");
+      } catch {
+        // User can still save manually if network hiccups
+      }
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [subsDirty, jobId, job?.status, originalSubs, translatedSubs]);
+
+  // Autoscroll ONLY inside the log terminal box when user is already near the bottom
   useEffect(() => {
     const el = logsContainerRef.current;
-    if (el) {
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom < 80 || el.scrollTop === 0) {
       el.scrollTop = el.scrollHeight;
     }
   }, [jobLogs]);
@@ -933,9 +1075,7 @@ export default function DubbingStudio({
       const info = await api.getYouTubeVideoInfo(target);
       setYtInfo(info);
       if (info.available_qualities && info.available_qualities.length > 0) {
-        setPreferredQuality(prev =>
-          info.available_qualities.includes(prev) ? prev : info.available_qualities[0]
-        );
+        setPreferredQuality(prev => pickBestQuality(info.available_qualities, prev));
       }
     } catch (err: unknown) {
       setYtInfo(null);
@@ -948,19 +1088,20 @@ export default function DubbingStudio({
   // Debounced auto-preview whenever a valid YouTube video URL is pasted/entered
   useEffect(() => {
     const trimmed = youtubeUrl.trim();
-    if (!trimmed) {
-      setYtInfo(null);
-      setYtInfoError(null);
-      return;
-    }
-    const vid = getYouTubeId(trimmed);
-    if (!vid) {
-      setYtInfo(null);
-      setYtInfoError(null);
-      return;
+    const vid = trimmed ? getYouTubeId(trimmed) : "";
+    let cancelled = false;
+
+    if (!trimmed || !vid) {
+      void Promise.resolve().then(() => {
+        if (cancelled) return;
+        setYtInfo(null);
+        setYtInfoError(null);
+      });
+      return () => {
+        cancelled = true;
+      };
     }
 
-    let cancelled = false;
     const timer = setTimeout(async () => {
       if (cancelled) return;
       setYtInfoLoading(true);
@@ -970,9 +1111,7 @@ export default function DubbingStudio({
         if (cancelled) return;
         setYtInfo(info);
         if (info.available_qualities && info.available_qualities.length > 0) {
-          setPreferredQuality(prev =>
-            info.available_qualities.includes(prev) ? prev : info.available_qualities[0]
-          );
+          setPreferredQuality(prev => pickBestQuality(info.available_qualities, prev));
         }
       } catch (err: unknown) {
         if (cancelled) return;
@@ -1001,6 +1140,7 @@ export default function DubbingStudio({
     setYtDownloading(true);
     setYtDownloadProgress(2);
     setYtDownloadMessage("Đang khởi tạo tải video từ YouTube...");
+    setSelectedFile(null);
     setUploadedJobId(null);
     setUploadedVideoUrl(null);
     setUploadedVideoTitle(null);
@@ -1027,7 +1167,7 @@ export default function DubbingStudio({
             setUploadedVideoUrl(api.getDubbingFileUrl(data.id, "video"));
             setUploadedVideoTitle(data.video_title || ytInfo?.title || "Video YouTube");
             void fetchAllJobs(false);
-          } else if (data.status === "failed") {
+          } else if (data.status === "failed" || data.status === "cancelled") {
             if (ytPreDownloadPollRef.current) {
               clearInterval(ytPreDownloadPollRef.current);
               ytPreDownloadPollRef.current = null;
@@ -1065,6 +1205,25 @@ export default function DubbingStudio({
     }
   };
 
+  const handleCancelJob = async (targetId?: string) => {
+    const idToCancel = targetId || jobId;
+    if (!idToCancel) return;
+    if (!window.confirm("Bạn có chắc chắn muốn dừng tiến trình lồng tiếng đang chạy không?")) return;
+    setCancellingJobId(idToCancel);
+    setError(null);
+    try {
+      const updated = await api.cancelDubbingJob(idToCancel);
+      if (jobId === idToCancel) {
+        setJob(updated);
+      }
+      setAllJobs(prev => prev.map(j => (j.id === idToCancel ? updated : j)));
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, "Không thể hủy tiến trình."));
+    } finally {
+      setCancellingJobId(null);
+    }
+  };
+
   const handleTestYouTubeConnection = async () => {
     setYtDiagTesting(true);
     setYtDiagResult(null);
@@ -1084,15 +1243,40 @@ export default function DubbingStudio({
     }
   };
 
+  const handleCancelUpload = () => {
+    if (uploadAbortRef.current) {
+      uploadAbortRef.current.abort();
+      uploadAbortRef.current = null;
+    }
+    setUploading(false);
+    setUploadProgress(0);
+    setSelectedFile(null);
+  };
+
   // Handle immediate file upload when selected
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] || null;
+    e.target.value = "";
     if (!file) return;
+
+    if (file.size > MAX_DUBBING_UPLOAD_BYTES) {
+      setError("Kích thước tệp video vượt quá giới hạn tối đa 300MB.");
+      return;
+    }
 
     if (ytPreDownloadPollRef.current) {
       clearInterval(ytPreDownloadPollRef.current);
       ytPreDownloadPollRef.current = null;
     }
+    if (uploadAbortRef.current) {
+      uploadAbortRef.current.abort();
+    }
+    const abortCtrl = new AbortController();
+    uploadAbortRef.current = abortCtrl;
+
+    setYoutubeUrl("");
+    setYtInfo(null);
+    setYtInfoError(null);
     setYtDownloading(false);
     setYtDownloadJobId(null);
     setSelectedFile(file);
@@ -1104,22 +1288,33 @@ export default function DubbingStudio({
     setUploadedVideoTitle(null);
 
     try {
-      const response = await api.uploadDubbingVideo(file, (progress) => {
-        setUploadProgress(progress);
-      });
+      const response = await api.uploadDubbingVideo(
+        file,
+        (progress) => {
+          setUploadProgress(progress);
+        },
+        abortCtrl.signal
+      );
       setUploadedJobId(response.id);
       setUploadedVideoUrl(api.getDubbingFileUrl(response.id, "video"));
       setUploadedVideoTitle(response.video_title || file.name);
+      void fetchAllJobs(false);
     } catch (err: unknown) {
-      setError(getErrorMessage(err, "Tải video lên thất bại. Vui lòng thử lại."));
+      if (!abortCtrl.signal.aborted) {
+        setError(getErrorMessage(err, "Tải video lên thất bại. Vui lòng thử lại."));
+      }
       setSelectedFile(null);
     } finally {
+      if (uploadAbortRef.current === abortCtrl) {
+        uploadAbortRef.current = null;
+      }
       setUploading(false);
     }
   };
 
   const handleStartDubbing = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (uploading || ytDownloading) return;
     setLoading(true);
     setError(null);
 
@@ -1141,6 +1336,7 @@ export default function DubbingStudio({
           videoDuration: uploadedJobId ? undefined : (ytInfo?.duration ?? undefined),
           voiceMode,
           voiceSampleId: voiceMode === "voice_sample" && selectedVoiceSampleId ? selectedVoiceSampleId : undefined,
+          enableSeparation: smartSeparation,
         }
       );
 
@@ -1152,7 +1348,7 @@ export default function DubbingStudio({
       // Invalidate any stale in-flight list poll & protect the newly created project
       jobsFetchSeqRef.current += 1;
       activeJobFetchIdRef.current = response.id;
-      recentlyCreatedJobsRef.current.set(response.id, { job: response, ts: Date.now() });
+      recordRecentCreate(recentlyCreatedJobsRef.current, response.id, response);
 
       // Clear stale state from any previously viewed job
       setSelectedSegId(null);
@@ -1197,7 +1393,10 @@ export default function DubbingStudio({
     setError(null);
     try {
       await api.updateDubbingSubtitles(jobId, originalSubs, translatedSubs);
-      alert("Đã lưu bản dịch phụ đề thành công!");
+      setSubsDirty(false);
+      subsDirtyRef.current = false;
+      setSubsSavedMsg("Đã lưu phụ đề!");
+      window.setTimeout(() => setSubsSavedMsg(null), 2500);
     } catch (err: unknown) {
       setError(getErrorMessage(err, "Lỗi lưu phụ đề."));
     } finally {
@@ -1211,15 +1410,20 @@ export default function DubbingStudio({
     setLoading(true);
     try {
       await api.updateDubbingSubtitles(jobId, originalSubs, translatedSubs);
+      setSubsDirty(false);
+      subsDirtyRef.current = false;
+      const effectiveVocalsVol = vocalsMuted ? 0 : vocalsVolume;
+      const effectiveBgmVol = bgmMuted ? 0 : bgmVolume;
       await api.finalizeDubbingJob(
         jobId,
-        vocalsVolume,
-        bgmVolume,
+        effectiveVocalsVol,
+        effectiveBgmVol,
         voiceMode,
         voiceMode === "voice_sample" ? selectedVoiceSampleId : ""
       );
       const data = await api.getDubbingJob(jobId);
       applyJobState(data);
+      setPollRevision(r => r + 1);
     } catch (err: unknown) {
       setError(getErrorMessage(err, "Lỗi hoàn tất lồng tiếng."));
     } finally {
@@ -1230,18 +1434,14 @@ export default function DubbingStudio({
   const handleReEditJob = async () => {
     if (!jobId) return;
     setReEditing(true);
+    setError(null);
     try {
       const updated = await api.reEditDubbingJob(jobId);
-      setJob(updated);
-      if (updated.translated_subtitles && updated.translated_subtitles.length > 0) {
-        setTranslatedSubs(updated.translated_subtitles);
-      }
-      if (updated.original_subtitles && updated.original_subtitles.length > 0) {
-        setOriginalSubs(updated.original_subtitles);
-      }
+      applyJobState(updated);
+      setPollRevision(r => r + 1);
       void fetchAllJobs();
     } catch (e: unknown) {
-      alert(`Lỗi khi mở lại chế độ chỉnh sửa: ${getErrorMessage(e, "Vui lòng thử lại")}`);
+      setError(`Lỗi khi mở lại chế độ chỉnh sửa: ${getErrorMessage(e, "Vui lòng thử lại")}`);
     } finally {
       setReEditing(false);
     }
@@ -1255,15 +1455,15 @@ export default function DubbingStudio({
         segment_id: segId,
         text,
         target_duration: targetDur,
-        target_language: targetLanguage || job?.target_language || "Vietnamese",
+        target_language: workspaceTargetLang || job?.target_language || "Vietnamese",
         original_text: origText,
-        llm_profile_id: selectedLlmProfileId || undefined,
+        llm_profile_id: workspaceLlmProfileId || selectedLlmProfileId || undefined,
       });
       if (res.shortened_text) {
         updateSubText(segId, res.shortened_text);
       }
     } catch (e: unknown) {
-      alert(`Không thể rút gọn câu bằng AI: ${getErrorMessage(e, "Mô hình LLM không phản hồi")}`);
+      setError(`Không thể rút gọn câu bằng AI: ${getErrorMessage(e, "Mô hình LLM không phản hồi")}`);
     } finally {
       setShorteningSegId(null);
     }
@@ -1272,29 +1472,53 @@ export default function DubbingStudio({
   const handleFastRemix = async () => {
     if (!jobId) return;
     setRemixing(true);
+    setError(null);
     try {
       await api.remixDubbingAudio(jobId, {
         vocals_volume: remixVocalVol,
         bgm_volume: remixBgmVol,
       });
-      setOutputVideoTimestamp(Date.now());
+      setMediaRevision(r => r + 1);
       void fetchAllJobs();
-      alert("Đã hòa âm lại và cập nhật video thành công!");
     } catch (e: unknown) {
-      alert(`Lỗi hòa âm video: ${getErrorMessage(e, "Không tìm thấy file âm thanh")}`);
+      setError(`Lỗi hòa âm video: ${getErrorMessage(e, "Không tìm thấy file âm thanh")}`);
     } finally {
       setRemixing(false);
     }
   };
 
-  const jumpToSegment = (start: number, id: number) => {
+  const jumpToSegment = useCallback((start: number, id: number) => {
     setSelectedSegId(id);
     setCurrentVideoTime(start);
-    if (videoPlayerRef.current) {
-      videoPlayerRef.current.currentTime = start;
-      videoPlayerRef.current.play();
+    const vidEl = videoPlayerRef.current;
+    if (vidEl) {
+      vidEl.currentTime = start;
+      void vidEl.play().catch(() => {});
     }
-  };
+  }, []);
+
+  const handleExportSrt = useCallback(() => {
+    const sourceList = translatedSubs.length > 0 ? translatedSubs : originalSubs;
+    if (sourceList.length === 0) return;
+    const srtText = sourceList
+      .map((seg, idx) => {
+        const orig = originalSubs[idx];
+        const st = typeof seg.start === "number" ? seg.start : (orig?.start ?? 0);
+        const et = typeof seg.end === "number" ? seg.end : (orig?.end ?? st + 1.5);
+        return `${idx + 1}\n${formatSrtTimestamp(st)} --> ${formatSrtTimestamp(et)}\n${seg.text || ""}\n`;
+      })
+      .join("\n");
+
+    const blob = new Blob([srtText], { type: "text/srt;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `subtitles_${jobId || "dubbing"}.srt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, [translatedSubs, originalSubs, jobId]);
 
   const renderVoiceSelector = (compact = false) => {
     const selectValue =
@@ -1318,11 +1542,11 @@ export default function DubbingStudio({
             <Mic className="w-3.5 h-3.5 text-primary" />
             <span className="text-xs font-bold text-foreground">Giọng Đọc Lồng Tiếng</span>
             {voiceMode !== "clone_original" ? (
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-bold">
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 font-bold">
                 Chuẩn Bản Ngữ
               </span>
             ) : (
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 font-bold">
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400 font-bold">
                 Clone Ngoại Quốc
               </span>
             )}
@@ -1359,20 +1583,20 @@ export default function DubbingStudio({
           className="w-full px-3 py-2 text-xs bg-background border border-border rounded-xl text-foreground font-medium focus:outline-none focus:ring-2 focus:ring-primary/30 cursor-pointer"
         >
           <option value="auto_native">
-            ✨ Tự động Giọng Việt Bản Ngữ (Khớp Nam/Nữ — Không bị lơ lớ)
+            Tự động Giọng Việt Bản Ngữ (Khớp Nam/Nữ — Không bị lơ lớ)
           </option>
           {voiceSamples.length > 0 && (
             <optgroup label="Kho Giọng Studio Bản Ngữ">
               {voiceSamples.map((s) => (
                 <option key={s.id} value={`sample:${s.id}`}>
-                  🎙️ {s.name || s.id}{s.duration ? ` (${s.duration.toFixed(1)}s)` : ""}
+                  {s.name || s.id}{s.duration ? ` (${s.duration.toFixed(1)}s)` : ""}
                 </option>
               ))}
             </optgroup>
           )}
           <optgroup label="Clone Giọng Gốc Video">
             <option value="clone_original">
-              🌍 Clone Giọng Gốc Diễn Giả (Giữ màu giọng ngoại quốc — dễ lơ lớ)
+              Clone Giọng Gốc Diễn Giả (Giữ màu giọng ngoại quốc — dễ lơ lớ)
             </option>
           </optgroup>
         </select>
@@ -1388,19 +1612,50 @@ export default function DubbingStudio({
     );
   };
 
+  const markSubtitlesModified = () => {
+    setSubsDirty(true);
+    subsDirtyRef.current = true;
+    setSubsSavedMsg(null);
+  };
+
   const updateSubText = (id: number, text: string) => {
+    markSubtitlesModified();
     setTranslatedSubs(prev =>
       prev.map(item => (item.id === id ? { ...item, text } : item))
     );
   };
 
   const updateOrigSubText = (id: number, text: string) => {
+    markSubtitlesModified();
     setOriginalSubs(prev =>
       prev.map(item => (item.id === id ? { ...item, text } : item))
     );
   };
 
+  const updateSegTiming = (id: number, field: "start" | "end", rawVal: string) => {
+    const parsed = parseFloat(rawVal);
+    if (!Number.isFinite(parsed) || parsed < 0) return;
+    markSubtitlesModified();
+    setOriginalSubs(prev =>
+      prev.map(item => {
+        if (item.id !== id) return item;
+        const nextStart = field === "start" ? parsed : item.start;
+        const nextEnd = field === "end" ? Math.max(nextStart + 0.1, parsed) : Math.max(nextStart + 0.1, item.end);
+        return { ...item, start: nextStart, end: nextEnd };
+      })
+    );
+    setTranslatedSubs(prev =>
+      prev.map(item => {
+        if (item.id !== id) return item;
+        const nextStart = field === "start" ? parsed : item.start;
+        const nextEnd = field === "end" ? Math.max(nextStart + 0.1, parsed) : Math.max(nextStart + 0.1, item.end);
+        return { ...item, start: nextStart, end: nextEnd };
+      })
+    );
+  };
+
   const handleDeleteSegment = (segId: number) => {
+    markSubtitlesModified();
     setOriginalSubs(prev =>
       prev
         .filter(item => item.id !== segId)
@@ -1411,8 +1666,8 @@ export default function DubbingStudio({
         .filter(item => item.id !== segId)
         .map((item, idx) => ({ ...item, id: idx + 1 }))
     );
-    if (selectedSegId === segId) setSelectedSegId(null);
-    if (editingOrigSegId === segId) setEditingOrigSegId(null);
+    setSelectedSegId(prev => (prev === null ? null : prev === segId ? null : prev > segId ? prev - 1 : prev));
+    setEditingOrigSegId(prev => (prev === null ? null : prev === segId ? null : prev > segId ? prev - 1 : prev));
   };
 
   const handleCleanAsrHallucinations = () => {
@@ -1460,37 +1715,26 @@ export default function DubbingStudio({
       nextTrans.push({ ...trans, id: newId, start: st, end: et, text: cleanedTransTxt });
     });
 
+    markSubtitlesModified();
     setOriginalSubs(nextOrig);
     setTranslatedSubs(nextTrans);
   };
 
-  const resetState = () => {
-    if (ytPreDownloadPollRef.current) {
-      clearInterval(ytPreDownloadPollRef.current);
-      ytPreDownloadPollRef.current = null;
-    }
+  const clearActiveWorkspaceState = (fallbackMode?: "list" | "create") => {
     localStorage.removeItem("active_dubbing_job_id");
     setJobId(null);
     setJob(null);
-    setYoutubeUrl("");
-    setSelectedFile(null);
     setOriginalSubs([]);
     setTranslatedSubs([]);
+    setSubsDirty(false);
+    subsDirtyRef.current = false;
+    setSubsSavedMsg(null);
     setSelectedSegId(null);
-    setError(null);
-    setUploading(false);
-    setUploadProgress(0);
-    setUploadedJobId(null);
-    setUploadedVideoUrl(null);
-    setUploadedVideoTitle(null);
-    setYtInfo(null);
-    setYtInfoError(null);
-    setYtDownloading(false);
-    setYtDownloadJobId(null);
-    setYtDownloadProgress(0);
-    setYtDownloadMessage("");
+    setEditingOrigSegId(null);
     setJobLogs("");
-    setViewMode("create");
+    if (fallbackMode) {
+      setViewMode(fallbackMode);
+    }
   };
 
   const handleCloseTab = (tabId: string) => {
@@ -1499,11 +1743,20 @@ export default function DubbingStudio({
     localStorage.setItem("open_dubbing_job_tabs", JSON.stringify(nextTabs));
 
     if (jobId === tabId) {
-      if (nextTabs.length > 0) {
-        const nextId = nextTabs[0];
-        openProjectInWorkspace(nextId);
+      if (viewMode === "workspace") {
+        if (nextTabs.length > 0) {
+          openProjectInWorkspace(nextTabs[0]);
+        } else {
+          clearActiveWorkspaceState("list");
+        }
       } else {
-        resetState();
+        // Preserve current "list" or "create" view without hijacking navigation!
+        if (nextTabs.length > 0) {
+          setJobId(nextTabs[0]);
+          localStorage.setItem("active_dubbing_job_id", nextTabs[0]);
+        } else {
+          clearActiveWorkspaceState();
+        }
       }
     }
   };
@@ -1512,55 +1765,30 @@ export default function DubbingStudio({
     if (!window.confirm("Bạn có chắc chắn muốn xóa vĩnh viễn dự án lồng tiếng này không?")) return;
     try {
       jobsFetchSeqRef.current += 1;
-      recentlyDeletedIdsRef.current.set(idToDelete, Date.now());
+      recordRecentDelete(recentlyDeletedIdsRef.current, idToDelete);
       recentlyCreatedJobsRef.current.delete(idToDelete);
       await api.deleteDubbingJob(idToDelete);
+
+      const nextTabs = openJobTabs.filter(id => id !== idToDelete);
+      setOpenJobTabs(nextTabs);
+      localStorage.setItem("open_dubbing_job_tabs", JSON.stringify(nextTabs));
       setAllJobs(prev => prev.filter(j => j.id !== idToDelete));
       setSelectedJobIds(prev => prev.filter(id => id !== idToDelete));
-      handleCloseTab(idToDelete);
+
       if (jobId === idToDelete) {
-        resetState();
+        if (viewMode === "workspace") {
+          if (nextTabs.length > 0) {
+            openProjectInWorkspace(nextTabs[0]);
+          } else {
+            clearActiveWorkspaceState("list");
+          }
+        } else {
+          clearActiveWorkspaceState();
+        }
       }
     } catch (err: unknown) {
       recentlyDeletedIdsRef.current.delete(idToDelete);
-      alert(`Lỗi khi xóa: ${getErrorMessage(err, "Không thể xóa dự án")}`);
-    }
-  };
-
-  const handleBulkDeleteJobs = async () => {
-    if (selectedJobIds.length === 0 || bulkDeleting) return;
-    if (!window.confirm(`Bạn có chắc chắn muốn xóa vĩnh viễn ${selectedJobIds.length} dự án đã chọn không?`)) return;
-    setBulkDeleting(true);
-    const targets = [...selectedJobIds];
-    try {
-      jobsFetchSeqRef.current += 1;
-      const deletedOk: string[] = [];
-      for (const tid of targets) {
-        try {
-          recentlyDeletedIdsRef.current.set(tid, Date.now());
-          recentlyCreatedJobsRef.current.delete(tid);
-          await api.deleteDubbingJob(tid);
-          deletedOk.push(tid);
-        } catch (err: unknown) {
-          recentlyDeletedIdsRef.current.delete(tid);
-          console.error(`Không thể xóa dự án ${tid}:`, err);
-        }
-      }
-      const deletedSet = new Set(deletedOk);
-      if (deletedSet.size > 0) {
-        setAllJobs(prev => prev.filter(j => !deletedSet.has(j.id)));
-        setOpenJobTabs(prev => {
-          const next = prev.filter(id => !deletedSet.has(id));
-          localStorage.setItem("open_dubbing_job_tabs", JSON.stringify(next));
-          return next;
-        });
-        setSelectedJobIds(prev => prev.filter(id => !deletedSet.has(id)));
-        if (jobId && deletedSet.has(jobId)) {
-          resetState();
-        }
-      }
-    } finally {
-      setBulkDeleting(false);
+      setError(`Lỗi khi xóa: ${getErrorMessage(err, "Không thể xóa dự án")}`);
     }
   };
 
@@ -1590,6 +1818,7 @@ export default function DubbingStudio({
 
   // Sync separate audio tracks with video player
   const handleVideoPlay = () => {
+    window.dispatchEvent(new CustomEvent("omnivoice:pause-global-audio"));
     if (job?.vocals_audio_path || job?.bgm_audio_path) {
       if (videoPlayerRef.current) {
         videoPlayerRef.current.muted = true;
@@ -1699,56 +1928,53 @@ export default function DubbingStudio({
 
   const handleReseparateAudio = async () => {
     if (!jobId) return;
-    if (!confirm("Bạn có chắc chắn muốn tách lại âm thanh (Vocals & BGM) bằng bộ tách mới không?")) return;
+    if (!window.confirm("Bạn có chắc chắn muốn tách lại âm thanh (Vocals & BGM) bằng bộ tách mới không?")) return;
     try {
       setReseparating(true);
+      setError(null);
       const updated = await api.reseparateDubbingAudio(jobId);
       setJob(updated);
+      setMediaRevision(r => r + 1);
       setTimeout(() => {
         if (vocalsPlayerRef.current) vocalsPlayerRef.current.load();
         if (bgmPlayerRef.current) bgmPlayerRef.current.load();
       }, 300);
-      alert("Tách lại âm thanh thành công! Hãy bấm Play để nghe thử.");
     } catch (err: unknown) {
-      alert(`Lỗi khi tách lại âm thanh: ${getErrorMessage(err, "Không thể thực hiện")}`);
+      setError(`Lỗi khi tách lại âm thanh: ${getErrorMessage(err, "Không thể thực hiện")}`);
     } finally {
       setReseparating(false);
     }
   };
 
   // Get current step index for the progress stepper
-  const getActiveStepIndex = () => {
-    if (!job) return 0;
-    const statusMap: Record<string, number> = {
-      queued: 0,
-      downloading: 0,
-      separating_audio: 1,
-      transcribing: 2,
-      translating: 3,
-      awaiting_review: 4,
-      generating_tts: 5,
-      mixing_audio: 6,
-      muxing_video: 7,
-      completed: 8,
-      failed: -1
-    };
-    return statusMap[job.status] !== undefined ? statusMap[job.status] : 0;
+  const statusStepMap: Record<string, number> = {
+    queued: 0,
+    downloading: 0,
+    separating_audio: 1,
+    transcribing: 2,
+    translating: 3,
+    awaiting_review: 4,
+    generating_tts: 5,
+    mixing_audio: 6,
+    muxing_video: 7,
+    completed: 8,
+    failed: -1,
+    cancelled: -1,
   };
-
-  const currentStepIdx = getActiveStepIndex();
+  const currentStepIdx = job ? (statusStepMap[job.status] ?? 0) : 0;
 
   const activeProcessingJobs = allJobs.filter(
-    j => j.status !== "completed" && j.status !== "failed" && j.status !== "uploaded" && j.status !== "awaiting_review"
+    j => !["completed", "failed", "cancelled", "uploaded", "awaiting_review"].includes(j.status)
   );
   const reviewJobs = allJobs.filter(j => j.status === "awaiting_review");
   const completedJobs = allJobs.filter(j => j.status === "completed");
   const uploadedJobs = allJobs.filter(j => j.status === "uploaded");
-  const failedJobs = allJobs.filter(j => j.status === "failed");
+  const failedJobs = allJobs.filter(j => j.status === "failed" || j.status === "cancelled");
 
   const filteredJobs = allJobs
     .filter(j => {
       if (jobsFilter === "running") {
-        if (j.status === "completed" || j.status === "failed" || j.status === "uploaded" || j.status === "awaiting_review") return false;
+        if (["completed", "failed", "cancelled", "uploaded", "awaiting_review"].includes(j.status)) return false;
       } else if (jobsFilter === "awaiting_review") {
         if (j.status !== "awaiting_review") return false;
       } else if (jobsFilter === "completed") {
@@ -1756,7 +1982,7 @@ export default function DubbingStudio({
       } else if (jobsFilter === "uploaded") {
         if (j.status !== "uploaded") return false;
       } else if (jobsFilter === "failed") {
-        if (j.status !== "failed") return false;
+        if (j.status !== "failed" && j.status !== "cancelled") return false;
       }
 
       if (jobsSearch.trim()) {
@@ -1781,7 +2007,7 @@ export default function DubbingStudio({
         return tb - ta;
       }
       if (jobsSort === "running_first") {
-        const isRun = (st: string) => !["completed", "failed", "uploaded", "awaiting_review"].includes(st);
+        const isRun = (st: string) => !["completed", "failed", "cancelled", "uploaded", "awaiting_review"].includes(st);
         const ra = isRun(a.status) ? 0 : a.status === "awaiting_review" ? 1 : 2;
         const rb = isRun(b.status) ? 0 : b.status === "awaiting_review" ? 1 : 2;
         if (ra !== rb) return ra - rb;
@@ -1789,6 +2015,9 @@ export default function DubbingStudio({
       }
       return tb - ta;
     });
+
+  const filteredJobIdSet = new Set(filteredJobs.map(j => j.id));
+  const effectiveSelectedJobIds = selectedJobIds.filter(id => filteredJobIdSet.has(id));
 
   const totalJobPages = Math.max(1, jobsPageSize >= 999 ? 1 : Math.ceil(filteredJobs.length / jobsPageSize));
   const safeJobsPage = Math.min(jobsPage, totalJobPages);
@@ -1798,7 +2027,7 @@ export default function DubbingStudio({
       : filteredJobs.slice((safeJobsPage - 1) * jobsPageSize, safeJobsPage * jobsPageSize);
 
   const visibleJobIds = paginatedJobs.map(j => j.id);
-  const allVisibleSelected = visibleJobIds.length > 0 && visibleJobIds.every(id => selectedJobIds.includes(id));
+  const allVisibleSelected = visibleJobIds.length > 0 && visibleJobIds.every(id => effectiveSelectedJobIds.includes(id));
 
   const toggleSelectAllVisible = () => {
     if (allVisibleSelected) {
@@ -1812,6 +2041,60 @@ export default function DubbingStudio({
   const toggleSelectJob = (id: string) => {
     setSelectedJobIds(prev => (prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]));
   };
+
+  const handleBulkDeleteJobs = async () => {
+    if (effectiveSelectedJobIds.length === 0 || bulkDeleting) return;
+    const targets = [...effectiveSelectedJobIds];
+    if (!window.confirm(`Bạn có chắc chắn muốn xóa vĩnh viễn ${targets.length} dự án đã chọn không?`)) return;
+    setBulkDeleting(true);
+    try {
+      jobsFetchSeqRef.current += 1;
+      const deletedOk: string[] = [];
+      for (const tid of targets) {
+        try {
+          recordRecentDelete(recentlyDeletedIdsRef.current, tid);
+          recentlyCreatedJobsRef.current.delete(tid);
+          await api.deleteDubbingJob(tid);
+          deletedOk.push(tid);
+        } catch (err: unknown) {
+          recentlyDeletedIdsRef.current.delete(tid);
+          console.error(`Không thể xóa dự án ${tid}:`, err);
+        }
+      }
+      const deletedSet = new Set(deletedOk);
+      if (deletedSet.size > 0) {
+        setAllJobs(prev => prev.filter(j => !deletedSet.has(j.id)));
+        setOpenJobTabs(prev => {
+          const next = prev.filter(id => !deletedSet.has(id));
+          localStorage.setItem("open_dubbing_job_tabs", JSON.stringify(next));
+          return next;
+        });
+        setSelectedJobIds(prev => prev.filter(id => !deletedSet.has(id)));
+        if (jobId && deletedSet.has(jobId)) {
+          clearActiveWorkspaceState(viewMode === "workspace" ? "list" : undefined);
+        }
+      }
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
+  const { activeOrigSeg, activeTransSeg } = useMemo(() => {
+    const activeSegIdx = originalSubs.findIndex((s, i) => {
+      const st = typeof s?.start === "number" ? s.start : (translatedSubs[i]?.start ?? -1);
+      const et = typeof s?.end === "number" ? s.end : (translatedSubs[i]?.end ?? -1);
+      return currentVideoTime >= st && currentVideoTime < et;
+    });
+    const fallbackIdx = activeSegIdx === -1
+      ? translatedSubs.findIndex(
+          s => typeof s.start === "number" && typeof s.end === "number" && currentVideoTime >= s.start && currentVideoTime < s.end
+        )
+      : activeSegIdx;
+    return {
+      activeOrigSeg: fallbackIdx !== -1 ? (originalSubs[fallbackIdx] || translatedSubs[fallbackIdx]) : null,
+      activeTransSeg: fallbackIdx !== -1 ? (translatedSubs[fallbackIdx] || originalSubs[fallbackIdx]) : null,
+    };
+  }, [originalSubs, translatedSubs, currentVideoTime]);
 
   const getStatusMeta = (st: string, progress: number) => {
     const map: Record<string, { label: string; dot: string; badge: string; actionLabel: string }> = {
@@ -1848,38 +2131,44 @@ export default function DubbingStudio({
       awaiting_review: {
         label: "Chờ duyệt phụ đề",
         dot: "bg-amber-500",
-        badge: "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30",
+        badge: "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30",
         actionLabel: "Duyệt phụ đề",
       },
       generating_tts: {
         label: `Sinh giọng đọc (${progress}%)`,
         dot: "bg-indigo-500 animate-pulse",
-        badge: "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border-indigo-500/30",
+        badge: "bg-indigo-500/10 text-indigo-700 dark:text-indigo-400 border-indigo-500/30",
         actionLabel: "Xem tiến độ",
       },
       mixing_audio: {
         label: `Trộn âm thanh (${progress}%)`,
         dot: "bg-indigo-500 animate-pulse",
-        badge: "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border-indigo-500/30",
+        badge: "bg-indigo-500/10 text-indigo-700 dark:text-indigo-400 border-indigo-500/30",
         actionLabel: "Xem tiến độ",
       },
       muxing_video: {
         label: `Đóng gói MP4 (${progress}%)`,
         dot: "bg-indigo-500 animate-pulse",
-        badge: "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border-indigo-500/30",
+        badge: "bg-indigo-500/10 text-indigo-700 dark:text-indigo-400 border-indigo-500/30",
         actionLabel: "Xem tiến độ",
       },
       completed: {
         label: "Hoàn tất",
         dot: "bg-emerald-500",
-        badge: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30",
+        badge: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/30",
         actionLabel: "Mở kết quả",
       },
       uploaded: {
         label: "Đã tải sẵn",
         dot: "bg-sky-500",
-        badge: "bg-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/30",
+        badge: "bg-sky-500/10 text-sky-700 dark:text-sky-400 border-sky-500/30",
         actionLabel: "Mở Studio",
+      },
+      cancelled: {
+        label: "Đã hủy",
+        dot: "bg-muted-foreground",
+        badge: "bg-muted text-muted-foreground border-border",
+        actionLabel: "Xem / Thử lại",
       },
       failed: {
         label: "Thất bại",
@@ -1954,7 +2243,7 @@ export default function DubbingStudio({
             <Layers className="w-3.5 h-3.5" />
             <span>Quản Lý Dự Án</span>
             {allJobs.length > 0 && (
-              <span className={`px-1.5 py-0.2 text-[10px] font-bold rounded-full ${
+              <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded-full ${
                 viewMode === "list" ? "bg-white/20 text-white" : "bg-primary/20 text-primary"
               }`}>
                 {allJobs.length}
@@ -1968,7 +2257,7 @@ export default function DubbingStudio({
             onClick={() => setViewMode("create")}
             className={`flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold rounded-xl border transition-all cursor-pointer ${
               viewMode === "create"
-                ? "bg-gradient-to-r from-primary to-accent text-white border-transparent shadow-md"
+                ? "bg-primary text-primary-foreground border-primary shadow-sm"
                 : "bg-primary/10 text-primary border-primary/20 hover:bg-primary/20"
             }`}
           >
@@ -1980,6 +2269,23 @@ export default function DubbingStudio({
 
       {/* --- REALTIME PROJECT SWITCHER TAB BAR --- */}
       <div className="flex items-center gap-2 overflow-x-auto pb-1 border-b border-border/60 scrollbar-thin">
+        {/* Tab 0: Danh Sách Dự Án (Always visible!) */}
+        <button
+          type="button"
+          onClick={() => {
+            setViewMode("list");
+            void fetchAllJobs(true);
+          }}
+          className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-all cursor-pointer shrink-0 ${
+            viewMode === "list"
+              ? "bg-primary text-primary-foreground shadow-sm"
+              : "bg-secondary/50 text-muted-foreground hover:text-foreground hover:bg-secondary"
+          }`}
+        >
+          <Layers className="w-3.5 h-3.5" />
+          <span>Danh Sách Dự Án ({allJobs.length})</span>
+        </button>
+
         {/* Tab 1: Tạo Dự Án Mới */}
         <button
           type="button"
@@ -2002,8 +2308,9 @@ export default function DubbingStudio({
           const isReview = tabJob?.status === "awaiting_review";
           const isCompleted = tabJob?.status === "completed";
           const isFailed = tabJob?.status === "failed";
+          const isCancelled = tabJob?.status === "cancelled";
           const isUploaded = tabJob?.status === "uploaded";
-          const isRunning = tabJob && !isCompleted && !isFailed && !isReview && !isUploaded;
+          const isRunning = tabJob && !isCompleted && !isFailed && !isCancelled && !isReview && !isUploaded;
 
           const title = tabJob?.video_title
             ? tabJob.video_title
@@ -2018,7 +2325,7 @@ export default function DubbingStudio({
                 isSelected
                   ? "bg-card text-foreground border-primary shadow-sm ring-1 ring-primary/30 font-bold"
                   : isReview
-                  ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/20"
+                  ? "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/20"
                   : "bg-secondary/30 text-muted-foreground border-border/50 hover:text-foreground hover:bg-secondary"
               }`}
               onClick={() => openProjectInWorkspace(tid, tabJob)}
@@ -2027,23 +2334,25 @@ export default function DubbingStudio({
               {isReview && <span className="inline-block w-2 h-2 rounded-full bg-amber-500 shrink-0" />}
               {isCompleted && <CheckCircle2 className="w-3 h-3 text-emerald-500 shrink-0" />}
               {isUploaded && <Film className="w-3 h-3 text-blue-500 shrink-0" />}
-              {isFailed && <AlertCircle className="w-3 h-3 text-destructive shrink-0" />}
+              {(isFailed || isCancelled) && <AlertCircle className="w-3 h-3 text-destructive shrink-0" />}
               
               <span className="max-w-[130px] truncate">{title}</span>
               
               {tabJob && (
-                <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
+                <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold ${
                   isReview 
-                    ? "bg-amber-500/20 text-amber-600 dark:text-amber-400" 
+                    ? "bg-amber-500/20 text-amber-700 dark:text-amber-400" 
                     : isCompleted 
-                    ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400" 
+                    ? "bg-emerald-500/20 text-emerald-700 dark:text-emerald-400" 
                     : isUploaded
-                    ? "bg-blue-500/20 text-blue-600 dark:text-blue-400"
+                    ? "bg-blue-500/20 text-blue-700 dark:text-blue-400"
+                    : isCancelled
+                    ? "bg-muted text-muted-foreground"
                     : isFailed 
                     ? "bg-destructive/20 text-destructive"
                     : "bg-primary/20 text-primary"
                 }`}>
-                  {isReview ? "Chờ duyệt" : isCompleted ? "Xong" : isUploaded ? "Sẵn sàng" : isFailed ? "Lỗi" : `${tabJob.progress}%`}
+                  {isReview ? "Chờ duyệt" : isCompleted ? "Xong" : isUploaded ? "Sẵn sàng" : isCancelled ? "Đã hủy" : isFailed ? "Lỗi" : `${tabJob.progress}%`}
                 </span>
               )}
 
@@ -2062,19 +2371,6 @@ export default function DubbingStudio({
             </div>
           );
         })}
-
-        {allJobs.length > openJobTabs.length && (
-          <button
-            type="button"
-            onClick={() => {
-              setViewMode("list");
-              fetchAllJobs(true);
-            }}
-            className="text-[11px] text-muted-foreground hover:text-primary font-medium px-2 py-1 shrink-0 ml-auto cursor-pointer"
-          >
-            Xem tất cả ({allJobs.length}) &rarr;
-          </button>
-        )}
       </div>
 
       {error && (
@@ -2100,16 +2396,21 @@ export default function DubbingStudio({
                   <span className="text-xs font-mono font-bold text-muted-foreground">ID: #{job.id.slice(0, 8)}</span>
                   <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
                     job.status === "completed"
-                      ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30"
+                      ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/30"
                       : job.status === "awaiting_review"
-                      ? "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30 animate-pulse"
+                      ? "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30 animate-pulse"
                       : job.status === "uploaded"
-                      ? "bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/30"
+                      ? "bg-blue-500/10 text-blue-700 dark:text-blue-400 border-blue-500/30"
+                      : job.status === "cancelled"
+                      ? "bg-muted text-muted-foreground border-border"
                       : job.status === "failed"
                       ? "bg-destructive/10 text-destructive border-destructive/30"
                       : "bg-primary/10 text-primary border-primary/30"
                   }`}>
-                    {job.status === "completed" ? "Hoàn tất" : job.status === "awaiting_review" ? "Cần kiểm duyệt" : job.status === "uploaded" ? "Đã tải sẵn" : job.status === "failed" ? "Lỗi" : `Đang xử lý ${job.progress}%`}
+                    {job.status === "completed" ? "Hoàn tất" : job.status === "awaiting_review" ? "Cần kiểm duyệt" : job.status === "uploaded" ? "Đã tải sẵn" : job.status === "cancelled" ? "Đã hủy" : job.status === "failed" ? "Lỗi" : `Đang xử lý ${job.progress}%`}
+                  </span>
+                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-secondary text-foreground border border-border">
+                    {workspaceTargetLang || job.target_language}
                   </span>
                   {job.preferred_quality && job.source_type === "youtube" && (
                     <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-secondary text-muted-foreground border border-border">
@@ -2135,13 +2436,26 @@ export default function DubbingStudio({
             </div>
 
             <div className="flex items-center gap-2 w-full sm:w-auto justify-end flex-wrap">
+              {!["completed", "failed", "cancelled", "awaiting_review", "uploaded"].includes(job.status) && (
+                <button
+                  type="button"
+                  onClick={() => void handleCancelJob(job.id)}
+                  disabled={cancellingJobId === job.id}
+                  className="px-3 py-1.5 bg-destructive/10 hover:bg-destructive/20 text-destructive text-xs font-bold rounded-xl border border-destructive/30 transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  title="Dừng tiến trình lồng tiếng đang chạy"
+                >
+                  {cancellingJobId === job.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3 h-3 fill-current" />}
+                  <span>Hủy Tác Vụ</span>
+                </button>
+              )}
+
               {job.status === "completed" && (
                 <a
-                  href={api.getDubbingFileUrl(job.id, "output", true)}
+                  href={api.getDubbingFileUrl(job.id, "output", true, false, mediaRevision)}
                   download={`dubbed_${job.id}.mp4`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="px-3.5 py-1.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white text-xs font-bold rounded-xl shadow transition-all flex items-center gap-1.5 cursor-pointer"
+                  className="px-3.5 py-1.5 bg-primary hover:bg-primary-hover text-primary-foreground text-xs font-bold rounded-xl shadow-sm transition-all flex items-center gap-1.5 cursor-pointer"
                   title="Tải video MP4 đã lồng tiếng về máy"
                 >
                   <Download className="w-3.5 h-3.5" />
@@ -2151,11 +2465,11 @@ export default function DubbingStudio({
 
               {job.has_source_video && (
                 <a
-                  href={api.getDubbingFileUrl(job.id, "video", true)}
+                  href={api.getDubbingFileUrl(job.id, "video", true, false, mediaRevision)}
                   download={`youtube_${job.id}.mp4`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="px-3 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 text-xs font-bold rounded-xl border border-emerald-500/30 transition-colors flex items-center gap-1.5 cursor-pointer"
+                  className="px-3 py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 text-xs font-bold rounded-xl border border-emerald-500/30 transition-colors flex items-center gap-1.5 cursor-pointer"
                   title="Tải tệp MP4 gốc đã tải về máy"
                 >
                   <Download className="w-3.5 h-3.5" />
@@ -2177,7 +2491,7 @@ export default function DubbingStudio({
                 type="button"
                 onClick={() => {
                   setViewMode("list");
-                  fetchAllJobs(true);
+                  void fetchAllJobs(true);
                 }}
                 className="px-3 py-1.5 bg-secondary hover:bg-secondary/80 text-foreground text-xs font-semibold rounded-xl border border-border transition-colors flex items-center gap-1.5 cursor-pointer"
               >
@@ -2187,7 +2501,7 @@ export default function DubbingStudio({
 
               <button
                 type="button"
-                onClick={() => handleDeleteJob(job.id)}
+                onClick={() => void handleDeleteJob(job.id)}
                 className="p-1.5 hover:bg-destructive/10 text-muted-foreground hover:text-destructive rounded-xl border border-border/60 transition-colors cursor-pointer"
                 title="Xóa dự án này"
               >
@@ -2216,8 +2530,8 @@ export default function DubbingStudio({
               {PIPELINE_STEPS.map((step, idx) => {
                 const IconComponent = step.icon;
                 const isDone = currentStepIdx > idx || job.status === "completed";
-                const isCurrent = currentStepIdx === idx && job.status !== "completed" && job.status !== "failed";
-                const isFailed = job.status === "failed" && currentStepIdx === idx;
+                const isCurrent = currentStepIdx === idx && !["completed", "failed", "cancelled", "uploaded"].includes(job.status);
+                const isFailed = (job.status === "failed" || job.status === "cancelled") && currentStepIdx === idx;
 
                 return (
                   <div
@@ -2251,7 +2565,7 @@ export default function DubbingStudio({
             {/* Live Message */}
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 p-3 bg-secondary/40 border border-border/60 rounded-xl text-xs text-foreground">
               <div className="flex items-center gap-2">
-                {job.status !== "completed" && job.status !== "failed" && job.status !== "uploaded" ? (
+                {!["completed", "failed", "cancelled", "uploaded", "awaiting_review"].includes(job.status) ? (
                   <Clock className="w-3.5 h-3.5 text-muted-foreground shrink-0 animate-spin" />
                 ) : (
                   <Clock className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
@@ -2265,17 +2579,15 @@ export default function DubbingStudio({
                     try {
                       setRetranslating(true);
                       const updated = await api.retryDubbingTranslation(job.id, { force_fallback: true });
-                      setJob(updated);
-                      if (updated.original_subtitles) setOriginalSubs(updated.original_subtitles);
-                      if (updated.translated_subtitles) setTranslatedSubs(updated.translated_subtitles);
+                      applyJobState(updated);
                     } catch (e: unknown) {
-                      alert(getErrorMessage(e, "Không thể bỏ qua"));
+                      setError(getErrorMessage(e, "Không thể bỏ qua"));
                     } finally {
                       setRetranslating(false);
                     }
                   }}
                   disabled={retranslating}
-                  className="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/30 rounded-lg font-bold text-[11px] flex items-center gap-1 cursor-pointer transition-colors"
+                  className="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-700 dark:text-amber-400 border border-amber-500/30 rounded-lg font-bold text-[11px] flex items-center gap-1 cursor-pointer transition-colors"
                   title="Bỏ qua dịch thuật LLM nếu bị kẹt và chuyển ngay sang bước duyệt phụ đề"
                 >
                   <Zap className="w-3.5 h-3.5" />
@@ -2294,13 +2606,13 @@ export default function DubbingStudio({
                       <span>Video Gốc Đã Sẵn Sàng Trên Máy Chủ</span>
                     </h4>
                     <p className="text-[11px] text-muted-foreground mt-0.5">
-                      Bạn có thể xem trước, tải MP4 về máy hoặc bắt đầu quy trình nhận dạng &amp; dịch thuật ngay.
+                      Chọn ngôn ngữ, giọng đọc và cấu hình bên dưới trước khi bắt đầu nhận dạng &amp; dịch thuật.
                     </p>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     {job.has_source_video && (
                       <a
-                        href={api.getDubbingFileUrl(job.id, "video", true)}
+                        href={api.getDubbingFileUrl(job.id, "video", true, false, mediaRevision)}
                         download={`youtube_${job.id}.mp4`}
                         className="px-3 py-1.5 bg-secondary hover:bg-secondary/80 text-foreground text-xs font-bold rounded-xl border border-border transition-colors flex items-center gap-1.5"
                       >
@@ -2318,12 +2630,17 @@ export default function DubbingStudio({
                           const started = await api.createDubbingJob(
                             undefined,
                             undefined,
-                            targetLanguage || job.target_language || "Vietnamese",
+                            workspaceTargetLang || job.target_language || "Vietnamese",
                             job.id,
-                            selectedLlmProfileId || undefined,
-                            { preferredQuality: job.preferred_quality || preferredQuality }
+                            workspaceLlmProfileId || selectedLlmProfileId || undefined,
+                            {
+                              preferredQuality: job.preferred_quality || preferredQuality,
+                              voiceMode,
+                              voiceSampleId: voiceMode === "voice_sample" && selectedVoiceSampleId ? selectedVoiceSampleId : undefined,
+                              enableSeparation: workspaceSeparation,
+                            }
                           );
-                          setJob(started);
+                          applyJobState(started);
                           setPollRevision(r => r + 1);
                           void fetchAllJobs(false);
                         } catch (e: unknown) {
@@ -2332,18 +2649,70 @@ export default function DubbingStudio({
                           setLoading(false);
                         }
                       }}
-                      className="px-4 py-1.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white text-xs font-bold rounded-xl shadow transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                      className="px-4 py-1.5 bg-primary hover:bg-primary-hover text-primary-foreground text-xs font-bold rounded-xl shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                     >
                       {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
                       <span>Bắt Đầu Nhận Dạng &amp; Dịch Thuật</span>
                     </button>
                   </div>
                 </div>
+
+                {/* Draft Configuration Controls */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-2">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[11px] font-semibold text-muted-foreground">Ngôn ngữ đích</label>
+                      <select
+                        value={workspaceTargetLang}
+                        onChange={(e) => setWorkspaceTargetLang(e.target.value)}
+                        className="bg-background border border-border rounded-xl px-3 py-2 text-xs text-foreground focus:outline-none focus:border-primary font-medium cursor-pointer"
+                      >
+                        <option value="English">English (Tiếng Anh)</option>
+                        <option value="Vietnamese">Tiếng Việt (Vietnamese)</option>
+                        <option value="Japanese">日本語 (Japanese)</option>
+                        <option value="Korean">한국어 (Korean)</option>
+                        <option value="Chinese">中文 (Chinese)</option>
+                        <option value="French">Français (French)</option>
+                        <option value="Spanish">Español (Spanish)</option>
+                      </select>
+                    </div>
+                    {llmProfiles.length > 0 && (
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[11px] font-semibold text-muted-foreground">Mô hình Dịch AI (LLM Profile)</label>
+                        <select
+                          value={workspaceLlmProfileId || selectedLlmProfileId}
+                          onChange={(e) => setWorkspaceLlmProfileId(e.target.value)}
+                          className="bg-background border border-border rounded-xl px-3 py-2 text-xs text-foreground focus:outline-none focus:border-primary font-medium cursor-pointer"
+                        >
+                          {llmProfiles.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.name} ({p.provider.toUpperCase()} - {p.model})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    <label className="flex items-center gap-2.5 p-2.5 bg-background/60 rounded-xl border border-border cursor-pointer text-xs text-foreground">
+                      <input
+                        type="checkbox"
+                        checked={workspaceSeparation}
+                        onChange={(e) => setWorkspaceSeparation(e.target.checked)}
+                        className="w-4 h-4 accent-primary rounded cursor-pointer"
+                      />
+                      <span className="font-semibold">Tách giọng nói &amp; nhạc nền (Demucs GPU)</span>
+                    </label>
+                  </div>
+                  <div>
+                    {renderVoiceSelector(true)}
+                  </div>
+                </div>
+
                 {job.has_source_video && (
-                  <div className="aspect-video w-full max-w-2xl mx-auto rounded-xl overflow-hidden bg-black border border-border">
+                  <div className="aspect-video w-full max-w-2xl mx-auto rounded-xl overflow-hidden bg-zinc-950 border border-border">
                     <video
-                      src={api.getDubbingFileUrl(job.id, "video")}
+                      src={api.getDubbingFileUrl(job.id, "video", false, false, mediaRevision)}
                       controls
+                      onPlay={() => window.dispatchEvent(new CustomEvent("omnivoice:pause-global-audio"))}
                       className="w-full h-full object-contain"
                     />
                   </div>
@@ -2351,13 +2720,15 @@ export default function DubbingStudio({
               </div>
             )}
 
-            {/* Failed Job Error & Retry Card */}
-            {job.status === "failed" && (
+            {/* Failed or Cancelled Job Error & Retry Card */}
+            {(job.status === "failed" || job.status === "cancelled") && (
               <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-2xl flex flex-col gap-3">
                 <div className="flex items-start gap-2.5">
                   <AlertCircle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
                   <div className="flex flex-col gap-1 min-w-0">
-                    <h4 className="text-xs font-bold text-destructive">Xử Lý Thất Bại — Chi Tiết Lỗi</h4>
+                    <h4 className="text-xs font-bold text-destructive">
+                      {job.status === "cancelled" ? "Tác Vụ Đã Dừng" : "Xử Lý Thất Bại — Chi Tiết Lỗi"}
+                    </h4>
                     <pre className="text-[11px] font-mono text-destructive/90 whitespace-pre-wrap break-words bg-background/60 p-2.5 rounded-xl border border-destructive/20">
                       {job.error_message || job.message || "Không xác định được lỗi."}
                     </pre>
@@ -2387,7 +2758,7 @@ export default function DubbingStudio({
                       className="px-3.5 py-1.5 bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-bold rounded-xl shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                     >
                       {retryingJob ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-                      <span>Thử Tải &amp; Chạy Lại</span>
+                      <span>Thử Chạy Lại</span>
                     </button>
                     {job.source_type === "youtube" && (
                       <button
@@ -2441,7 +2812,7 @@ export default function DubbingStudio({
               </div>
               <div
                 ref={logsContainerRef}
-                className="bg-[#18181b] border border-border/60 rounded-xl p-4 font-mono text-[11px] text-[#a1a1aa] overflow-y-auto max-h-60 flex flex-col gap-1.5 shadow-inner"
+                className="bg-zinc-950 border border-border/60 rounded-xl p-4 font-mono text-[11px] text-zinc-300 overflow-y-auto max-h-60 flex flex-col gap-1.5 shadow-inner"
               >
                 {jobLogs ? (
                   jobLogs.split("\n").map((line, lIdx) => {
@@ -2451,14 +2822,14 @@ export default function DubbingStudio({
                     const isKaggle = line.includes("[KAGGLE]") || line.includes("[MOCK]");
                     return (
                       <div key={lIdx} className="leading-relaxed break-all text-left">
-                        <span className={isError ? "text-red-400 font-bold" : isSuccess ? "text-emerald-400" : isKaggle ? "text-cyan-400" : "text-zinc-300"}>
+                        <span className={isError ? "text-red-400 font-bold" : isSuccess ? "text-emerald-400" : isKaggle ? "text-cyan-400" : "text-zinc-200"}>
                           {line}
                         </span>
                       </div>
                     );
                   })
                 ) : (
-                  <div className="text-zinc-500 italic text-left">Đang tải nhật ký tiến trình...</div>
+                  <div className="text-zinc-400 italic text-left">Đang tải nhật ký tiến trình...</div>
                 )}
               </div>
             </div>
@@ -2600,10 +2971,10 @@ export default function DubbingStudio({
               </div>
 
               <div className="flex items-center gap-2 justify-end flex-wrap">
-                {selectedJobIds.length > 0 && (
+                {effectiveSelectedJobIds.length > 0 && (
                   <div className="flex items-center gap-2 px-2.5 py-1 bg-destructive/10 border border-destructive/30 rounded-xl">
                     <span className="text-[11px] font-bold text-destructive">
-                      Đã chọn {selectedJobIds.length}
+                      Đã chọn {effectiveSelectedJobIds.length}
                     </span>
                     <button
                       type="button"
@@ -2713,13 +3084,14 @@ export default function DubbingStudio({
                       const isReview = j.status === "awaiting_review";
                       const isCompleted = j.status === "completed";
                       const isFailed = j.status === "failed";
+                      const isCancelled = j.status === "cancelled";
                       const isUploaded = j.status === "uploaded";
-                      const isRunning = !isCompleted && !isFailed && !isReview && !isUploaded;
+                      const isRunning = !isCompleted && !isFailed && !isCancelled && !isReview && !isUploaded;
                       const isYt = j.source_type === "youtube";
                       const ytId = getYouTubeId(j.source_url);
                       const durLabel = formatDuration(j.video_duration);
                       const statusMeta = getStatusMeta(j.status, j.progress || 0);
-                      const isChecked = selectedJobIds.includes(j.id);
+                      const isChecked = effectiveSelectedJobIds.includes(j.id);
                       const isCurrentActive = jobId === j.id;
                       const voiceObj = j.voice_sample_id ? voiceSamples.find(v => v.id === j.voice_sample_id) : null;
                       const voiceLabel =
@@ -2764,7 +3136,7 @@ export default function DubbingStudio({
                                   <Film className={`w-4 h-4 ${isYt ? "text-red-500" : "text-primary/70"}`} />
                                 )}
                                 {durLabel && (
-                                  <span className="absolute bottom-0.5 right-0.5 px-1 py-0.2 rounded bg-black/80 text-white text-[9px] font-mono font-bold leading-tight">
+                                  <span className="absolute bottom-0.5 right-0.5 px-1 py-0.5 rounded bg-zinc-950/85 text-white text-[9px] font-mono font-bold leading-tight">
                                     {durLabel}
                                   </span>
                                 )}
@@ -2783,7 +3155,7 @@ export default function DubbingStudio({
                                     {isYt ? "YouTube" : "Tải lên"}
                                   </span>
                                   {isYt && j.preferred_quality && (
-                                    <span className="px-1.5 py-0.2 rounded bg-secondary border border-border font-mono text-[9px] font-bold text-foreground">
+                                    <span className="px-1.5 py-0.5 rounded bg-secondary border border-border font-mono text-[9px] font-bold text-foreground">
                                       {j.preferred_quality === "2160p" ? "4K" : j.preferred_quality === "1440p" ? "2K" : j.preferred_quality}
                                     </span>
                                   )}
@@ -2844,7 +3216,7 @@ export default function DubbingStudio({
                                 </div>
                               )}
 
-                              {isFailed && (j.error_message || j.message) && (
+                              {(isFailed || isCancelled) && (j.error_message || j.message) && (
                                 <span className="text-[10px] text-destructive/85 truncate" title={j.error_message || j.message || ""}>
                                   {j.error_message || j.message}
                                 </span>
@@ -2876,7 +3248,7 @@ export default function DubbingStudio({
                                     ? "bg-amber-500 hover:bg-amber-600 text-white border-amber-500 shadow-sm"
                                     : isCompleted
                                       ? "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 border-emerald-500/30"
-                                      : isFailed
+                                      : isFailed || isCancelled
                                         ? "bg-destructive/10 hover:bg-destructive/20 text-destructive border-destructive/30"
                                         : "bg-secondary hover:bg-secondary/80 text-foreground border-border"
                                 }`}
@@ -2885,24 +3257,36 @@ export default function DubbingStudio({
                                 <span>{statusMeta.actionLabel}</span>
                               </button>
 
+                              {isRunning && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleCancelJob(j.id)}
+                                  disabled={cancellingJobId === j.id}
+                                  className="p-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-700 dark:text-amber-400 rounded-lg border border-amber-500/30 transition-colors cursor-pointer disabled:opacity-50"
+                                  title="Dừng tác vụ đang chạy"
+                                >
+                                  {cancellingJobId === j.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5 fill-current" />}
+                                </button>
+                              )}
+
                               {isCompleted ? (
                                 <a
-                                  href={api.getDubbingFileUrl(j.id, "output", true)}
+                                  href={api.getDubbingFileUrl(j.id, "output", true, false, mediaRevision)}
                                   download={`dubbed_${j.id}.mp4`}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  className="p-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-lg border border-emerald-500/30 transition-colors"
+                                  className="p-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 rounded-lg border border-emerald-500/30 transition-colors"
                                   title="Tải video MP4 đã lồng tiếng"
                                 >
                                   <Download className="w-3.5 h-3.5" />
                                 </a>
                               ) : j.has_source_video ? (
                                 <a
-                                  href={api.getDubbingFileUrl(j.id, "video", true)}
+                                  href={api.getDubbingFileUrl(j.id, "video", true, false, mediaRevision)}
                                   download={`youtube_${j.id}.mp4`}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  className="p-1.5 bg-sky-500/10 hover:bg-sky-500/20 text-sky-600 dark:text-sky-400 rounded-lg border border-sky-500/30 transition-colors"
+                                  className="p-1.5 bg-sky-500/10 hover:bg-sky-500/20 text-sky-700 dark:text-sky-400 rounded-lg border border-sky-500/30 transition-colors"
                                   title="Tải video gốc MP4"
                                 >
                                   <Download className="w-3.5 h-3.5" />
@@ -3010,15 +3394,22 @@ export default function DubbingStudio({
                     <span className="text-xs font-bold text-foreground">
                       Tải lên tệp video từ máy tính
                     </span>
-                    <span className="text-[10px] text-muted-foreground mt-1">Hỗ trợ các định dạng MP4, MKV, MOV</span>
+                    <span className="text-[10px] text-muted-foreground mt-1">Hỗ trợ MP4, MKV, MOV (Tối đa 300MB)</span>
                   </div>
                 ) : uploading ? (
-                  <div className="border-2 border-dashed border-primary/45 rounded-2xl p-8 flex flex-col items-center justify-center bg-primary/5">
-                    <Loader2 className="w-8 h-8 text-primary animate-spin mb-3" />
-                    <span className="text-xs font-bold text-foreground mb-2">Đang tải video lên máy chủ... {uploadProgress}%</span>
+                  <div className="border-2 border-dashed border-primary/45 rounded-2xl p-8 flex flex-col items-center justify-center bg-primary/5 gap-3">
+                    <Loader2 className="w-8 h-8 text-primary animate-spin" />
+                    <span className="text-xs font-bold text-foreground">Đang tải video lên máy chủ... {uploadProgress}%</span>
                     <div className="w-full max-w-xs bg-secondary h-2 rounded-full overflow-hidden border border-border">
                       <div className="bg-primary h-full transition-all duration-300" style={{ width: `${uploadProgress}%` }}></div>
                     </div>
+                    <button
+                      type="button"
+                      onClick={handleCancelUpload}
+                      className="px-3 py-1.5 bg-destructive/10 hover:bg-destructive/20 text-destructive text-xs font-bold rounded-lg border border-destructive/30 transition-colors cursor-pointer"
+                    >
+                      Hủy tải lên
+                    </button>
                   </div>
                 ) : (
                   <div className="border border-border rounded-2xl p-5 flex flex-col gap-3 bg-secondary/15">
@@ -3032,9 +3423,9 @@ export default function DubbingStudio({
                       <div className="flex items-center gap-2.5 shrink-0">
                         {uploadedJobId && (
                           <a
-                            href={api.getDubbingFileUrl(uploadedJobId, "video", true)}
+                            href={api.getDubbingFileUrl(uploadedJobId, "video", true, false, mediaRevision)}
                             download={`youtube_${uploadedJobId}.mp4`}
-                            className="text-[11px] text-emerald-600 dark:text-emerald-400 hover:underline font-bold flex items-center gap-1"
+                            className="text-[11px] text-emerald-700 dark:text-emerald-400 hover:underline font-bold flex items-center gap-1"
                           >
                             <Download className="w-3 h-3" />
                             <span>Tải MP4 Về Máy</span>
@@ -3056,10 +3447,11 @@ export default function DubbingStudio({
                       </div>
                     </div>
                     {uploadedVideoUrl && (
-                      <div className="aspect-video w-full rounded-xl overflow-hidden bg-black border border-border relative">
+                      <div className="aspect-video w-full rounded-xl overflow-hidden bg-zinc-950 border border-border relative">
                         <video
                           src={uploadedVideoUrl}
                           controls
+                          onPlay={() => window.dispatchEvent(new CustomEvent("omnivoice:pause-global-audio"))}
                           className="w-full h-full object-contain"
                         />
                       </div>
@@ -3090,7 +3482,7 @@ export default function DubbingStudio({
                           }}
                           className={`text-[11px] px-2.5 py-1 rounded-lg border flex items-center gap-1.5 font-medium transition-all cursor-pointer ${
                             proxyPool.length > 0
-                              ? "bg-purple-500/15 text-purple-600 dark:text-purple-400 border-purple-500/30 hover:bg-purple-500/25"
+                              ? "bg-purple-500/15 text-purple-700 dark:text-purple-400 border-purple-500/30 hover:bg-purple-500/25"
                               : "bg-secondary/60 text-muted-foreground border-border hover:bg-secondary hover:text-foreground"
                           }`}
                         >
@@ -3106,9 +3498,9 @@ export default function DubbingStudio({
                           }}
                           className={`text-[11px] px-2.5 py-1 rounded-lg border flex items-center gap-1.5 font-medium transition-all cursor-pointer ${
                             oauthStatus?.connected
-                              ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/25"
+                              ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/25"
                               : cookieStatus?.has_cookies
-                              ? "bg-blue-500/15 text-blue-600 dark:text-blue-400 border-blue-500/30 hover:bg-blue-500/25"
+                              ? "bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/30 hover:bg-blue-500/25"
                               : "bg-primary/15 text-primary border-primary/30 hover:bg-primary/25"
                           }`}
                         >
@@ -3138,12 +3530,21 @@ export default function DubbingStudio({
                       placeholder="https://www.youtube.com/watch?v=... hoặc youtube.com/shorts/..."
                       value={youtubeUrl}
                       onChange={(e) => {
-                        setYoutubeUrl(e.target.value);
-                        if (uploadedJobId && ytDownloadJobId === uploadedJobId) {
-                          setUploadedJobId(null);
-                          setUploadedVideoUrl(null);
-                          setUploadedVideoTitle(null);
-                          setYtDownloadJobId(null);
+                        const val = e.target.value;
+                        setYoutubeUrl(val);
+                        if (!val.trim() || !getYouTubeId(val.trim())) {
+                          setYtInfo(null);
+                          setYtInfoError(null);
+                        }
+                        if (val.trim()) {
+                          // Typing a YouTube URL clears any conflicting local file selection
+                          setSelectedFile(null);
+                          if (uploadedJobId) {
+                            setUploadedJobId(null);
+                            setUploadedVideoUrl(null);
+                            setUploadedVideoTitle(null);
+                            setYtDownloadJobId(null);
+                          }
                         }
                       }}
                       className="flex-1 bg-background border border-border rounded-xl px-4 py-2.5 text-xs text-foreground focus:outline-none focus:border-primary"
@@ -3167,111 +3568,113 @@ export default function DubbingStudio({
                   )}
 
                   {ytInfoError && (
-                    <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-xs text-amber-600 dark:text-amber-400 flex items-center gap-2">
+                    <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-xs text-amber-700 dark:text-amber-400 flex items-center gap-2">
                       <AlertTriangle className="w-4 h-4 shrink-0" />
                       <span>{ytInfoError}</span>
                     </div>
                   )}
 
-                  {ytInfo && (
+                  {(ytInfo || youtubeUrl.trim()) && (
                     <div className="p-4 bg-secondary/20 border border-border rounded-2xl flex flex-col gap-3">
-                      <div className="flex flex-col sm:flex-row gap-3.5">
-                        {ytInfo.thumbnail_url && (
-                          <div className="relative w-full sm:w-44 aspect-video rounded-xl overflow-hidden bg-black shrink-0 border border-border">
-                            <img
-                              src={ytInfo.thumbnail_url}
-                              alt={ytInfo.title}
-                              className="w-full h-full object-cover"
-                            />
-                            {formatDuration(ytInfo.duration) && (
-                              <span className="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded bg-black/80 text-white text-[10px] font-mono font-bold">
-                                {formatDuration(ytInfo.duration)}
-                              </span>
-                            )}
-                          </div>
-                        )}
-                        <div className="flex flex-col justify-between gap-2 min-w-0 flex-1">
-                          <div>
-                            <h4 className="text-xs font-bold text-foreground line-clamp-2 leading-snug">
-                              {ytInfo.title}
-                            </h4>
-                            <div className="flex items-center gap-2 text-[11px] text-muted-foreground mt-1 flex-wrap">
-                              {ytInfo.channel && <span className="font-medium text-foreground/80">{ytInfo.channel}</span>}
-                              {formatDuration(ytInfo.duration) && <span>• {formatDuration(ytInfo.duration)}</span>}
-                              <a
-                                href={ytInfo.canonical_url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="inline-flex items-center gap-1 text-primary hover:underline"
-                              >
-                                <span>Mở YouTube</span>
-                                <ExternalLink className="w-2.5 h-2.5" />
-                              </a>
-                            </div>
-                          </div>
-
-                          {ytInfo.is_live && (
-                            <div className="p-2 bg-amber-500/10 border border-amber-500/30 rounded-lg text-[11px] text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
-                              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                              <span>Video đang phát trực tiếp (Live) có thể không tải được toàn bộ.</span>
+                      {ytInfo && (
+                        <div className="flex flex-col sm:flex-row gap-3.5">
+                          {ytInfo.thumbnail_url && (
+                            <div className="relative w-full sm:w-44 aspect-video rounded-xl overflow-hidden bg-zinc-950 shrink-0 border border-border">
+                              <img
+                                src={ytInfo.thumbnail_url}
+                                alt={ytInfo.title}
+                                className="w-full h-full object-cover"
+                              />
+                              {formatDuration(ytInfo.duration) && (
+                                <span className="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded bg-zinc-950/85 text-white text-[10px] font-mono font-bold">
+                                  {formatDuration(ytInfo.duration)}
+                                </span>
+                              )}
                             </div>
                           )}
-
-                          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                            <div className="flex items-center gap-2">
-                              <label className="text-[11px] font-semibold text-muted-foreground">Chất lượng:</label>
-                              <select
-                                value={preferredQuality}
-                                onChange={(e) => setPreferredQuality(e.target.value)}
-                                disabled={ytDownloading}
-                                className="bg-background border border-border rounded-lg px-2.5 py-1 text-xs font-medium text-foreground focus:outline-none focus:border-primary"
-                              >
-                                {(ytInfo.available_qualities && ytInfo.available_qualities.length > 0
-                                  ? ytInfo.available_qualities
-                                  : ["2160p", "1440p", "1080p", "720p", "480p", "360p"]
-                                ).map((q) => (
-                                  <option key={q} value={q}>
-                                    {q === "2160p"
-                                      ? "4K Ultra HD (2160p)"
-                                      : q === "1440p"
-                                        ? "2K QHD (1440p)"
-                                        : q === "1080p"
-                                          ? "1080p Full HD"
-                                          : q === "720p"
-                                            ? "720p HD"
-                                            : q === "480p"
-                                              ? "480p SD"
-                                              : "360p Nhanh"}
-                                  </option>
-                                ))}
-                              </select>
+                          <div className="flex flex-col justify-between gap-2 min-w-0 flex-1">
+                            <div>
+                              <h4 className="text-xs font-bold text-foreground line-clamp-2 leading-snug">
+                                {ytInfo.title}
+                              </h4>
+                              <div className="flex items-center gap-2 text-[11px] text-muted-foreground mt-1 flex-wrap">
+                                {ytInfo.channel && <span className="font-medium text-foreground/80">{ytInfo.channel}</span>}
+                                {formatDuration(ytInfo.duration) && <span>• {formatDuration(ytInfo.duration)}</span>}
+                                <a
+                                  href={ytInfo.canonical_url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 text-primary hover:underline"
+                                >
+                                  <span>Mở YouTube</span>
+                                  <ExternalLink className="w-2.5 h-2.5" />
+                                </a>
+                              </div>
                             </div>
 
-                            <button
-                              type="button"
-                              onClick={() => void handlePreDownloadYouTube()}
-                              disabled={ytDownloading || Boolean(uploadedJobId && ytDownloadJobId === uploadedJobId)}
-                              className="px-3 py-1.5 bg-primary/10 hover:bg-primary/20 text-primary text-xs font-bold rounded-xl border border-primary/25 transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
-                            >
-                              {ytDownloading ? (
-                                <>
-                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                  <span>Đang tải ({ytDownloadProgress}%)</span>
-                                </>
-                              ) : uploadedJobId && ytDownloadJobId === uploadedJobId ? (
-                                <>
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
-                                  <span>Đã tải lên máy chủ</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Download className="w-3.5 h-3.5" />
-                                  <span>Tải Video Về Máy Chủ Trước</span>
-                                </>
-                              )}
-                            </button>
+                            {ytInfo.is_live && (
+                              <div className="p-2 bg-amber-500/10 border border-amber-500/30 rounded-lg text-[11px] text-amber-700 dark:text-amber-400 flex items-center gap-1.5">
+                                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                                <span>Video đang phát trực tiếp (Live) có thể không tải được toàn bộ.</span>
+                              </div>
+                            )}
                           </div>
                         </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                        <div className="flex items-center gap-2">
+                          <label className="text-[11px] font-semibold text-muted-foreground">Chất lượng tải:</label>
+                          <select
+                            value={preferredQuality}
+                            onChange={(e) => setPreferredQuality(e.target.value)}
+                            disabled={ytDownloading}
+                            className="bg-background border border-border rounded-lg px-2.5 py-1 text-xs font-medium text-foreground focus:outline-none focus:border-primary cursor-pointer"
+                          >
+                            {(ytInfo?.available_qualities && ytInfo.available_qualities.length > 0
+                              ? ytInfo.available_qualities
+                              : ["2160p", "1440p", "1080p", "720p", "480p", "360p"]
+                            ).map((q) => (
+                              <option key={q} value={q}>
+                                {q === "2160p"
+                                  ? "4K Ultra HD (2160p)"
+                                  : q === "1440p"
+                                    ? "2K QHD (1440p)"
+                                    : q === "1080p"
+                                      ? "1080p Full HD"
+                                      : q === "720p"
+                                        ? "720p HD"
+                                        : q === "480p"
+                                          ? "480p SD"
+                                          : "360p Nhanh"}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => void handlePreDownloadYouTube()}
+                          disabled={!youtubeUrl.trim() || ytDownloading || Boolean(uploadedJobId && ytDownloadJobId === uploadedJobId)}
+                          className="px-3 py-1.5 bg-primary/10 hover:bg-primary/20 text-primary text-xs font-bold rounded-xl border border-primary/25 transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                        >
+                          {ytDownloading ? (
+                            <>
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              <span>Đang tải ({ytDownloadProgress}%)</span>
+                            </>
+                          ) : uploadedJobId && ytDownloadJobId === uploadedJobId ? (
+                            <>
+                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                              <span>Đã tải lên máy chủ</span>
+                            </>
+                          ) : (
+                            <>
+                              <Download className="w-3.5 h-3.5" />
+                              <span>Tải Video Về Máy Chủ Trước</span>
+                            </>
+                          )}
+                        </button>
                       </div>
 
                       {ytDownloading && (
@@ -3312,13 +3715,23 @@ export default function DubbingStudio({
 
                 <button
                   type="submit"
-                  disabled={loading}
-                  className="w-full py-3 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs rounded-xl transition-all shadow-md shadow-primary/10 flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+                  disabled={loading || uploading || ytDownloading}
+                  className="w-full py-3 bg-primary hover:bg-primary-hover text-primary-foreground font-bold text-xs rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
                 >
                   {loading ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
                       <span>Đang khởi tạo tác vụ...</span>
+                    </>
+                  ) : uploading ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Đang chờ tải video lên ({uploadProgress}%)...</span>
+                    </>
+                  ) : ytDownloading ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Đang chờ tải video YouTube ({ytDownloadProgress}%)...</span>
                     </>
                   ) : (
                     <>
@@ -3413,28 +3826,16 @@ export default function DubbingStudio({
       )}
 
       {/* --- STEP 3: SUBTITLE REVIEW & EDIT STUDIO --- */}
-      {viewMode === "workspace" && jobId && job && job.id === jobId && job.status === "awaiting_review" && (() => {
-        const activeSegIdx = originalSubs.findIndex((s, i) => {
-          const st = typeof s?.start === "number" ? s.start : (translatedSubs[i]?.start ?? -1);
-          const et = typeof s?.end === "number" ? s.end : (translatedSubs[i]?.end ?? -1);
-          return currentVideoTime >= st && currentVideoTime <= et;
-        });
-        const fallbackIdx = activeSegIdx === -1
-          ? translatedSubs.findIndex(s => typeof s.start === "number" && typeof s.end === "number" && currentVideoTime >= s.start && currentVideoTime <= s.end)
-          : activeSegIdx;
-        const activeOrigSeg = fallbackIdx !== -1 ? (originalSubs[fallbackIdx] || translatedSubs[fallbackIdx]) : null;
-        const activeTransSeg = fallbackIdx !== -1 ? (translatedSubs[fallbackIdx] || originalSubs[fallbackIdx]) : null;
-
-        return (
+      {viewMode === "workspace" && jobId && job && job.id === jobId && job.status === "awaiting_review" && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           
           {/* Left: Video Player & Audio Controls */}
           <SectionCard title="Video Xem Trước & Bộ Trộn Âm Thanh">
             <div className="flex flex-col gap-4">
-              <div className="relative aspect-video rounded-xl bg-black overflow-hidden border border-border shadow-inner">
+              <div className="relative aspect-video rounded-xl bg-zinc-950 overflow-hidden border border-border shadow-inner">
                 <video
                   ref={videoPlayerRef}
-                  src={api.getDubbingFileUrl(jobId, "video")}
+                  src={api.getDubbingFileUrl(jobId, "video", false, false, mediaRevision)}
                   controls
                   playsInline
                   preload="metadata"
@@ -3453,17 +3854,17 @@ export default function DubbingStudio({
                 {/* Live Subtitle Overlay on Video Player (English ASR + Translation) */}
                 {subOverlayMode !== "off" && activeOrigSeg && (
                   <div className="absolute bottom-11 left-3 right-3 pointer-events-none z-10 flex flex-col items-center gap-1 transition-all">
-                    <span className="px-2 py-0.5 rounded-full bg-black/80 text-[9px] font-mono font-bold text-amber-300 border border-amber-400/30 shadow">
+                    <span className="px-2 py-0.5 rounded-full bg-zinc-950/85 text-[9px] font-mono font-bold text-amber-300 border border-amber-400/30 shadow">
                       Phân đoạn #{activeOrigSeg.id} • {activeOrigSeg.start.toFixed(2)}s → {activeOrigSeg.end.toFixed(2)}s
                     </span>
                     {(subOverlayMode === "bilingual" || subOverlayMode === "en") && (
-                      <div className="max-w-[95%] bg-black/85 backdrop-blur-md text-white px-3.5 py-1.5 rounded-lg border border-amber-400/50 shadow-lg text-center">
+                      <div className="max-w-[95%] bg-zinc-950/85 backdrop-blur-md text-white px-3.5 py-1.5 rounded-lg border border-amber-400/50 shadow-lg text-center">
                         <span className="text-[9px] font-extrabold uppercase tracking-wider text-amber-400 mr-1.5">[SUB GỐC ASR]</span>
                         <span className="text-xs sm:text-sm font-semibold leading-snug">{activeOrigSeg.text}</span>
                       </div>
                     )}
                     {(subOverlayMode === "bilingual" || subOverlayMode === "vi") && activeTransSeg && (
-                      <div className="max-w-[92%] bg-black/80 backdrop-blur-md text-emerald-300 px-3 py-1 rounded-lg border border-emerald-500/40 shadow-md text-center">
+                      <div className="max-w-[92%] bg-zinc-950/80 backdrop-blur-md text-emerald-300 px-3 py-1 rounded-lg border border-emerald-500/40 shadow-md text-center">
                         <span className="text-[9px] font-bold uppercase tracking-wider text-emerald-400 mr-1.5">[DỊCH]</span>
                         <span className="text-[11px] sm:text-xs font-medium leading-snug">{activeTransSeg.text}</span>
                       </div>
@@ -3472,10 +3873,10 @@ export default function DubbingStudio({
                 )}
                 
                 {job.vocals_audio_path && (
-                  <audio ref={vocalsPlayerRef} src={api.getDubbingFileUrl(jobId, "vocals", false, true)} preload="metadata" />
+                  <audio ref={vocalsPlayerRef} src={api.getDubbingFileUrl(jobId, "vocals", false, true, mediaRevision)} preload="metadata" />
                 )}
                 {job.bgm_audio_path && (
-                  <audio ref={bgmPlayerRef} src={api.getDubbingFileUrl(jobId, "bgm", false, true)} preload="metadata" />
+                  <audio ref={bgmPlayerRef} src={api.getDubbingFileUrl(jobId, "bgm", false, true, mediaRevision)} preload="metadata" />
                 )}
               </div>
 
@@ -3483,8 +3884,9 @@ export default function DubbingStudio({
               <div className="p-3 bg-secondary/40 rounded-xl border border-border flex flex-col gap-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
-                    <span className="px-2 py-0.5 rounded bg-background border border-border text-[10px] font-mono font-bold text-primary">
-                      ⏱ {currentVideoTime.toFixed(2)}s
+                    <span className="px-2 py-0.5 rounded bg-background border border-border text-[10px] font-mono font-bold text-primary inline-flex items-center gap-1">
+                      <Clock className="w-3 h-3" />
+                      <span>{currentVideoTime.toFixed(2)}s</span>
                     </span>
                     {activeOrigSeg ? (
                       <span className="text-[11px] font-bold text-amber-600 dark:text-amber-400 flex items-center gap-1">
@@ -3633,8 +4035,8 @@ export default function DubbingStudio({
                       <input
                         type="range"
                         min="0"
-                        max="1"
-                        step="0.01"
+                        max="2"
+                        step="0.05"
                         value={vocalsMuted ? 0 : vocalsVolume}
                         onChange={(e) => {
                           const val = parseFloat(e.target.value);
@@ -3748,11 +4150,11 @@ export default function DubbingStudio({
               )}
 
               <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
-                <div className="flex items-center gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
                   {llmProfiles.length > 0 && (
                     <select
-                      value={selectedLlmProfileId || ""}
-                      onChange={(e) => setSelectedLlmProfileId(e.target.value)}
+                      value={workspaceLlmProfileId || selectedLlmProfileId || ""}
+                      onChange={(e) => setWorkspaceLlmProfileId(e.target.value)}
                       className="bg-background border border-border rounded-lg px-2 py-1 text-[11px] text-foreground font-medium focus:ring-1 focus:ring-primary outline-hidden"
                     >
                       {llmProfiles.map(p => (
@@ -3765,23 +4167,22 @@ export default function DubbingStudio({
                     onClick={async () => {
                       try {
                         setRetranslating(true);
+                        setError(null);
                         await api.updateDubbingSubtitles(job.id, originalSubs, translatedSubs);
                         const updated = await api.retryDubbingTranslation(job.id, {
-                          llm_profile_id: selectedLlmProfileId || undefined,
-                          target_language: targetLanguage || job.target_language
+                          llm_profile_id: workspaceLlmProfileId || selectedLlmProfileId || undefined,
+                          target_language: workspaceTargetLang || job.target_language
                         });
-                        setJob(updated);
-                        if (updated.original_subtitles) setOriginalSubs(updated.original_subtitles);
-                        if (updated.translated_subtitles) setTranslatedSubs(updated.translated_subtitles);
-                        alert("Đã làm sạch phụ đề gốc & dịch lại toàn bộ qua AI thành công!");
+                        applyJobState(updated);
+                        setSubsSavedMsg("Đã dịch lại bằng AI!");
                       } catch (e: unknown) {
-                        alert(`Lỗi khi dịch lại: ${getErrorMessage(e, "Mô hình LLM không phản hồi")}`);
+                        setError(`Lỗi khi dịch lại: ${getErrorMessage(e, "Mô hình LLM không phản hồi")}`);
                       } finally {
                         setRetranslating(false);
                       }
                     }}
                     disabled={retranslating}
-                    className="px-2.5 py-1 bg-secondary hover:bg-secondary/80 text-foreground text-xs font-semibold rounded-lg border border-border transition-colors cursor-pointer flex items-center gap-1"
+                    className="px-2.5 py-1 bg-secondary hover:bg-secondary/80 text-foreground text-xs font-semibold rounded-lg border border-border transition-colors cursor-pointer flex items-center gap-1 disabled:opacity-50"
                     title="Làm sạch ảo giác ASR và dịch lại tất cả phân đoạn bằng mô hình AI"
                   >
                     <RefreshCw className={`w-3 h-3 ${retranslating ? "animate-spin text-primary" : ""}`} />
@@ -3799,14 +4200,37 @@ export default function DubbingStudio({
                   </button>
                 </div>
 
-                <button
-                  onClick={handleSaveSubtitles}
-                  disabled={savingSubs}
-                  className="px-3 py-1 bg-secondary hover:bg-secondary/80 text-foreground text-xs font-semibold rounded-lg border border-border transition-colors cursor-pointer flex items-center gap-1.5"
-                >
-                  <Save className="w-3.5 h-3.5 text-primary" />
-                  <span>{savingSubs ? "Đang lưu..." : "Lưu phụ đề"}</span>
-                </button>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {subsDirty ? (
+                    <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/25">
+                      Chưa lưu
+                    </span>
+                  ) : subsSavedMsg ? (
+                    <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/25">
+                      {subsSavedMsg}
+                    </span>
+                  ) : null}
+
+                  <button
+                    type="button"
+                    onClick={handleExportSrt}
+                    className="px-2.5 py-1 bg-secondary hover:bg-secondary/80 text-foreground text-xs font-semibold rounded-lg border border-border transition-colors cursor-pointer flex items-center gap-1"
+                    title="Tải xuống tệp phụ đề SRT hiện tại"
+                  >
+                    <Download className="w-3 h-3 text-primary" />
+                    <span>Tải SRT</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleSaveSubtitles}
+                    disabled={savingSubs}
+                    className="px-3 py-1 bg-secondary hover:bg-secondary/80 text-foreground text-xs font-semibold rounded-lg border border-border transition-colors cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <Save className="w-3.5 h-3.5 text-primary" />
+                    <span>{savingSubs ? "Đang lưu..." : "Lưu phụ đề"}</span>
+                  </button>
+                </div>
               </div>
 
               <div className="flex flex-col h-[450px] overflow-y-auto pr-1 gap-3">
@@ -3822,7 +4246,8 @@ export default function DubbingStudio({
                     : 4.0;
                   const safeBorrow = Math.min(0.80, Math.max(0, gapAfter - 0.30) * 0.42);
                   const allowedDur = duration + safeBorrow;
-                  const { syllables, estSeconds } = estimateDubbingSpokenStats(seg.text || "", targetLanguage || job?.target_language);
+                  const effectiveLang = workspaceTargetLang || job?.target_language || targetLanguage;
+                  const { syllables, estSeconds } = estimateDubbingSpokenStats(seg.text || "", effectiveLang);
                   const isOverDuration = estSeconds > allowedDur * 1.06;
                   const isUnderDuration = duration >= 2.8 && estSeconds < duration * 0.78;
                   const isShortening = shorteningSegId === seg.id;
@@ -3830,8 +4255,7 @@ export default function DubbingStudio({
                   return (
                     <div
                       key={seg.id}
-                      onClick={() => jumpToSegment(seg.start, seg.id)}
-                      className={`p-3.5 rounded-xl border transition-all cursor-pointer ${
+                      className={`p-3.5 rounded-xl border transition-all ${
                         isPlayingNow
                           ? "bg-amber-500/10 border-amber-500 shadow-sm ring-1 ring-amber-500/30"
                           : isSelected
@@ -3843,7 +4267,15 @@ export default function DubbingStudio({
                     >
                       <div className="flex flex-wrap justify-between items-center gap-2 mb-2">
                         <div className="flex items-center gap-2">
-                          <span className="text-[10px] font-bold text-primary tracking-wider">PHÂN ĐOẠN #{seg.id}</span>
+                          <button
+                            type="button"
+                            onClick={() => jumpToSegment(seg.start, seg.id)}
+                            title="Phát video từ đầu phân đoạn này"
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-primary/10 hover:bg-primary/20 text-[10px] font-bold text-primary tracking-wider transition-colors cursor-pointer"
+                          >
+                            <Play className="w-2.5 h-2.5 fill-current" />
+                            <span>PHÂN ĐOẠN #{seg.id}</span>
+                          </button>
                           {isPlayingNow && (
                             <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-500 text-white flex items-center gap-1 animate-pulse">
                               <span>● Đang phát</span>
@@ -3865,13 +4297,10 @@ export default function DubbingStudio({
                           )}
                         </div>
 
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <button
                             type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleShortenSubtitle(seg.id, seg.text, duration, origSeg.text);
-                            }}
+                            onClick={() => handleShortenSubtitle(seg.id, seg.text, duration, origSeg.text)}
                             disabled={isShortening}
                             className={`px-2 py-0.5 text-[10px] font-bold rounded border transition-all flex items-center gap-1 cursor-pointer ${
                               isOverDuration
@@ -3893,16 +4322,32 @@ export default function DubbingStudio({
                             )}
                           </button>
 
-                          <span className="text-[10px] font-mono font-bold text-muted-foreground bg-background px-2 py-0.5 rounded border border-border">
-                            {typeof seg.start === "number" ? seg.start.toFixed(2) : "0.00"}s → {typeof seg.end === "number" ? seg.end.toFixed(2) : "0.00"}s ({duration.toFixed(1)}s)
-                          </span>
+                          <div className="inline-flex items-center gap-1 text-[10px] font-mono font-bold text-muted-foreground bg-background px-1.5 py-0.5 rounded border border-border">
+                            <input
+                              type="number"
+                              step="0.1"
+                              min="0"
+                              aria-label={`Bắt đầu phân đoạn ${seg.id} (giây)`}
+                              value={typeof seg.start === "number" ? Number(seg.start.toFixed(2)) : 0}
+                              onChange={(e) => updateSegTiming(seg.id, "start", e.target.value)}
+                              className="w-12 bg-transparent text-foreground text-right focus:outline-none focus:text-primary"
+                            />
+                            <span>→</span>
+                            <input
+                              type="number"
+                              step="0.1"
+                              min="0.1"
+                              aria-label={`Kết thúc phân đoạn ${seg.id} (giây)`}
+                              value={typeof seg.end === "number" ? Number(seg.end.toFixed(2)) : 0.5}
+                              onChange={(e) => updateSegTiming(seg.id, "end", e.target.value)}
+                              className="w-12 bg-transparent text-foreground text-right focus:outline-none focus:text-primary"
+                            />
+                            <span>s ({duration.toFixed(1)}s)</span>
+                          </div>
 
                           <button
                             type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleDeleteSegment(seg.id);
-                            }}
+                            onClick={() => handleDeleteSegment(seg.id)}
                             className="p-1 rounded hover:bg-destructive/15 text-muted-foreground hover:text-destructive transition-colors cursor-pointer"
                             title="Xóa phân đoạn này (nếu ASR nhận diện dư / bịa lời ở cuối video)"
                           >
@@ -3919,10 +4364,7 @@ export default function DubbingStudio({
                             </span>
                             <button
                               type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setEditingOrigSegId(isEditingOrig ? null : seg.id);
-                              }}
+                              onClick={() => setEditingOrigSegId(isEditingOrig ? null : seg.id)}
                               className="text-[9px] font-semibold text-muted-foreground hover:text-primary flex items-center gap-1 cursor-pointer"
                             >
                               <Edit3 className="w-2.5 h-2.5" />
@@ -3933,18 +4375,14 @@ export default function DubbingStudio({
                             <textarea
                               value={origSeg.text}
                               onChange={(e) => updateOrigSubText(origSeg.id, e.target.value)}
-                              onClick={(e) => e.stopPropagation()}
                               rows={2}
                               className="w-full bg-background border border-amber-500/50 rounded-lg p-2 text-xs text-foreground mt-1 focus:outline-none focus:border-amber-500"
                             />
                           ) : (
                             <p
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setEditingOrigSegId(seg.id);
-                              }}
+                              onClick={() => setEditingOrigSegId(seg.id)}
                               title="Bấm để sửa văn bản Gốc (ASR) nếu nhận diện sai hoặc thừa chữ"
-                              className="text-xs text-foreground/85 italic mt-0.5 hover:bg-background/60 rounded px-1.5 py-0.5 -mx-1.5 transition-colors"
+                              className="text-xs text-foreground/85 italic mt-0.5 hover:bg-background/60 rounded px-1.5 py-0.5 -mx-1.5 transition-colors cursor-text"
                             >
                               {origSeg.text}
                             </p>
@@ -3953,7 +4391,9 @@ export default function DubbingStudio({
                         
                         <div>
                           <div className="flex items-center justify-between">
-                            <span className="text-[9px] uppercase font-bold text-primary tracking-wider">Dịch ({targetLanguage}):</span>
+                            <span className="text-[9px] uppercase font-bold text-primary tracking-wider">
+                              Dịch ({workspaceTargetLang || job.target_language}):
+                            </span>
                             <span className="text-[9px] text-muted-foreground font-mono">
                               {syllables} âm tiết • ước tính ~{estSeconds}s
                             </span>
@@ -3961,7 +4401,6 @@ export default function DubbingStudio({
                           <textarea
                             value={seg.text}
                             onChange={(e) => updateSubText(seg.id, e.target.value)}
-                            onClick={(e) => e.stopPropagation()}
                             rows={2}
                             className={`w-full bg-background border rounded-lg p-2 text-xs text-foreground mt-1 focus:outline-none focus:border-primary font-medium ${
                               isOverDuration ? "border-amber-500/50" : "border-border"
@@ -3977,8 +4416,7 @@ export default function DubbingStudio({
           </SectionCard>
 
         </div>
-        );
-      })()}
+      )}
 
       {/* --- STEP 5: FINAL OUTPUT PREVIEW & DOWNLOAD --- */}
       {viewMode === "workspace" && jobId && job && job.id === jobId && job.status === "completed" && (
@@ -3995,52 +4433,33 @@ export default function DubbingStudio({
               </p>
             </div>
 
-            <div className="aspect-video w-full max-w-2xl rounded-2xl overflow-hidden bg-black border border-border shadow-xl">
+            <div className="aspect-video w-full max-w-2xl rounded-2xl overflow-hidden bg-zinc-950 border border-border shadow-xl">
               <video
-                key={`dubbed_video_${jobId}_${outputVideoTimestamp}`}
-                src={api.getDubbingFileUrl(jobId, "output", false, false, outputVideoTimestamp)}
+                key={`dubbed_video_${jobId}_${mediaRevision}`}
+                src={api.getDubbingFileUrl(jobId, "output", false, false, mediaRevision)}
                 controls
                 playsInline
                 preload="metadata"
+                onPlay={() => window.dispatchEvent(new CustomEvent("omnivoice:pause-global-audio"))}
                 className="w-full h-full object-contain"
               />
             </div>
 
             <div className="flex flex-wrap gap-3 justify-center">
               <a
-                href={api.getDubbingFileUrl(jobId, "output", true)}
+                href={api.getDubbingFileUrl(jobId, "output", true, false, mediaRevision)}
                 download={`dubbed_video_${jobId}.mp4`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="px-4 py-2.5 bg-gradient-to-r from-primary to-accent hover:brightness-105 text-white font-bold text-xs rounded-xl transition-all shadow-md flex items-center gap-2 cursor-pointer"
+                className="px-4 py-2.5 bg-primary hover:bg-primary-hover text-primary-foreground font-bold text-xs rounded-xl transition-colors shadow-sm flex items-center gap-2 cursor-pointer"
               >
                 <Download className="w-4 h-4" />
                 <span>Tải Video MP4 Lồng Tiếng</span>
               </a>
               
               <button
-                onClick={() => {
-                  const srtText = originalSubs.map((seg, idx) => {
-                    const trans = translatedSubs[idx] || seg;
-                    const format = (s: number) => {
-                      const h = Math.floor(s / 3600);
-                      const m = Math.floor((s % 3600) / 60);
-                      const sec = Math.floor(s % 60);
-                      const ms = Math.floor((s % 1) * 1000);
-                      return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
-                    };
-                    return `${idx + 1}\n${format(seg.start)} --> ${format(seg.end)}\n${trans.text}\n`;
-                  }).join("\n");
-                  
-                  const blob = new Blob([srtText], { type: "text/plain;charset=utf-8" });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = `subtitles_${jobId}.srt`;
-                  document.body.appendChild(a);
-                  a.click();
-                  document.body.removeChild(a);
-                }}
+                type="button"
+                onClick={handleExportSrt}
                 className="px-4 py-2.5 bg-secondary hover:bg-secondary/80 text-foreground font-bold text-xs rounded-xl border border-border transition-colors flex items-center gap-2 cursor-pointer"
               >
                 <FileText className="w-4 h-4" />
@@ -4178,12 +4597,16 @@ export default function DubbingStudio({
       {/* --- YOUTUBE AUTHENTICATION MODAL --- */}
       {isAdmin && showCookieModal && (
         <div
-          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          className="fixed inset-0 z-[70] lg:pl-fluid-sidebar bg-black/55 backdrop-blur-sm flex items-center justify-center p-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="dubbing-auth-modal-title"
+          onClick={closeCookieModal}
         >
-          <div className="bg-card border border-border rounded-2xl max-w-lg w-full p-6 shadow-2xl flex flex-col gap-4 animate-in fade-in zoom-in-95 duration-200">
+          <div
+            className="bg-card border border-border rounded-2xl max-w-lg w-full max-h-[88vh] overflow-y-auto p-6 shadow-2xl flex flex-col gap-4 animate-in fade-in zoom-in-95 duration-200"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex items-center justify-between pb-3 border-b border-border">
               <div className="flex items-center gap-2.5">
                 <div className="p-2 bg-primary/10 text-primary rounded-xl">
@@ -4197,8 +4620,8 @@ export default function DubbingStudio({
               <button
                 type="button"
                 aria-label="Đóng hộp thoại"
-                onClick={() => { setShowCookieModal(false); setCookieMsg(null); }}
-                className="p-2 min-w-[36px] min-h-[36px] flex items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors cursor-pointer"
+                onClick={closeCookieModal}
+                className="p-2 min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -4253,7 +4676,7 @@ export default function DubbingStudio({
                 <Globe className="w-3.5 h-3.5" />
                 <span>Proxy Dân Cư (Khuyên Dùng)</span>
                 {proxyPool.length > 0 && (
-                  <span className={`px-1.5 py-0.2 text-[10px] font-bold rounded-full ${
+                  <span className={`px-1.5 py-0.5 text-[10px] font-bold rounded-full ${
                     activeModalTab === "proxy" ? "bg-white/20 text-white" : "bg-purple-500/20 text-purple-600 dark:text-purple-400"
                   }`}>
                     {proxyPool.length}
@@ -4672,8 +5095,8 @@ export default function DubbingStudio({
               </button>
               <button
                 type="button"
-                onClick={() => { setShowCookieModal(false); setCookieMsg(null); setYtDiagResult(null); }}
-                className="px-5 py-2 bg-secondary hover:bg-secondary/80 text-foreground font-bold text-xs rounded-xl border border-border transition-colors cursor-pointer"
+                onClick={closeCookieModal}
+                className="px-5 py-2.5 min-h-[44px] bg-secondary hover:bg-secondary/80 text-foreground font-bold text-xs rounded-xl border border-border transition-colors cursor-pointer"
               >
                 Đóng
               </button>

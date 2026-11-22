@@ -7,6 +7,7 @@ import json
 import re
 import socket
 import tempfile
+import threading
 import uuid
 import urllib.parse
 import requests
@@ -81,9 +82,50 @@ _YTDLP_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%(.*)")
 
 
 class VideoDubbingService:
+    _deleted_job_ids: set = set()
+    _cancelled_job_ids: set = set()
+    _media_opt_locks: dict = {}
+    _media_opt_guard = threading.Lock()
+
+    @classmethod
+    def mark_job_deleted(cls, job_id: str) -> None:
+        if job_id:
+            cls._deleted_job_ids.add(job_id)
+            cls._cancelled_job_ids.add(job_id)
+
+    @classmethod
+    def mark_job_cancelled(cls, job_id: str) -> None:
+        if job_id:
+            cls._cancelled_job_ids.add(job_id)
+
+    @classmethod
+    def clear_job_cancelled(cls, job_id: str) -> None:
+        if job_id:
+            cls._cancelled_job_ids.discard(job_id)
+
+    @classmethod
+    def is_job_deleted(cls, job_id: str) -> bool:
+        return bool(job_id and job_id in cls._deleted_job_ids)
+
+    @classmethod
+    def is_job_cancelled(cls, job_id: str) -> bool:
+        return bool(job_id and (job_id in cls._cancelled_job_ids or job_id in cls._deleted_job_ids))
+
+    @classmethod
+    def _get_media_lock(cls, file_path: str) -> threading.Lock:
+        norm = os.path.abspath(file_path)
+        with cls._media_opt_guard:
+            lk = cls._media_opt_locks.get(norm)
+            if lk is None:
+                lk = threading.Lock()
+                cls._media_opt_locks[norm] = lk
+            return lk
+
     @staticmethod
     def log_to_job(job_id: str, message: str):
         """Prints a detailed log message to server console and appends to process.log in job directory."""
+        if VideoDubbingService.is_job_deleted(job_id):
+            return
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         log_line = f"[{timestamp}] {message}"
         try:
@@ -95,6 +137,8 @@ class VideoDubbingService:
                 pass
 
         try:
+            if VideoDubbingService.is_job_deleted(job_id):
+                return
             job_dir = os.path.join(settings.dubbing_dir, job_id)
             os.makedirs(job_dir, exist_ok=True)
             log_file = os.path.join(job_dir, "process.log")
@@ -1010,40 +1054,47 @@ class VideoDubbingService:
             VideoDubbingService._write_web_ok_marker(file_path)
             return file_path
 
-        tmp_out = f"{file_path}.faststart_tmp.mp4"
-        try:
-            if is_h264 or not transcode_non_h264:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", file_path,
-                    "-c", "copy",
-                    "-movflags", "+faststart",
-                    tmp_out,
-                ]
-                timeout_sec = 90
-            else:
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-i", file_path,
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+faststart",
-                    tmp_out,
-                ]
-                timeout_sec = 300
+        with VideoDubbingService._get_media_lock(file_path):
+            if VideoDubbingService._has_valid_web_ok_marker(file_path):
+                return file_path
+            tmp_out = f"{file_path}.{uuid.uuid4().hex[:8]}.faststart_tmp.mp4"
+            try:
+                if is_h264 or not transcode_non_h264:
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", file_path,
+                        "-c", "copy",
+                        "-movflags", "+faststart",
+                        tmp_out,
+                    ]
+                    timeout_sec = 90
+                else:
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", file_path,
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        tmp_out,
+                    ]
+                    timeout_sec = 300
 
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-            if res.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 1024:
-                os.replace(tmp_out, file_path)
-                VideoDubbingService._write_web_ok_marker(file_path)
-        except Exception as e:
-            print(f"[VideoDubbingService] Faststart optimization skipped for {file_path}: {e}")
-        finally:
-            if os.path.exists(tmp_out):
-                try:
-                    os.remove(tmp_out)
-                except Exception:
-                    pass
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+                if res.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 1024:
+                    try:
+                        os.replace(tmp_out, file_path)
+                        VideoDubbingService._write_web_ok_marker(file_path)
+                    except PermissionError:
+                        # File is actively streamed on Windows; serve existing file cleanly without failing
+                        pass
+            except Exception as e:
+                print(f"[VideoDubbingService] Faststart optimization skipped for {file_path}: {e}")
+            finally:
+                if os.path.exists(tmp_out):
+                    try:
+                        os.remove(tmp_out)
+                    except Exception:
+                        pass
 
         return file_path
 
@@ -1060,37 +1111,38 @@ class VideoDubbingService:
 
         base, _ = os.path.splitext(wav_path)
         preview_m4a = f"{base}_preview.m4a"
-        try:
-            wav_mtime = os.path.getmtime(wav_path)
-            if (
-                os.path.exists(preview_m4a)
-                and os.path.getsize(preview_m4a) > 512
-                and os.path.getmtime(preview_m4a) >= wav_mtime
-            ):
-                return preview_m4a, "audio/mp4"
+        with VideoDubbingService._get_media_lock(preview_m4a):
+            try:
+                wav_mtime = os.path.getmtime(wav_path)
+                if (
+                    os.path.exists(preview_m4a)
+                    and os.path.getsize(preview_m4a) > 512
+                    and os.path.getmtime(preview_m4a) >= wav_mtime
+                ):
+                    return preview_m4a, "audio/mp4"
 
-            tmp_m4a = f"{preview_m4a}.tmp.m4a"
-            res = subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    "-i", wav_path,
-                    "-vn",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-movflags", "+faststart",
-                    tmp_m4a,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if res.returncode == 0 and os.path.exists(tmp_m4a) and os.path.getsize(tmp_m4a) > 512:
-                os.replace(tmp_m4a, preview_m4a)
-                return preview_m4a, "audio/mp4"
-            if os.path.exists(tmp_m4a):
-                os.remove(tmp_m4a)
-        except Exception as e:
-            print(f"[VideoDubbingService] Preview M4A transcode fallback for {wav_path}: {e}")
+                tmp_m4a = f"{preview_m4a}.{uuid.uuid4().hex[:8]}.tmp.m4a"
+                res = subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-i", wav_path,
+                        "-vn",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        tmp_m4a,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if res.returncode == 0 and os.path.exists(tmp_m4a) and os.path.getsize(tmp_m4a) > 512:
+                    os.replace(tmp_m4a, preview_m4a)
+                    return preview_m4a, "audio/mp4"
+                if os.path.exists(tmp_m4a):
+                    os.remove(tmp_m4a)
+            except Exception as e:
+                print(f"[VideoDubbingService] Preview M4A transcode fallback for {wav_path}: {e}")
 
         return wav_path, "audio/wav"
 
@@ -1946,21 +1998,24 @@ class VideoDubbingService:
         if not selected_profile:
             selected_profile = db.query(LLMProfile).filter(LLMProfile.is_active == True).first()
 
-        if selected_profile:
-            return {
-                "provider": selected_profile.provider,
-                "api_key": selected_profile.api_key or "",
-                "model": selected_profile.model,
-                "custom_endpoint": selected_profile.custom_endpoint or "",
-                "thinking_effort": selected_profile.thinking_effort or "none",
-                "profile_name": selected_profile.name,
-            }
-
         def get_setting(key: str, default: str) -> str:
             entry = db.query(SystemSetting).filter(SystemSetting.key == key).first()
             if entry and entry.value.strip():
                 return entry.value.strip()
             return default
+
+        if selected_profile:
+            resolved_key = (selected_profile.api_key or "").strip()
+            if not resolved_key and selected_profile.id == "llm_default_gemini":
+                resolved_key = get_setting("llm_api_key", settings.LLM_API_KEY)
+            return {
+                "provider": selected_profile.provider,
+                "api_key": resolved_key,
+                "model": selected_profile.model,
+                "custom_endpoint": selected_profile.custom_endpoint or "",
+                "thinking_effort": selected_profile.thinking_effort or "none",
+                "profile_name": selected_profile.name,
+            }
 
         return {
             "provider": get_setting("llm_provider", settings.LLM_PROVIDER),
@@ -3406,6 +3461,7 @@ class VideoDubbingService:
             and v_info["pix_fmt"] in ("yuv420p", "yuvj420p", "yuv420p10le", "")
         )
 
+        mux_tmp_path = f"{output_path}.{uuid.uuid4().hex[:8]}.mux_tmp.mp4"
         res_mux = None
         if has_video and can_copy_h264:
             copy_mux_cmd = [
@@ -3419,7 +3475,7 @@ class VideoDubbingService:
                 "-b:a", "192k",
                 "-movflags", "+faststart",
                 "-shortest",
-                output_path,
+                mux_tmp_path,
             ]
             res_mux = subprocess.run(copy_mux_cmd, capture_output=True, text=True)
 
@@ -3436,7 +3492,7 @@ class VideoDubbingService:
                     "-b:a", "192k",
                     "-movflags", "+faststart",
                     "-shortest",
-                    output_path,
+                    mux_tmp_path,
                 ]
             else:
                 # Fallback for audio-only / test dummy inputs
@@ -3451,30 +3507,44 @@ class VideoDubbingService:
                     "-b:a", "192k",
                     "-movflags", "+faststart",
                     "-shortest",
-                    output_path,
+                    mux_tmp_path,
                 ]
 
             res_mux = subprocess.run(mux_cmd, capture_output=True, text=True)
             if res_mux.returncode != 0:
                 if os.path.exists(temp_mixed_audio):
                     os.remove(temp_mixed_audio)
+                if os.path.exists(mux_tmp_path):
+                    os.remove(mux_tmp_path)
                 print(f"[FFmpeg Mux Error] {res_mux.stderr}")
                 raise RuntimeError(f"FFmpeg video remuxing failed: {res_mux.stderr[:300]}")
 
-        VideoDubbingService._write_web_ok_marker(output_path)
+        final_output_path = output_path
+        try:
+            os.replace(mux_tmp_path, output_path)
+        except PermissionError:
+            # Windows open file handle fallback: write beside locked file so remix never crashes with WinError 32
+            base_no_ext, ext = os.path.splitext(output_path)
+            alt_out = f"{base_no_ext}_{int(time.time())}{ext}"
+            os.replace(mux_tmp_path, alt_out)
+            final_output_path = alt_out
+
+        VideoDubbingService._write_web_ok_marker(final_output_path)
 
         # Clean up temporary mixed audio track
         if os.path.exists(temp_mixed_audio):
             os.remove(temp_mixed_audio)
+        return final_output_path
 
     @staticmethod
     def compile_srt(subtitles: List[Dict[str, Any]]) -> str:
         """Converts structured JSON subtitle segments into standard SRT format."""
         def format_time(seconds: float) -> str:
-            hrs = int(seconds // 3600)
-            mins = int((seconds % 3600) // 60)
-            secs = int(seconds % 60)
-            ms = int((seconds % 1) * 1000)
+            total_ms = max(0, int(round(float(seconds) * 1000)))
+            hrs = total_ms // 3_600_000
+            mins = (total_ms % 3_600_000) // 60_000
+            secs = (total_ms % 60_000) // 1000
+            ms = total_ms % 1000
             return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
 
         srt_lines = []

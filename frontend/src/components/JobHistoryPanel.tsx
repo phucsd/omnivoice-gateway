@@ -10,6 +10,7 @@ interface JobHistoryPanelProps {
   onPlayAudio: (url: string, title: string) => void;
   onTogglePlay: () => void;
   onOpenDubbingJob?: (dubJobId: string) => void;
+  onClosePlayerIfUrl?: (deletedUrl: string) => void;
 }
 
 export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
@@ -19,9 +20,10 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
   onPlayAudio,
   onTogglePlay,
   onOpenDubbingJob,
+  onClosePlayerIfUrl,
 }) => {
   const [jobs, setJobs] = useState<JobStatusResponse[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   
   // Pagination & Filter states
@@ -102,6 +104,10 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
         status_filter: selectedStatus,
         search: debouncedSearch
       });
+      if (res.total_pages > 0 && page > res.total_pages) {
+        setPage(res.total_pages);
+        return;
+      }
       setJobs(res.items || []);
       setTotalJobs(res.total || 0);
       setTotalPages(res.total_pages || 1);
@@ -117,8 +123,17 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
     const isConfirmed = window.confirm("Bạn có chắc chắn muốn xóa tác vụ này không? Hành động này không thể hoàn tác.");
     if (!isConfirmed) return;
 
+    const targetJob = jobs.find((j) => j.job_id === jobId);
     try {
       await api.deleteJob(jobId);
+      if (targetJob && onClosePlayerIfUrl) {
+        if (targetJob.cdn_audio_url) {
+          onClosePlayerIfUrl(targetJob.cdn_audio_url);
+        }
+        if (targetJob.audio_url) {
+          onClosePlayerIfUrl(`${api.getApiBaseUrl()}${targetJob.audio_url}`);
+        }
+      }
       await loadJobs();
     } catch (err: unknown) {
       console.error("Lỗi khi xóa tác vụ:", err);
@@ -129,6 +144,9 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
   useEffect(() => {
     let active = true;
     (async () => {
+      await Promise.resolve();
+      if (!active) return;
+      setLoading(true);
       try {
         const res = await api.listJobs({
           page,
@@ -138,6 +156,10 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
           search: debouncedSearch
         });
         if (!active) return;
+        if (res.total_pages > 0 && page > res.total_pages) {
+          setPage(res.total_pages);
+          return;
+        }
         setJobs(res.items || []);
         setTotalJobs(res.total || 0);
         setTotalPages(res.total_pages || 1);
@@ -154,6 +176,36 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
       active = false;
     };
   }, [refreshTrigger, page, pageSize, selectedCategory, selectedStatus, debouncedSearch]);
+
+  const hasActiveProcessingJobs = jobs.some(
+    (j) => !["completed", "failed", "cancelled", "awaiting_review", "uploaded"].includes(j.status)
+  );
+
+  useEffect(() => {
+    if (!hasActiveProcessingJobs) return;
+    let active = true;
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await api.listJobs({
+          page,
+          page_size: pageSize,
+          job_type: selectedCategory,
+          status_filter: selectedStatus,
+          search: debouncedSearch,
+        });
+        if (!active) return;
+        setJobs(res.items || []);
+        setTotalJobs(res.total || 0);
+        setTotalPages(res.total_pages || 1);
+      } catch {
+        // Ignore transient background refresh errors
+      }
+    }, 3000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [hasActiveProcessingJobs, page, pageSize, selectedCategory, selectedStatus, debouncedSearch]);
 
   useEffect(() => {
     if (!isSaveModalOpen) return;
@@ -396,7 +448,10 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
             const safeJobId = String(job.job_id || "unknown");
             const isCompleted = job.status === "completed";
             const isFailed = job.status === "failed";
-            const isProcessing = !isCompleted && !isFailed;
+            const isCancelled = job.status === "cancelled";
+            const isAwaitingReview = job.status === "awaiting_review";
+            const isUploaded = job.status === "uploaded";
+            const isProcessing = !isCompleted && !isFailed && !isCancelled && !isAwaitingReview && !isUploaded;
             const fullText = job.text || "";
             const isLongText = fullText.length > 120;
             const isExpanded = !!expandedJobs[safeJobId];
@@ -405,11 +460,15 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
               : fullText;
 
             const audioUrl = job.audio_url ? `${api.getApiBaseUrl()}${job.audio_url}` : "";
+            const playableAudioUrl = job.cdn_audio_url || audioUrl;
             const isDubbingItem =
               job.job_type === "video_dubbing" ||
               job.job_type === "separate_audio" ||
               job.job_type === "dub_segments" ||
-              safeJobId.startsWith("vd_");
+              safeJobId.startsWith("vd_") ||
+              safeJobId.startsWith("asr_vd_") ||
+              safeJobId.startsWith("sep_vd_") ||
+              safeJobId.startsWith("dub_vd_");
             const dubbingJobId = isDubbingItem
               ? String(
                   job.params?.dubbing_job_id ||
@@ -428,7 +487,7 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
                <div 
                  key={safeJobId} 
                  className={`bg-muted/30 border rounded-3xl p-5 flex flex-col gap-4 transition-all duration-300 shadow-sm ${
-                   currentPlayUrl && currentPlayUrl === audioUrl
+                   currentPlayUrl && playableAudioUrl && currentPlayUrl === playableAudioUrl
                      ? "border-primary bg-primary/[0.02] shadow-md shadow-primary/5"
                      : "border-border hover:border-border/40 hover:bg-muted/50"
                  }`}
@@ -471,6 +530,24 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
                         <span>Thất bại</span>
                       </span>
                     )}
+                    {isCancelled && (
+                      <span className="inline-flex items-center gap-1 text-[9px] font-bold px-2.5 py-0.5 bg-muted border border-border text-muted-foreground rounded-full select-none">
+                        <X className="w-3 h-3" />
+                        <span>Đã hủy</span>
+                      </span>
+                    )}
+                    {isAwaitingReview && (
+                      <span className="inline-flex items-center gap-1 text-[9px] font-bold px-2.5 py-0.5 bg-amber-500/10 border border-amber-500/25 text-amber-700 dark:text-amber-400 rounded-full select-none">
+                        <Clock className="w-3 h-3" />
+                        <span>Chờ duyệt phụ đề</span>
+                      </span>
+                    )}
+                    {isUploaded && (
+                      <span className="inline-flex items-center gap-1 text-[9px] font-bold px-2.5 py-0.5 bg-sky-500/10 border border-sky-500/25 text-sky-700 dark:text-sky-400 rounded-full select-none">
+                        <Film className="w-3 h-3" />
+                        <span>Đã tải video</span>
+                      </span>
+                    )}
                     {isProcessing && (
                       <span className="inline-flex items-center gap-1.5 text-[9px] font-bold px-2.5 py-0.5 bg-muted border border-border text-muted-foreground rounded-full animate-pulse select-none">
                         <RefreshCw className="w-3 h-3 animate-spin text-muted-foreground" />
@@ -481,7 +558,7 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
                       type="button"
                       onClick={() => handleDeleteJob(job.job_id)}
                       className="p-1 hover:bg-destructive/10 border border-transparent hover:border-destructive/20 text-muted-foreground hover:text-destructive rounded-lg transition-colors cursor-pointer"
-                      title={isProcessing ? "Hủy tác vụ khởi hàng chờ" : "Xóa tác vụ khỏi lịch sử"}
+                      title={isProcessing ? "Hủy tác vụ khỏi hàng chờ" : "Xóa tác vụ khỏi lịch sử"}
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
@@ -621,12 +698,13 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
 
                 {/* Inline Video Player for Video Dubbing items */}
                 {hasPlayableVideo && isVideoOpen && (
-                  <div className="aspect-video w-full max-w-xl rounded-2xl overflow-hidden bg-black border border-border shadow-md">
+                  <div className="aspect-video w-full max-w-xl rounded-2xl overflow-hidden bg-zinc-950 border border-border shadow-md">
                     <video
                       src={api.getDubbingFileUrl(dubbingJobId, hasOutputVideo ? "output" : "video")}
                       controls
                       playsInline
                       preload="metadata"
+                      onPlay={() => window.dispatchEvent(new CustomEvent("omnivoice:pause-global-audio"))}
                       className="w-full h-full object-contain"
                     />
                   </div>
@@ -711,13 +789,13 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
                         )}
                       </>
                     ) : (
-                      isCompleted && (
+                      isCompleted && job.job_type !== "asr" && (
                         <button
                           type="button"
                           onClick={() => handleOpenSaveModal(job.job_id, fullText)}
                           className="flex-grow py-2.5 px-4 bg-card/60 hover:bg-card border border-border text-foreground hover:text-foreground rounded-full font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm active:scale-[0.98]"
                         >
-                          <Heart className="w-3.5 h-3.5 fill-slate-450 text-muted-foreground" />
+                          <Heart className="w-3.5 h-3.5 fill-current text-muted-foreground" />
                           <span>Lưu giọng vào Thư viện</span>
                         </button>
                       )
@@ -796,11 +874,11 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
           role="dialog"
           aria-modal="true"
           aria-labelledby="save-voice-modal-title"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 lg:pl-64 bg-background/80 backdrop-blur-md animate-fadeIn"
+          className="fixed inset-0 z-[70] flex items-center justify-center p-4 lg:pl-fluid-sidebar bg-black/55 backdrop-blur-md animate-fadeIn"
           onClick={() => setIsSaveModalOpen(false)}
         >
           <div
-            className="bg-card border border-border rounded-[20px] p-6 w-full max-w-md flex flex-col gap-4.5 shadow-2xl relative"
+            className="bg-card border border-border rounded-[20px] p-6 w-full max-w-md max-h-[90vh] overflow-y-auto flex flex-col gap-4.5 shadow-2xl relative"
             onClick={(e) => e.stopPropagation()}
           >
             <button

@@ -44,12 +44,16 @@ def get_system_settings(db: Session = Depends(get_db), current_user: User = Depe
     timeout_seconds = settings.KAGGLE_TIMEOUT_SECONDS
     worker_dir = settings.KAGGLE_WORKER_DIR
 
-    # Load User Setting overrides from DB
+    # Load SystemSetting global overrides, then UserSetting per-user overrides
     def get_setting(key: str, default_val):
+        val = default_val
+        sys_entry = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+        if sys_entry and sys_entry.value.strip():
+            val = sys_entry.value.strip()
         entry = db.query(UserSetting).filter(UserSetting.user_id == current_user.id, UserSetting.key == key).first()
         if entry and entry.value.strip():
-            return entry.value.strip()
-        return default_val
+            val = entry.value.strip()
+        return val
 
     username = get_setting("kaggle_username", username)
     db_key = get_setting("kaggle_key", "")
@@ -71,6 +75,13 @@ def get_system_settings(db: Session = Depends(get_db), current_user: User = Depe
     ui_layout_entry = db.query(SystemSetting).filter(SystemSetting.key == "ui_layout").first()
     ui_layout = ui_layout_entry.value.strip() if ui_layout_entry and ui_layout_entry.value.strip() else "modern"
 
+    wm_entry = db.query(SystemSetting).filter(SystemSetting.key == "worker_mode").first()
+    effective_worker_mode = (
+        wm_entry.value.strip()
+        if (wm_entry and wm_entry.value.strip() in ("mock", "kaggle"))
+        else settings.WORKER_MODE
+    )
+
     return SettingsResponse(
         kaggle_username=username,
         kaggle_key_configured=key_configured,
@@ -80,7 +91,7 @@ def get_system_settings(db: Session = Depends(get_db), current_user: User = Depe
         kaggle_accelerator=accelerator,
         kaggle_timeout_seconds=timeout_seconds,
         kaggle_worker_dir=worker_dir,
-        worker_mode=settings.WORKER_MODE,
+        worker_mode=effective_worker_mode,
         ui_layout=ui_layout
     )
 

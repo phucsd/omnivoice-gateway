@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { Play, Pause, Loader2, Sparkles, Settings2, CheckCircle2, Mic, Sliders, Wand2 } from "lucide-react";
+import { Play, Pause, Loader2, Sparkles, Settings2, CheckCircle2, Mic, Sliders, Wand2, ChevronDown, ChevronUp } from "lucide-react";
 import { api, getErrorMessage } from "../api/client";
 import type { JobStatusResponse, VoiceSampleResponse } from "../api/client";
 
@@ -9,6 +9,7 @@ import { SectionCard } from "./ui/SectionCard";
 
 interface TTSPanelProps {
   activeVoiceSampleId: string | null;
+  onSelectVoiceSample?: (sampleId: string | null) => void;
   onJobCreatedOrUpdated?: () => void;
   layout?: "classic" | "modern";
   currentPlayUrl: string | null;
@@ -19,6 +20,7 @@ interface TTSPanelProps {
 
 export const TTSPanel: React.FC<TTSPanelProps> = ({
   activeVoiceSampleId,
+  onSelectVoiceSample,
   onJobCreatedOrUpdated,
   currentPlayUrl,
   globalPlayerPlaying,
@@ -122,15 +124,23 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
   }, []);
 
   useEffect(() => {
-    if (!activeVoiceSampleId) return;
     let active = true;
     Promise.resolve().then(async () => {
       if (!active) return;
+      if (!activeVoiceSampleId) {
+        setCustomVoiceSampleId("");
+        setRefText("");
+        return;
+      }
       setCustomVoiceSampleId(activeVoiceSampleId);
       setMode("clone_voice");
       try {
         const samples = await api.listVoiceSamples();
-        if (active) setVoiceSamples(samples);
+        if (active) {
+          setVoiceSamples(samples);
+          const matched = samples.find(s => s.id === activeVoiceSampleId);
+          setRefText(matched?.ref_text || "");
+        }
       } catch (err) {
         console.error("Lỗi cập nhật danh sách mẫu giọng:", err);
       }
@@ -141,7 +151,11 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
   }, [activeVoiceSampleId]);
 
   const handleGenerate = useCallback(async () => {
-    if (!text.trim()) return;
+    if (!text.trim() || loading || isPolling) return;
+    if (text.length > 5000) {
+      setErrorMsg("Văn bản vượt quá giới hạn 5.000 ký tự. Vui lòng rút gọn nội dung.");
+      return;
+    }
     setLoading(true);
     setJobId(null);
     setJobStatus(null);
@@ -216,6 +230,8 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
     normalizeText,
     speed,
     numStep,
+    loading,
+    isPolling,
   ]);
 
   const handleGenerateRef = useRef(handleGenerate);
@@ -248,7 +264,12 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
         }
       } catch (err) {
         console.error("Lỗi khôi phục TTS job status:", err);
-        if (active) setLoading(false);
+        if (active) {
+          setJobId(null);
+          setJobStatus(null);
+          localStorage.removeItem("VITE_TTS_JOB_ID");
+          setLoading(false);
+        }
       }
     })();
     return () => {
@@ -364,9 +385,11 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
                       id="tts-voice-select"
                       value={customVoiceSampleId}
                       onChange={(e) => {
-                        setCustomVoiceSampleId(e.target.value);
-                        const found = voiceSamples.find(s => s.id === e.target.value);
-                        if (found && found.ref_text) setRefText(found.ref_text);
+                        const val = e.target.value;
+                        setCustomVoiceSampleId(val);
+                        onSelectVoiceSample?.(val || null);
+                        const found = voiceSamples.find(s => s.id === val);
+                        setRefText(found?.ref_text || "");
                       }}
                       className="bg-secondary/50 border border-border/70 hover:border-border rounded-xl px-4 min-h-[48px] text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 w-full"
                     >
@@ -438,11 +461,12 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
               id="tts-text-input"
               ref={textareaRef}
               value={text}
+              maxLength={5000}
               onChange={(e) => setText(e.target.value)}
               placeholder="Nhập nội dung cần đọc..."
               className="w-full bg-secondary/30 rounded-xl p-4 min-h-[200px] border border-border/60 focus:border-primary/50 focus:outline-none resize-y"
             />
-            <div className="text-xs text-muted-foreground mt-2 text-right">
+            <div className={`text-xs mt-2 text-right font-mono ${text.length >= 5000 ? "text-destructive font-bold" : "text-muted-foreground"}`}>
               {text.length} / 5000 ký tự
             </div>
           </SectionCard>
@@ -457,23 +481,28 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
                 progress={jobStatus.progress}
                 errorMessage={jobStatus.error_message}
               />
-              {jobStatus.status === "completed" && jobStatus.audio_url && (
-                <div className="mt-4 flex gap-3">
+              {jobStatus.status === "completed" && (jobStatus.cdn_audio_url || jobStatus.audio_url) && (
+                <div className="mt-4 flex flex-wrap gap-3">
                   <button
+                    type="button"
                     onClick={() => {
-                      const url = `${api.getApiBaseUrl()}${jobStatus.audio_url}`;
+                      const url = jobStatus.cdn_audio_url || `${api.getApiBaseUrl()}${jobStatus.audio_url}`;
                       if (currentPlayUrl === url) onTogglePlay();
                       else onPlayAudio(url, "TTS Output");
                     }}
-                    className="flex-1 bg-primary text-primary-foreground hover:bg-primary-hover h-10 rounded-xl flex items-center justify-center gap-2 text-sm font-semibold transition-colors"
+                    className="flex-1 min-h-[44px] bg-primary text-primary-foreground hover:bg-primary-hover px-4 rounded-xl flex items-center justify-center gap-2 text-sm font-semibold transition-colors cursor-pointer"
                   >
-                    {currentPlayUrl === `${api.getApiBaseUrl()}${jobStatus.audio_url}` && globalPlayerPlaying ? (
+                    {currentPlayUrl === (jobStatus.cdn_audio_url || `${api.getApiBaseUrl()}${jobStatus.audio_url}`) && globalPlayerPlaying ? (
                       <><Pause className="w-4 h-4" /> Tạm dừng</>
                     ) : (
                       <><Play className="w-4 h-4" /> Nghe thử</>
                     )}
                   </button>
-                  <button onClick={handleClearJob} className="px-4 bg-secondary text-foreground hover:bg-secondary/80 h-10 rounded-xl text-sm font-semibold">
+                  <button
+                    type="button"
+                    onClick={handleClearJob}
+                    className="min-h-[44px] px-4 bg-secondary text-foreground hover:bg-secondary/80 rounded-xl text-sm font-semibold cursor-pointer"
+                  >
                     Xóa kết quả
                   </button>
                 </div>
@@ -487,15 +516,15 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
            <button
               type="button"
               onClick={handleGenerate}
-              disabled={loading || !text.trim() || (mode === "clone_voice" && !customVoiceSampleId)}
+              disabled={loading || isPolling || !text.trim() || text.length > 5000 || (mode === "clone_voice" && !customVoiceSampleId)}
               className={`w-full min-h-[52px] rounded-xl font-bold text-base transition-colors flex items-center justify-center gap-2 cursor-pointer active:translate-y-[1px] ${
-                !loading && text.trim() && (mode !== "clone_voice" || customVoiceSampleId)
+                !loading && !isPolling && text.trim() && text.length <= 5000 && (mode !== "clone_voice" || customVoiceSampleId)
                   ? "bg-primary text-primary-foreground hover:bg-primary-hover"
                   : "bg-secondary text-muted-foreground cursor-not-allowed"
               }`}
             >
-              {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5 fill-current" />}
-              <span>{loading ? "Đang xử lý..." : "Tạo Audio"}</span>
+              {loading || isPolling ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5 fill-current" />}
+              <span>{loading || isPolling ? "Đang xử lý..." : "Tạo Audio"}</span>
             </button>
 
             {errorMsg && (
@@ -525,11 +554,15 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
 
               <div>
                 <button
+                  type="button"
                   onClick={() => setShowAdvanced(!showAdvanced)}
-                  className="flex items-center gap-2 text-xs font-bold text-muted-foreground uppercase hover:text-foreground w-full text-left"
+                  className="min-h-[40px] flex items-center justify-between gap-2 text-xs font-bold text-muted-foreground uppercase hover:text-foreground w-full text-left cursor-pointer"
                 >
-                  <Settings2 className="w-4 h-4" />
-                  Tham số kỹ thuật (Advanced) {showAdvanced ? "▲" : "▼"}
+                  <span className="flex items-center gap-2">
+                    <Settings2 className="w-4 h-4" />
+                    <span>Tham số kỹ thuật (Advanced)</span>
+                  </span>
+                  {showAdvanced ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                 </button>
 
                 {showAdvanced && (

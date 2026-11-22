@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { KeyRound, Copy, Trash2, Eye, EyeOff, Check, RefreshCw, ShieldCheck, X, BookOpen } from "lucide-react";
+import { KeyRound, Copy, Trash2, Eye, EyeOff, Check, RefreshCw, ShieldCheck, X, BookOpen, Plus, AlertCircle } from "lucide-react";
 import { api, getErrorMessage, type ApiKeyResponse } from "../api/client";
 
 interface ApiKeyPanelProps {
@@ -12,16 +12,18 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
   const [apiKeys, setApiKeys] = useState<ApiKeyResponse[]>([]);
   const [loading, setLoading] = useState(false);
   const [creatingKey, setCreatingKey] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
   const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
 
   const fetchApiKeys = useCallback(async () => {
     setLoading(true);
+    setErrorMsg(null);
     try {
       const res = await api.getUserApiKeys();
       setApiKeys(res);
-    } catch (err) {
-      console.error("Lỗi lấy danh sách API Keys:", err);
+    } catch (err: unknown) {
+      setErrorMsg(getErrorMessage(err, "Không thể tải danh sách API Keys."));
     } finally {
       setLoading(false);
     }
@@ -31,11 +33,15 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
     if (!isOpen) return;
     let active = true;
     (async () => {
+      await Promise.resolve();
+      if (!active) return;
+      setLoading(true);
+      setErrorMsg(null);
       try {
         const res = await api.getUserApiKeys();
         if (active) setApiKeys(res);
-      } catch (err) {
-        console.error("Lỗi lấy danh sách API Keys:", err);
+      } catch (err: unknown) {
+        if (active) setErrorMsg(getErrorMessage(err, "Không thể tải danh sách API Keys."));
       } finally {
         if (active) setLoading(false);
       }
@@ -56,6 +62,7 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
 
   const handleCreateApiKey = async () => {
     setCreatingKey(true);
+    setErrorMsg(null);
     try {
       const now = new Date();
       const formattedDate = `${String(now.getDate()).padStart(2, "0")}/${String(now.getMonth() + 1).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
@@ -65,7 +72,7 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
       setVisibleKeys((prev) => ({ ...prev, [newKey.id]: true }));
       await fetchApiKeys();
     } catch (err: unknown) {
-      alert("Lỗi tạo API Key: " + getErrorMessage(err));
+      setErrorMsg(`Lỗi tạo API Key: ${getErrorMessage(err)}`);
     } finally {
       setCreatingKey(false);
     }
@@ -73,11 +80,12 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
 
   const handleDeleteApiKey = async (keyId: string) => {
     if (!window.confirm("Bạn có chắc chắn muốn xóa API Key này không? Mọi tích hợp bên ngoài dùng key này sẽ ngừng hoạt động.")) return;
+    setErrorMsg(null);
     try {
       await api.deleteUserApiKey(keyId);
       await fetchApiKeys();
     } catch (err: unknown) {
-      alert("Lỗi xóa API Key: " + getErrorMessage(err));
+      setErrorMsg(`Lỗi xóa API Key: ${getErrorMessage(err)}`);
     }
   };
 
@@ -87,8 +95,6 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
     setTimeout(() => setCopiedKeyId(null), 2000);
   };
 
-
-
   if (!isOpen) return null;
 
   return (
@@ -96,7 +102,7 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
       role="dialog"
       aria-modal="true"
       aria-labelledby="api-key-modal-title"
-      className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+      className="fixed inset-0 bg-black/55 backdrop-blur-sm flex items-center justify-center z-[70] p-4 lg:pl-fluid-sidebar animate-fadeIn"
       onClick={onClose}
     >
       <div
@@ -126,6 +132,13 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
         </div>
 
         {/* API Keys Table & Generation Card */}
+        {errorMsg && (
+          <div className="p-3 bg-destructive/10 border border-destructive/20 text-destructive text-xs font-semibold rounded-xl flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span>{errorMsg}</span>
+          </div>
+        )}
+
         <div className="bg-background border border-border rounded-xl p-4 flex flex-col gap-3.5 shadow-inner">
           <div className="flex items-center justify-between gap-4">
             <div className="flex items-center gap-2 text-primary">
@@ -138,7 +151,7 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
               disabled={creatingKey}
               className="min-h-[44px] bg-primary hover:bg-primary-hover text-primary-foreground font-bold text-xs px-4 py-2 rounded-xl cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-1.5"
             >
-              <PlusIcon className="w-3.5 h-3.5" />
+              <Plus className="w-3.5 h-3.5" />
               <span>{creatingKey ? "Đang sinh khóa..." : "Tạo API Key mới"}</span>
             </button>
           </div>
@@ -246,20 +259,3 @@ export const ApiKeyPanel: React.FC<ApiKeyPanelProps> = ({ isOpen, onClose, onNav
     </div>
   );
 };
-
-const PlusIcon = ({ className }: { className?: string }) => (
-  <svg
-    className={className}
-    fill="none"
-    stroke="currentColor"
-    viewBox="0 0 24 24"
-    xmlns="http://www.w3.org/2050/svg"
-  >
-    <path
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      strokeWidth="2"
-      d="M12 4v16m8-8H4"
-    ></path>
-  </svg>
-);

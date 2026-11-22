@@ -41,7 +41,11 @@ def create_voice_design_preview(
             preprocess_prompt=payload.preprocess_prompt,
             postprocess_output=payload.postprocess_output,
             audio_chunk_duration=payload.audio_chunk_duration,
-            audio_chunk_threshold=payload.audio_chunk_threshold
+            audio_chunk_threshold=payload.audio_chunk_threshold,
+            language=payload.language,
+            pad_duration=payload.pad_duration,
+            fade_duration=payload.fade_duration,
+            normalize_text=payload.normalize_text if payload.normalize_text is not None else True,
         )
         return VoiceDesignPreviewResponse(
             preview_id=preview.id,
@@ -59,7 +63,10 @@ def create_voice_design_preview(
 def get_preview_info(preview_id: str, response: Response, db: Session = Depends(get_db), current_user: User = Depends(get_user_or_api_key)):
     """Fetches details and current processing state of a voice design preview."""
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    preview = db.query(VoiceDesignPreview).filter(VoiceDesignPreview.id == preview_id, VoiceDesignPreview.user_id == current_user.id).first()
+    q = db.query(VoiceDesignPreview).filter(VoiceDesignPreview.id == preview_id)
+    if not current_user.is_admin:
+        q = q.filter(VoiceDesignPreview.user_id == current_user.id)
+    preview = q.first()
     if not preview:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -68,10 +75,12 @@ def get_preview_info(preview_id: str, response: Response, db: Session = Depends(
     return preview
 
 @router.get("/{preview_id}/audio")
-def get_preview_audio(preview_id: str, response: Response, db: Session = Depends(get_db), current_user: User = Depends(get_user_or_api_key)):
+def get_preview_audio(preview_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_user_or_api_key)):
     """Serves the generated WAV preview audio file using FileResponse."""
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    preview = db.query(VoiceDesignPreview).filter(VoiceDesignPreview.id == preview_id, VoiceDesignPreview.user_id == current_user.id).first()
+    q = db.query(VoiceDesignPreview).filter(VoiceDesignPreview.id == preview_id)
+    if not current_user.is_admin:
+        q = q.filter(VoiceDesignPreview.user_id == current_user.id)
+    preview = q.first()
     if not preview:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -94,7 +103,8 @@ def get_preview_audio(preview_id: str, response: Response, db: Session = Depends
         preview.preview_audio_path,
         media_type="audio/wav",
         filename=f"preview_{preview_id}.wav",
-        content_disposition_type="inline"
+        content_disposition_type="inline",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
 
 @router.post("/{preview_id}/accept", response_model=AcceptPreviewResponse)

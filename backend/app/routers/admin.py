@@ -35,7 +35,7 @@ def _mask_secret(value: Optional[str]) -> str:
 
 
 def _is_masked_secret(value: Optional[str]) -> bool:
-    return bool(value and "••••" in value)
+    return bool(value and "••" in value)
 
 
 def _serialize_llm_profile(profile: LLMProfile) -> LLMProfileResponse:
@@ -108,15 +108,8 @@ def debug_db(db: Session = Depends(get_db), current_user: User = Depends(get_adm
 @router.post("/restore-corrupt-db")
 def restore_corrupt_db(db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
     import os, glob, shutil, sqlite3
-    db_path = settings.DATABASE_URL
-    if db_path.startswith("sqlite:///"):
-        db_path = db_path[10:]
-    elif db_path.startswith("sqlite://"):
-        db_path = db_path[9:]
-    elif db_path.startswith("sqlite:"):
-        db_path = db_path[7:]
-    if "?" in db_path:
-        db_path = db_path.split("?")[0]
+    from app.database import get_sqlite_path
+    db_path = get_sqlite_path(settings.DATABASE_URL)
         
     db_dir = os.path.dirname(db_path) or "."
     base_name = os.path.basename(db_path)
@@ -256,15 +249,8 @@ def align_all_data_to_admin(db: Session = Depends(get_db), current_user: User = 
 @router.post("/run-sqlite-recover")
 def run_sqlite_recover(db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
     import os, glob, subprocess, sqlite3
-    db_path = settings.DATABASE_URL
-    if db_path.startswith("sqlite:///"):
-        db_path = db_path[10:]
-    elif db_path.startswith("sqlite://"):
-        db_path = db_path[9:]
-    elif db_path.startswith("sqlite:"):
-        db_path = db_path[7:]
-    if "?" in db_path:
-        db_path = db_path.split("?")[0]
+    from app.database import get_sqlite_path
+    db_path = get_sqlite_path(settings.DATABASE_URL)
         
     db_dir = os.path.dirname(db_path) or "."
     base_name = os.path.basename(db_path)
@@ -530,7 +516,16 @@ def delete_user(
         
     if user.id == admin.id:
         raise HTTPException(status_code=400, detail="Bạn không thể tự xóa tài khoản của chính mình.")
-        
+
+    # Clean up owned credentials, settings, and jobs so orphaned rows cannot survive in SQLite
+    from app.models import UserSetting, VoiceSample, VideoDubbingJob, VoiceDesignPreview
+    db.query(ApiKey).filter(ApiKey.user_id == user.id).delete(synchronize_session=False)
+    db.query(UserSetting).filter(UserSetting.user_id == user.id).delete(synchronize_session=False)
+    db.query(VoiceSample).filter(VoiceSample.user_id == user.id, VoiceSample.is_public == False).delete(synchronize_session=False)
+    db.query(VoiceDesignPreview).filter(VoiceDesignPreview.user_id == user.id).delete(synchronize_session=False)
+    db.query(TTSJob).filter(TTSJob.user_id == user.id).delete(synchronize_session=False)
+    db.query(VideoDubbingJob).filter(VideoDubbingJob.user_id == user.id).delete(synchronize_session=False)
+
     db.delete(user)
     db.commit()
     return {"status": "success", "message": "Xóa người dùng thành công."}
@@ -697,6 +692,16 @@ def update_system_settings_admin(
             if payload.worker_mode not in ["mock", "kaggle"]:
                 raise HTTPException(status_code=400, detail="worker_mode phải là 'mock' hoặc 'kaggle'.")
             save_setting("worker_mode", payload.worker_mode)
+            if settings.APP_ENV != "testing":
+                settings.WORKER_MODE = payload.worker_mode
+                from app.services.mock_worker import MockWorker
+                from app.services.kaggle_orchestrator import KaggleOrchestrator
+                if payload.worker_mode == "mock":
+                    KaggleOrchestrator.stop_queue_runner()
+                    MockWorker.start()
+                else:
+                    MockWorker.stop()
+                    KaggleOrchestrator.start_queue_runner()
             
         if payload.ui_layout is not None:
             if payload.ui_layout not in ["classic", "modern"]:
@@ -772,6 +777,7 @@ class ScanModelsRequest(BaseModel):
     provider: Optional[str] = "gemini"
     api_key: Optional[str] = None
     custom_endpoint: Optional[str] = None
+    profile_id: Optional[str] = None
 
 @router.post("/llm/scan-models", response_model=dict)
 def scan_llm_models_admin(
@@ -786,9 +792,13 @@ def scan_llm_models_admin(
         entry = db.query(SystemSetting).filter(SystemSetting.key == key).first()
         return entry.value if entry else default
 
-    raw_api_key = None if _is_masked_secret(payload.api_key) else payload.api_key
-    api_key = raw_api_key or get_setting("llm_api_key", settings.LLM_API_KEY)
-    custom_endpoint = payload.custom_endpoint or get_setting("llm_custom_endpoint", settings.LLM_CUSTOM_ENDPOINT)
+    saved_profile = None
+    if payload.profile_id:
+        saved_profile = db.query(LLMProfile).filter(LLMProfile.id == payload.profile_id).first()
+
+    raw_api_key = None if _is_masked_secret(payload.api_key) else (payload.api_key or "").strip() or None
+    api_key = raw_api_key or (saved_profile.api_key if saved_profile and saved_profile.api_key else None) or get_setting("llm_api_key", settings.LLM_API_KEY)
+    custom_endpoint = payload.custom_endpoint or (saved_profile.custom_endpoint if saved_profile and saved_profile.custom_endpoint else None) or get_setting("llm_custom_endpoint", settings.LLM_CUSTOM_ENDPOINT)
 
     import requests
     models_found = []
@@ -843,11 +853,23 @@ def get_stats(
     total_users = db.query(User).count()
     verified_users = db.query(User).filter(User.is_verified == True).count()
     
-    active_jobs = db.query(TTSJob).filter(
-        TTSJob.status.in_(["queued", "starting_worker", "booting_kaggle", "queued_kaggle", "running", "preparing_input", "generating_audio", "exporting_wav"])
+    from app.models import VideoDubbingJob
+    active_tts = db.query(TTSJob).filter(
+        TTSJob.status.in_([
+            "queued", "starting_worker", "booting_kaggle", "queued_kaggle",
+            "running", "preparing_input", "loading_model", "generating_audio",
+            "separating_audio", "transcribing", "generating_tts", "mixing_audio", "exporting_wav",
+        ])
     ).count()
-    completed_jobs = db.query(TTSJob).filter(TTSJob.status == "completed").count()
-    failed_jobs = db.query(TTSJob).filter(TTSJob.status == "failed").count()
+    active_dub = db.query(VideoDubbingJob).filter(
+        VideoDubbingJob.status.in_([
+            "queued", "downloading", "separating_audio", "transcribing",
+            "translating", "generating_tts", "mixing_audio", "muxing_video",
+        ])
+    ).count()
+    active_jobs = active_tts + active_dub
+    completed_jobs = db.query(TTSJob).filter(TTSJob.status == "completed").count() + db.query(VideoDubbingJob).filter(VideoDubbingJob.status == "completed").count()
+    failed_jobs = db.query(TTSJob).filter(TTSJob.status == "failed").count() + db.query(VideoDubbingJob).filter(VideoDubbingJob.status == "failed").count()
     
     total_api_calls = db.query(ApiUsageLog).count()
     
@@ -935,11 +957,12 @@ def create_llm_profile(
     count = db.query(LLMProfile).count()
     is_act = payload.is_active or (count == 0)
 
+    clean_key = "" if _is_masked_secret(payload.api_key) else (payload.api_key or "")
     profile = LLMProfile(
         id=generate_id("llm"),
         name=payload.name,
         provider=payload.provider,
-        api_key=payload.api_key or "",
+        api_key=clean_key,
         model=payload.model,
         custom_endpoint=custom_ep,
         thinking_effort=payload.thinking_effort or "none",

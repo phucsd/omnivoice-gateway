@@ -56,6 +56,7 @@ export const ASRPanel: React.FC = () => {
   const [copied, setCopied] = useState(false);
   const [showSpeedMenu, setShowSpeedMenu] = useState(false);
 
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const pollIntervalRef = useRef<number | null>(null);
   const timeoutRef = useRef<number | null>(null);
   const playWordRangeRef = useRef<{ start: number, end: number } | null>(null);
@@ -64,7 +65,11 @@ export const ASRPanel: React.FC = () => {
 
   const handleASRSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!asrFile) return;
+    if (!asrFile || loading || isPolling) return;
+    if (asrFile.size > 25 * 1024 * 1024) {
+      setErrorMsg("Kích thước tệp âm thanh vượt quá giới hạn 25MB.");
+      return;
+    }
 
     setLoading(true);
     setJobId(null);
@@ -98,6 +103,9 @@ export const ASRPanel: React.FC = () => {
     setJobId(null);
     setJobStatus(null);
     setAsrFile(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
     localStorage.removeItem("VITE_ASR_PANEL_JOB_ID");
   };
 
@@ -118,6 +126,9 @@ export const ASRPanel: React.FC = () => {
       .catch((err: unknown) => {
         if (cancelled) return;
         console.error("Lỗi khôi phục ASR Panel job status:", err);
+        setJobId(null);
+        setJobStatus(null);
+        localStorage.removeItem("VITE_ASR_PANEL_JOB_ID");
         setLoading(false);
       });
 
@@ -329,6 +340,7 @@ export const ASRPanel: React.FC = () => {
     if (!audio) return;
 
     const handlePlay = () => {
+      window.dispatchEvent(new CustomEvent("omnivoice:pause-global-audio"));
       setIsPlaying(true);
       startPreciseTracking();
     };
@@ -399,10 +411,13 @@ export const ASRPanel: React.FC = () => {
     const audio = audioRef.current;
     if (!audio) return;
     
-    isSeekingWordRef.current = true;
+    const needsSeek = Math.abs(audio.currentTime - start) > 0.02;
+    isSeekingWordRef.current = needsSeek;
     playWordRangeRef.current = { start, end };
     
-    audio.currentTime = start;
+    if (needsSeek) {
+      audio.currentTime = start;
+    }
     setCurrentTime(start);
     audio.play().catch(err => console.error(err));
   };
@@ -476,11 +491,19 @@ export const ASRPanel: React.FC = () => {
                 <label className="text-fluid-xs font-bold text-muted-foreground uppercase tracking-wider">Tệp âm thanh cần nhận dạng</label>
                 <div className="border-2 border-dashed border-border/85 hover:border-primary/50 transition-all rounded-2xl p-8 flex flex-col items-center justify-center text-center gap-3 bg-secondary/10 hover:bg-secondary/20 relative cursor-pointer min-h-[160px]">
                   <input
+                    ref={fileInputRef}
                     type="file"
                     accept="audio/*"
                     onChange={(e) => {
                       if (e.target.files && e.target.files.length > 0) {
-                        setAsrFile(e.target.files[0]);
+                        const f = e.target.files[0];
+                        if (f.size > 25 * 1024 * 1024) {
+                          setErrorMsg("Kích thước tệp vượt quá giới hạn 25MB.");
+                          e.target.value = "";
+                          return;
+                        }
+                        setErrorMsg(null);
+                        setAsrFile(f);
                       }
                     }}
                     className="absolute inset-0 opacity-0 cursor-pointer w-full h-full"
@@ -491,7 +514,7 @@ export const ASRPanel: React.FC = () => {
                       {asrFile ? asrFile.name : "Kéo thả hoặc click để chọn tệp âm thanh"}
                     </span>
                     <span className="text-[10px] text-muted-foreground font-semibold">
-                      Hỗ trợ WAV, MP3, M4A, FLAC (Lên đến 15MB)
+                      Hỗ trợ WAV, MP3, M4A, FLAC (Lên đến 25MB)
                     </span>
                   </div>
                 </div>
@@ -506,14 +529,14 @@ export const ASRPanel: React.FC = () => {
 
               <button
                 type="submit"
-                disabled={loading || !asrFile}
-                className={`w-full h-11 rounded-xl font-bold text-fluid-sm transition-all duration-150 active:scale-[0.99] flex items-center justify-center gap-2 cursor-pointer shadow-md ${
-                  loading || !asrFile
+                disabled={loading || isPolling || !asrFile}
+                className={`w-full min-h-[44px] rounded-xl font-bold text-fluid-sm transition-colors active:translate-y-[1px] flex items-center justify-center gap-2 cursor-pointer ${
+                  loading || isPolling || !asrFile
                     ? "bg-muted text-muted-foreground border border-border cursor-not-allowed"
-                    : "bg-gradient-to-r from-primary via-indigo-600 to-accent text-white hover:brightness-105 hover:shadow-lg border-none"
+                    : "bg-primary hover:bg-primary-hover text-primary-foreground"
                 }`}
               >
-                {loading ? (
+                {loading || isPolling ? (
                   <>
                     <Loader2 className="w-4.5 h-4.5 animate-spin" />
                     <span>Đang nhận dạng giọng nói...</span>
@@ -834,25 +857,28 @@ export const ASRPanel: React.FC = () => {
                       <span>Tốc độ: {playbackRate.toFixed(2)}x</span>
                     </button>
                     {showSpeedMenu && (
-                      <div className="absolute bottom-full right-0 mb-1 bg-card border border-border shadow-xl rounded-xl py-1.5 min-w-[90px] z-50 flex flex-col">
-                        {[0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((r) => (
-                          <button
-                            key={r}
-                            type="button"
-                            onClick={() => {
-                              setPlaybackRate(r);
-                              setShowSpeedMenu(false);
-                            }}
-                            className={`w-full text-left px-3.5 py-1.5 text-xs font-semibold cursor-pointer ${
-                              playbackRate === r 
-                                ? "bg-primary/10 text-primary font-bold" 
-                                : "text-foreground hover:bg-secondary/80"
-                            }`}
-                          >
-                            {r.toFixed(2)}x
-                          </button>
-                        ))}
-                      </div>
+                      <>
+                        <div className="fixed inset-0 z-40" onClick={() => setShowSpeedMenu(false)} />
+                        <div className="absolute bottom-full right-0 mb-1 bg-card border border-border shadow-xl rounded-xl py-1.5 min-w-[90px] z-50 flex flex-col">
+                          {[0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map((r) => (
+                            <button
+                              key={r}
+                              type="button"
+                              onClick={() => {
+                                setPlaybackRate(r);
+                                setShowSpeedMenu(false);
+                              }}
+                              className={`w-full text-left px-3.5 py-2 text-xs font-semibold cursor-pointer ${
+                                playbackRate === r 
+                                  ? "bg-primary/10 text-primary font-bold" 
+                                  : "text-foreground hover:bg-secondary/80"
+                              }`}
+                            >
+                              {r.toFixed(2)}x
+                            </button>
+                          ))}
+                        </div>
+                      </>
                     )}
                   </div>
                 </div>

@@ -93,6 +93,10 @@ class VoiceDesignPreviewCreate(BaseModel):
     postprocess_output: Optional[bool] = True
     audio_chunk_duration: Optional[float] = 15.0
     audio_chunk_threshold: Optional[float] = 30.0
+    language: Optional[str] = None
+    pad_duration: Optional[float] = None
+    fade_duration: Optional[float] = None
+    normalize_text: Optional[bool] = True
 
 class VoiceDesignPreviewResponse(BaseModel):
     preview_id: str

@@ -57,7 +57,7 @@ The TTS pipeline operates asynchronously. You create a job, poll its status, and
 | `language` | string | Optional | - | Target language code (e.g. `vi`, `en`, `zh`, `ja`, `ko`, `fr`, `de`, `es`). |
 | `pad_duration` | float | Optional | - | Additional silence padding duration (seconds). |
 | `fade_duration` | float | Optional | - | Smooth fade in/out duration (seconds). |
-| `normalize_text` | boolean | Optional | `false` | Automatically normalize numbers, dates, abbreviations, and currencies into words (English/Chinese). |
+| `normalize_text` | boolean | Optional | `true` | Automatically normalize numbers, dates, abbreviations, and currencies into natural spoken words. |
 
 #### Response (200 OK)
 ```json
@@ -146,7 +146,7 @@ Correct spelling overrides when terms, abbreviations, or names are mispronounced
   * `"打[ZHE2]出售"` (forces folding tone 2 for 折).
 
 ### 5.3 Text Normalization (Đọc chuẩn số & ký tự)
-Khi `normalize_text` được đặt thành `true` (mặc định: `false`, tối ưu cho Tiếng Anh & Tiếng Trung), engine tự động chuyển hóa:
+Khi `normalize_text` được đặt thành `true` (mặc định: `true`), engine tự động chuyển hóa:
 * Các con số và số thứ tự: `123` -> `"một trăm hai mươi ba"`.
 * Ngày tháng, năm: `20/11/2024` -> `"ngày hai mươi tháng mười một năm hai nghìn không trăm hai mươi tư"`.
 * Tiền tệ và đơn vị: `50.000đ`, `$100` -> `"năm mươi nghìn đồng"`, `"một trăm đô la"`.
@@ -197,12 +197,13 @@ Returns a list matching ElevenLabs JSON schema containing combined public and pr
 ### 7.2 Get Voice Audio Preview
 * **Method**: `GET`
 * **Path**: `/v1/voices/{voice_id}/previews`
-* **Query Parameter**: `?token=YOUR_API_KEY` (Optional, required only for private voice samples).
+* **Authentication**: Optional for public voices; for private voices pass `Authorization: Bearer YOUR_API_KEY` or `xi-api-key: YOUR_API_KEY` (and create a Blob URL in browsers rather than exposing API keys in query strings).
 
-Can be directly embedded in standard HTML `<audio>` elements:
-```html
-<audio src="https://omnivoice-gateway.pages.dev/v1/voices/YOUR_VOICE_ID/previews?token=YOUR_API_KEY" controls />
-```
+### 7.3 ElevenLabs Text-to-Speech Compatibility
+* **Method**: `POST`
+* **Path**: `/v1/text-to-speech/{voice_id}`
+* **Headers**: `xi-api-key: YOUR_API_KEY` or `Authorization: Bearer YOUR_API_KEY`
+* **Payload** (JSON): `{"text": "Xin chào!", "voice_settings": {"speed": 1.0}}`
 
 ---
 
@@ -246,18 +247,20 @@ A multi-stage asynchronous processing pipe to download a video, split audio into
 
 Returns a `VideoDubbingJobResponse` containing the `job_id`.
 
-### 9.2 Submit YouTube Video or Update Settings
+### 9.2 Create Video Dubbing Job (YouTube or Pre-Uploaded Video)
 * **Method**: `POST`
 * **Path**: `/v1/video-dubbing`
-* **Content-Type**: `application/json`
-* **Payload Schema**:
-  ```json
-  {
-    "source_type": "youtube",
-    "source_url": "https://www.youtube.com/watch?v=xxxxxx",
-    "target_language": "vi"
-  }
-  ```
+* **Content-Type**: `multipart/form-data`
+* **Form Fields**:
+  * `youtube_url` (string, optional): Public YouTube video URL (if not using `file` or `existing_job_id`).
+  * `file` (binary, optional): Direct video upload if not pre-uploaded via `/v1/video-dubbing/upload`.
+  * `existing_job_id` (string, optional): `job_id` returned from `/v1/video-dubbing/upload`.
+  * `target_language` (string, default `"Vietnamese"`): Target translation language (e.g. `"Vietnamese"`, `"English"`, `"Japanese"`).
+  * `voice_mode` (string, default `"auto_clone"`): `"auto_clone"` (extract speaker stem from video) or `"custom"` (use `voice_sample_id`).
+  * `voice_sample_id` (string, optional): Voice ID when `voice_mode="custom"`.
+  * `enable_separation` (boolean, default `true`): Separate vocals and BGM stems before ASR/mixing.
+  * `video_quality` (string, default `"1080p"`): Preferred YouTube download resolution (`"360p"`, `"480p"`, `"720p"`, `"1080p"`, `"1440p"`, `"2160p"`).
+  * `llm_profile_id` (string, optional): Override active LLM profile for translation.
 
 ---
 
@@ -265,55 +268,78 @@ Returns a `VideoDubbingJobResponse` containing the `job_id`.
 * **Method**: `GET`
 * **Path**: `/v1/video-dubbing/jobs/{job_id}`
 
-Returns the full state machine details including the `subtitles` array of segments:
+Returns the full state machine details including `original_subtitles` and `translated_subtitles`:
 ```json
 {
-  "id": "dub_xxxx",
-  "status": "translated",
-  "progress": 70,
-  "source_url": "...",
-  "target_language": "vi",
-  "subtitles": [
+  "job_id": "vd_xxxx",
+  "status": "awaiting_review",
+  "progress": 60,
+  "youtube_url": "https://www.youtube.com/watch?v=xxxxxx",
+  "target_language": "Vietnamese",
+  "voice_mode": "auto_clone",
+  "enable_separation": true,
+  "original_subtitles": [
     {
-      "id": 0,
+      "id": 1,
       "start": 1.25,
       "end": 4.50,
       "text": "Hello, welcome to this video.",
-      "translated_text": "Xin chào, chào mừng bạn đến với video này.",
-      "speaker": "Speaker 0",
-      "voice_sample_id": "vs_default"
+      "speaker": "SPEAKER_00"
+    }
+  ],
+  "translated_subtitles": [
+    {
+      "id": 1,
+      "start": 1.25,
+      "end": 4.50,
+      "text": "Xin chào, chào mừng bạn đến với video này.",
+      "speaker": "SPEAKER_00",
+      "voice_sample_id": null,
+      "speed": 1.0
     }
   ]
 }
 ```
 
 #### Dubbing Pipeline Status States
-1. `downloading`: Fetching video file from source.
-2. `separating_audio`: Splitting original vocal path from instruments.
-3. `transcribing`: Running Whisper translation & time mapping.
-4. `translating`: Translating source transcript to target language.
-5. `translated`: Ready for user adjustment. You can now edit the `subtitles` segments.
-6. `dubbing`: Running TTS engines to replace voice tracks.
-7. `mixing`: Compiling new audio and combining back with BGM and video components.
-8. `completed`: Process complete, file ready for output.
-9. `failed`: Error encountered.
+1. `uploaded`: Local video uploaded as draft, waiting to start pipeline.
+2. `queued` / `downloading`: Initializing or downloading source video.
+3. `separating_audio`: Splitting original vocals from BGM stem.
+4. `transcribing`: Running Whisper ASR & speaker segment alignment.
+5. `translating`: Translating source segments to `target_language` via LLM.
+6. `awaiting_review`: Ready for subtitle review & editing before TTS rendering.
+7. `generating_tts`: Synthesizing dubbed voice segments on GPU worker.
+8. `mixing_audio`: Mixing dubbed speech with BGM and residual vocals.
+9. `muxing_video`: Encoding final playable MP4 output.
+10. `completed` / `failed` / `cancelled`: Terminal states.
 
 ---
 
 ### 9.4 Update Subtitle Segments
-Before finalizing, you can correct the translation, alter timing, or assign distinct voices to specific speakers.
+Before finalizing (while in `awaiting_review`), update `original_subtitles` and `translated_subtitles`:
 * **Method**: `PUT`
 * **Path**: `/v1/video-dubbing/jobs/{job_id}/subtitles`
 * **Payload**:
   ```json
   {
-    "subtitles": [
+    "original_subtitles": [
       {
-        "id": 0,
-        "translated_text": "Xin chào, rất vui được gặp các bạn!",
-        "voice_sample_id": "vs_southern_male",
+        "id": 1,
         "start": 1.25,
-        "end": 4.80
+        "end": 4.80,
+        "text": "Hello, welcome to this video.",
+        "speaker": "SPEAKER_00"
+      }
+    ],
+    "translated_subtitles": [
+      {
+        "id": 1,
+        "start": 1.25,
+        "end": 4.80,
+        "text": "Xin chào, rất vui được gặp các bạn!",
+        "speaker": "SPEAKER_00",
+        "voice_sample_id": "vs_southern_male",
+        "speed": 1.0
       }
     ]
   }
@@ -324,8 +350,9 @@ Before finalizing, you can correct the translation, alter timing, or assign dist
 ### 9.5 Finalize Dubbing (Trigger Rendering)
 * **Method**: `POST`
 * **Path**: `/v1/video-dubbing/jobs/{job_id}/finalize`
+* **Payload** (JSON, optional): `{"bgm_volume": 0.6, "vocals_volume": 0.15}`
 
-Triggers the backend worker to dub segments and mix the output channels. Check `/v1/video-dubbing/jobs/{job_id}` for progress (updates status to `dubbing`, `mixing`, then `completed`).
+Triggers the backend worker to synthesize dubbed segments, mix stems, and mux the final MP4 (`generating_tts` -> `mixing_audio` -> `muxing_video` -> `completed`). You can cancel an active dubbing job via `POST /v1/video-dubbing/jobs/{job_id}/cancel`.
 
 ---
 
@@ -354,7 +381,7 @@ curl -X POST "https://voice.oloka.net/v1/tts/jobs" \
     "speed": 1.0,
     "num_step": 32,
     "with_alignment": true,
-    "normalize_text": false
+    "normalize_text": true
   }'
 
 # 2. Get Job Status (Repeat every 3-5 seconds)
@@ -384,7 +411,7 @@ payload = {
     "voice_sample_id": "vs_xxxx",
     "text": "Xin chào, đây là tích hợp Python.",
     "with_alignment": True,
-    "normalize_text": False
+    "normalize_text": True
 }
 
 # 1. Submit request
@@ -417,8 +444,7 @@ print("File downloaded as output.wav")
 
 ### 10.3 NodeJS
 ```javascript
-const fetch = require('node-fetch'); // Required if running Node < 18
-const fs = require('fs');
+const fs = require('fs'); // Node.js >= 18 includes global fetch
 
 const API_URL = "https://voice.oloka.net";
 const API_KEY = "YOUR_API_KEY";
@@ -438,9 +464,10 @@ async function execute() {
       voice_sample_id: 'vs_xxxx',
       text: 'Xin chào từ NodeJS client.',
       with_alignment: true,
-      normalize_text: false
+      normalize_text: true
     })
   });
+  if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
   const { job_id } = await res.json();
   console.log(`Job created: ${job_id}`);
 
@@ -460,7 +487,8 @@ async function execute() {
 
   // 3. Download WAV Audio
   const audioRes = await fetch(`${API_URL}/v1/tts/jobs/${job_id}/audio`, { headers });
-  const buffer = await audioRes.buffer();
+  if (!audioRes.ok) throw new Error(`Audio HTTP error! status: ${audioRes.status}`);
+  const buffer = Buffer.from(await audioRes.arrayBuffer());
   fs.writeFileSync('output.wav', buffer);
   console.log('Audio file saved to output.wav');
 }

@@ -164,14 +164,15 @@ class MockWorker:
             db.commit()
             
             VideoDubbingService.log_to_job(dub_job_id, f"[MOCK WORKER] Trộn nhạc & đóng gói video thành công tại: {output_video_path}. Quy trình hoàn tất!")
-            JobService.complete_job_output(db, job_id, output_video_path)
+            JobService.complete_job_output(db, job_id, dubbed_vocals_path)
             return
 
         # Check if job is ASR
         if job.job_type == "asr":
-            dub_job_id = job_id.replace("asr_", "")
-            from app.services.video_dubbing_service import VideoDubbingService
-            VideoDubbingService.log_to_job(dub_job_id, "[MOCK WORKER] Bắt đầu nhận dạng giọng nói ASR Whisper (giả lập)...")
+            if job_id.startswith("asr_"):
+                dub_job_id = job_id.replace("asr_", "", 1)
+                from app.services.video_dubbing_service import VideoDubbingService
+                VideoDubbingService.log_to_job(dub_job_id, "[MOCK WORKER] Bắt đầu nhận dạng giọng nói ASR Whisper (giả lập)...")
 
             # Step 1: Loading Model (30%)
             MockWorker._update_job(db, job_id, "loading_model", "Đang tải mô hình ASR (Giả lập)...", 30)

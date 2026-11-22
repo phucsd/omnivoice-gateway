@@ -61,7 +61,7 @@ def _build_dubbing_project_history_item(vd: VideoDubbingJob) -> JobStatusRespons
 
     return JobStatusResponse(
         job_id=vd.id,
-        status="completed" if (vd.status == "completed" or has_output_video) else vd.status,
+        status=vd.status or "queued",
         message=vd.message,
         progress=int(vd.progress or 0),
         audio_url=audio_url,
@@ -96,9 +96,13 @@ def _build_job_response(job: TTSJob) -> JobStatusResponse:
     dub_id = os.path.basename(job.id.split("_", 1)[1]) if job.id.startswith(("sep_", "dub_", "asr_")) and "_" in job.id else None
 
     audio_url = None
-    if job.status == "completed":
+    if job.job_type == "asr" and job.ref_audio_path:
+        audio_url = f"/v1/asr/jobs/{job.id}/audio"
+    elif job.status == "completed":
         if job.job_type == "voice_design_preview" and job.preview_id:
             audio_url = f"/v1/voice-design/previews/{job.preview_id}/audio"
+        elif job.job_type == "asr":
+            audio_url = f"/v1/asr/jobs/{job.id}/audio"
         else:
             audio_url = f"/v1/tts/jobs/{job.id}/audio"
 
@@ -131,6 +135,8 @@ def _build_job_response(job: TTSJob) -> JobStatusResponse:
         mode_val = "auto_voice"
     elif job.job_type in ["voice_design_tts", "voice_design_preview"]:
         mode_val = "voice_design"
+    elif job.job_type == "asr":
+        mode_val = "asr"
     elif is_dub_subjob:
         mode_val = "video_dubbing"
 
@@ -269,6 +275,65 @@ def list_jobs(
             )
         return combined_items
 
+    # When listing "all" jobs in paginated UI mode, merge VideoDubbingJob projects cleanly
+    # and hide internal dubbing worker sub-jobs (sep_vd_*, asr_vd_*, dub_vd_*) whose parent exists
+    if (not job_type or job_type == "all") and page is not None:
+        vd_q = db.query(VideoDubbingJob).filter(VideoDubbingJob.user_id == current_user.id)
+        if status_filter and status_filter != "all":
+            if status_filter == "failed":
+                vd_q = vd_q.filter(VideoDubbingJob.status == "failed")
+            elif status_filter == "completed":
+                vd_q = vd_q.filter(VideoDubbingJob.status == "completed")
+            elif status_filter == "running":
+                vd_q = vd_q.filter(VideoDubbingJob.status.notin_(["completed", "failed", "cancelled", "uploaded", "awaiting_review"]))
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            vd_q = vd_q.filter(
+                (VideoDubbingJob.id.ilike(term))
+                | (VideoDubbingJob.video_title.ilike(term))
+                | (VideoDubbingJob.source_url.ilike(term))
+                | (VideoDubbingJob.translated_subtitles.ilike(term))
+                | (VideoDubbingJob.original_subtitles.ilike(term))
+            )
+        vd_rows = vd_q.order_by(VideoDubbingJob.created_at.desc()).all()
+        covered_vd_ids = {v.id for v in vd_rows}
+
+        tts_q = db.query(TTSJob).filter(TTSJob.user_id == current_user.id)
+        if status_filter and status_filter != "all":
+            if status_filter == "failed":
+                tts_q = tts_q.filter(TTSJob.status == "failed")
+            elif status_filter == "completed":
+                tts_q = tts_q.filter(TTSJob.status == "completed")
+            elif status_filter == "running":
+                tts_q = tts_q.filter(TTSJob.status.notin_(["completed", "failed", "cancelled"]))
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            tts_q = tts_q.filter(
+                (TTSJob.id.ilike(term)) | (TTSJob.text.ilike(term)) | (TTSJob.instruct.ilike(term))
+            )
+        tts_rows = tts_q.order_by(TTSJob.created_at.desc()).all()
+
+        merged: List[JobStatusResponse] = [_build_dubbing_project_history_item(v) for v in vd_rows]
+        for tj in tts_rows:
+            if tj.id.startswith(("sep_vd_", "asr_vd_", "dub_vd_")):
+                parent_id = tj.id.split("_", 1)[1]
+                if parent_id in covered_vd_ids:
+                    continue
+            merged.append(_build_job_response(tj))
+
+        merged.sort(key=lambda x: x.created_at or datetime.min, reverse=True)
+        p = max(1, page)
+        ps = max(1, min(100, page_size or 15))
+        total = len(merged)
+        total_pages = (total + ps - 1) // ps if total > 0 else 1
+        return PaginatedJobsResponse(
+            items=merged[(p - 1) * ps : p * ps],
+            total=total,
+            page=p,
+            page_size=ps,
+            total_pages=total_pages,
+        )
+
     query = db.query(TTSJob).filter(TTSJob.user_id == current_user.id)
 
     # Filtering by job_type (category)
@@ -362,13 +427,25 @@ def delete_job(job_id: str, db: Session = Depends(get_db), current_user: User = 
     Xóa/Hủy một tác vụ khỏi hàng chờ hoặc lịch sử. Nếu tác vụ có file âm thanh kết quả,
     file đó cũng sẽ được dọn dẹp khỏi disk.
     """
-    if job_id.startswith("vd_"):
-        vd = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
-        if not vd or (vd.user_id != current_user.id and not current_user.is_admin):
+    from sqlalchemy import or_
+
+    vd = db.query(VideoDubbingJob).filter(VideoDubbingJob.id == job_id).first()
+    if vd:
+        if vd.user_id != current_user.id and not current_user.is_admin:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Không tìm thấy Job với ID: {job_id}"
             )
+        from app.services.video_dubbing_service import VideoDubbingService
+        VideoDubbingService.mark_job_deleted(job_id)
+        # Also remove linked GPU worker sub-jobs so they don't run as zombies or reappear in History
+        db.query(TTSJob).filter(
+            or_(
+                TTSJob.id.in_([f"sep_{job_id}", f"asr_{job_id}", f"dub_{job_id}"]),
+                TTSJob.batch_id == job_id,
+                TTSJob.id.like(f"dub_seg_{job_id}_%"),
+            )
+        ).delete(synchronize_session=False)
         try:
             job_dir = ensure_within_directory(settings.dubbing_dir, os.path.join(settings.dubbing_dir, job_id))
             if os.path.exists(job_dir):
@@ -394,8 +471,23 @@ def delete_job(job_id: str, db: Session = Depends(get_db), current_user: User = 
     ):
         try:
             os.remove(job.output_audio_path)
+            mp3_cache = os.path.splitext(job.output_audio_path)[0] + ".mp3"
+            if os.path.exists(mp3_cache):
+                os.remove(mp3_cache)
         except Exception as e:
             print(f"Lỗi xóa file âm thanh đầu ra: {e}")
+
+    # Dọn dẹp file âm thanh upload của tác vụ ASR độc lập nếu có
+    if (
+        job.job_type == "asr"
+        and job.ref_audio_path
+        and not job.id.startswith("asr_")
+        and os.path.exists(job.ref_audio_path)
+    ):
+        try:
+            os.remove(job.ref_audio_path)
+        except Exception as e:
+            print(f"Lỗi xóa file âm thanh ASR upload: {e}")
             
     # Dọn dẹp file preview thiết kế giọng nếu có
     if job.job_type == "voice_design_preview" and job.preview_id:

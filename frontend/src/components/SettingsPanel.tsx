@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Settings, X, HelpCircle } from "lucide-react";
+import { Settings, X, HelpCircle, ExternalLink } from "lucide-react";
 import { api, getErrorMessage, type SettingsUpdateRequest, type SystemSettings } from "../api/client";
 
 interface SettingsPanelProps {
@@ -19,6 +19,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
 
   const [connectionResult, setConnectionResult] = useState<{ success: boolean; message: string } | null>(null);
   const [pushResult, setPushResult] = useState<{ success: boolean; message: string; url?: string } | null>(null);
+  const pendingSaveRef = useRef<Promise<void> | null>(null);
 
   const onStatusChangeRef = useRef(onStatusChange);
   useEffect(() => {
@@ -29,6 +30,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
     if (!isOpen) return;
     let active = true;
     (async () => {
+      await Promise.resolve();
+      if (!active) return;
+      setLoading(true);
+      setConnectionResult(null);
+      setPushResult(null);
       try {
         const res = await api.getSettings();
         if (!active) return;
@@ -40,7 +46,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
           onStatusChangeRef.current?.("connected");
         }
       } catch (err: unknown) {
-        console.error("Lỗi tải cấu hình:", err);
+        if (!active) return;
+        setConnectionResult({
+          success: false,
+          message: getErrorMessage(err, "Không thể tải cấu hình Kaggle."),
+        });
       } finally {
         if (active) setLoading(false);
       }
@@ -59,9 +69,35 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [isOpen, onClose]);
 
+  const performSave = async (payload: SettingsUpdateRequest, clearKey: boolean) => {
+    const task = (async () => {
+      await api.updateSettings(payload);
+      const res = await api.getSettings();
+      setConfig(res);
+      if (clearKey) setKey("");
+
+      if (onStatusChangeRef.current) {
+        if (!res.kaggle_username || !res.kaggle_key_configured) {
+          onStatusChangeRef.current("unconfigured");
+        } else {
+          onStatusChangeRef.current("connected");
+        }
+      }
+    })();
+    pendingSaveRef.current = task;
+    try {
+      await task;
+    } finally {
+      if (pendingSaveRef.current === task) {
+        pendingSaveRef.current = null;
+      }
+    }
+  };
+
   const handleAutoSave = async (field: "username" | "key", val: string) => {
     const payload: SettingsUpdateRequest = {};
     if (field === "username") {
+      if (val.trim() === (config?.kaggle_username || "")) return;
       payload.kaggle_username = val.trim();
     } else {
       if (!val.trim()) return;
@@ -69,20 +105,31 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
     }
 
     try {
-      await api.updateSettings(payload);
-      const res = await api.getSettings();
-      setConfig(res);
-      if (field === "key") setKey("");
-
-      if (onStatusChange) {
-        if (!res.kaggle_username || !res.kaggle_key_configured) {
-          onStatusChange("unconfigured");
-        } else {
-          onStatusChange("connected");
-        }
-      }
+      await performSave(payload, field === "key");
     } catch (err: unknown) {
-      console.error("Auto-save failed:", getErrorMessage(err));
+      setConnectionResult({
+        success: false,
+        message: `Lưu cấu hình thất bại: ${getErrorMessage(err)}`,
+      });
+    }
+  };
+
+  const flushPendingChanges = async () => {
+    if (pendingSaveRef.current) {
+      await pendingSaveRef.current;
+    }
+    const payload: SettingsUpdateRequest = {};
+    let hasChanges = false;
+    if (username.trim() !== (config?.kaggle_username || "")) {
+      payload.kaggle_username = username.trim();
+      hasChanges = true;
+    }
+    if (key.trim()) {
+      payload.kaggle_key = key.trim();
+      hasChanges = true;
+    }
+    if (hasChanges) {
+      await performSave(payload, Boolean(payload.kaggle_key));
     }
   };
 
@@ -90,6 +137,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
     setTestingConnection(true);
     setConnectionResult(null);
     try {
+      await flushPendingChanges();
       const res = await api.testKaggleConnection();
       setConnectionResult(res);
       if (onStatusChange) {
@@ -113,6 +161,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
     setPushResult(null);
     setConnectionResult(null);
     try {
+      await flushPendingChanges();
       const res = await api.pushNotebook();
       setPushResult(res);
       if (onStatusChange) {
@@ -138,7 +187,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
       role="dialog"
       aria-modal="true"
       aria-labelledby="kaggle-settings-modal-title"
-      className="fixed inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 lg:pl-64 animate-fadeIn"
+      className="fixed inset-0 bg-black/55 backdrop-blur-sm flex items-center justify-center z-[70] p-4 lg:pl-fluid-sidebar animate-fadeIn"
       onClick={onClose}
     >
       <div
@@ -268,9 +317,18 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
                 <span className="break-all font-medium">{pushResult.message}</span>
               </div>
               {pushResult.success && pushResult.url && (
-                <p className="text-[10px] text-muted-foreground leading-relaxed bg-background p-2.5 border border-border rounded-lg">
-                  Notebook đã được đẩy thành công lên Kaggle. Hệ thống tự động đẩy-và-chạy batch job khi bạn thực hiện TTS.
-                </p>
+                <div className="text-[10px] text-muted-foreground leading-relaxed bg-background p-2.5 border border-border rounded-lg flex flex-col gap-1.5">
+                  <span>Notebook đã được đẩy thành công lên Kaggle. Hệ thống tự động đẩy-và-chạy batch job khi bạn thực hiện TTS.</span>
+                  <a
+                    href={pushResult.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-primary hover:underline font-bold inline-flex items-center gap-1 self-start"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    <span>Mở Notebook trên Kaggle</span>
+                  </a>
+                </div>
               )}
             </div>
           )}
@@ -281,7 +339,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
               type="button"
               onClick={handleTestConnection}
               disabled={testingConnection || loading || pushingNotebook}
-              className="flex-grow flex items-center justify-center gap-1.5 bg-muted hover:bg-muted text-foreground hover:text-foreground font-bold text-xs px-4 py-2.5 rounded-lg transition-colors cursor-pointer border border-border/80 disabled:opacity-55 disabled:cursor-not-allowed"
+              className="min-h-[44px] flex-grow flex items-center justify-center gap-1.5 bg-muted hover:bg-muted/80 text-foreground font-bold text-xs px-4 py-2.5 rounded-lg transition-colors cursor-pointer border border-border/80 disabled:opacity-55 disabled:cursor-not-allowed"
             >
               {testingConnection ? (
                 <>
@@ -297,7 +355,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
               type="button"
               onClick={handlePushNotebook}
               disabled={pushingNotebook || loading || testingConnection}
-              className="flex-grow flex items-center justify-center gap-1.5 bg-primary/20 hover:bg-primary/30 text-primary hover:text-primary/90 font-bold text-xs px-4 py-2.5 rounded-lg transition-colors cursor-pointer border border-primary/20 disabled:opacity-55 disabled:cursor-not-allowed"
+              className="min-h-[44px] flex-grow flex items-center justify-center gap-1.5 bg-primary/20 hover:bg-primary/30 text-primary font-bold text-xs px-4 py-2.5 rounded-lg transition-colors cursor-pointer border border-primary/20 disabled:opacity-55 disabled:cursor-not-allowed"
             >
               {pushingNotebook ? (
                 <>

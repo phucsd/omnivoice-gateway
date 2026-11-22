@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Sparkles, Radio, RefreshCw, Layers, LogOut, Server, KeyRound, BookOpen, Sun, Moon, Monitor, Volume2, Menu, X, Mic, Sliders, Video } from "lucide-react";
 import { api } from "./api/client";
+import { audioEngine } from "./services/audioEngine";
 
 import { VoiceSampleUpload } from "./components/VoiceSampleUpload";
 import { VoiceDesignPanel } from "./components/VoiceDesignPanel";
@@ -17,6 +18,54 @@ import { PlaygroundPanel } from "./components/PlaygroundPanel";
 import { ASRPanel } from "./components/ASRPanel";
 import DubbingStudio from "./components/DubbingStudio";
 import { ErrorBoundary } from "./components/ui/ErrorBoundary";
+
+type AppTab = "workspace" | "voice-lab" | "library" | "history" | "docs" | "admin" | "playground" | "asr" | "dubbing";
+
+const TAB_TO_HASH: Record<AppTab, string> = {
+  workspace: "#/",
+  asr: "#/asr",
+  dubbing: "#/dubbing",
+  library: "#/library",
+  "voice-lab": "#/voice-lab",
+  history: "#/history",
+  docs: "#/docs",
+  playground: "#/playground",
+  admin: "#/admin",
+};
+
+function parseTabFromHash(hash: string): AppTab {
+  const clean = (hash || "").split("?")[0].replace(/\/+$/, "");
+  switch (clean) {
+    case "#/asr":
+      return "asr";
+    case "#/dubbing":
+      return "dubbing";
+    case "#/library":
+      return "library";
+    case "#/voice-lab":
+      return "voice-lab";
+    case "#/history":
+      return "history";
+    case "#/docs":
+      return "docs";
+    case "#/playground":
+      return "playground";
+    case "#/admin":
+      return "admin";
+    default:
+      return "workspace";
+  }
+}
+
+const USER_SCOPED_STORAGE_KEYS = [
+  "VITE_TTS_JOB_ID",
+  "VITE_VOICE_DESIGN_JOB_ID",
+  "VITE_VOICE_DESIGN_PREVIEW_ID",
+  "VITE_ASR_PANEL_JOB_ID",
+  "VITE_PLAYGROUND_JOB_ID",
+  "active_dubbing_job_id",
+  "open_dubbing_job_tabs",
+];
 
 function getAgentOrbState(
   connectionStatus: "checking" | "connected" | "disconnected",
@@ -55,24 +104,22 @@ function getAgentOrbState(
 }
 
 function App() {
-  const [token, setToken] = useState<string | null>(localStorage.getItem("VITE_JWT_TOKEN"));
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem("VITE_JWT_TOKEN"));
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<"workspace" | "voice-lab" | "library" | "history" | "docs" | "admin" | "playground" | "asr" | "dubbing">(() => {
-    return window.location.hash === "#/docs" ? "docs" : "workspace";
-  });
+  const [activeTab, setActiveTab] = useState<AppTab>(() => parseTabFromHash(window.location.hash));
   const [pendingDubbingJobId, setPendingDubbingJobId] = useState<string | null>(null);
   const [dubbingListNavTrigger, setDubbingListNavTrigger] = useState<number>(0);
-  
+
   const [theme, setTheme] = useState<"light" | "dark" | "system">(() => {
     return (localStorage.getItem("theme") as "light" | "dark" | "system") || "dark";
   });
 
   useEffect(() => {
     const root = window.document.documentElement;
-    
+
     const applyTheme = (themeName: "light" | "dark" | "system") => {
       root.classList.remove("light", "dark");
-      
+
       if (themeName === "system") {
         const systemTheme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
         root.classList.add(systemTheme);
@@ -94,50 +141,56 @@ function App() {
 
   useEffect(() => {
     const handleHashChange = () => {
-      if (window.location.hash === "#/docs") {
-        setActiveTab("docs");
-      } else if (window.location.hash === "#/" || window.location.hash === "") {
-        setActiveTab("workspace");
-      }
+      setActiveTab(parseTabFromHash(window.location.hash));
     };
     window.addEventListener("hashchange", handleHashChange);
-
     return () => {
       window.removeEventListener("hashchange", handleHashChange);
     };
   }, []);
 
-  const navigateToTab = (tab: "workspace" | "voice-lab" | "library" | "history" | "docs" | "admin" | "playground" | "asr" | "dubbing") => {
+  useEffect(() => {
+    if (!sidebarOpen) return;
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSidebarOpen(false);
+    };
+    window.addEventListener("keydown", handleEsc);
+    return () => window.removeEventListener("keydown", handleEsc);
+  }, [sidebarOpen]);
+
+  const navigateToTab = useCallback((tab: AppTab) => {
     setActiveTab(tab);
     setSidebarOpen(false);
-    if (tab === "docs") {
-      window.location.hash = "#/docs";
-    } else {
-      window.location.hash = "#/";
+    const targetHash = TAB_TO_HASH[tab] || "#/";
+    if (window.location.hash !== targetHash) {
+      window.location.hash = targetHash;
     }
     window.scrollTo(0, 0);
-  };
+  }, []);
 
   const [currentUser, setCurrentUser] = useState<{ id: string; username: string; is_admin: boolean } | null>(null);
   const [uiLayout, setUiLayout] = useState<"classic" | "modern">("modern");
   const [activeVoiceSampleId, setActiveVoiceSampleId] = useState<string | null>(null);
   const [refreshHistory, setRefreshHistory] = useState(0);
-  const handleJobCreatedOrUpdated = () => {
+  const handleJobCreatedOrUpdated = useCallback(() => {
     setRefreshHistory(prev => prev + 1);
-  };
+  }, []);
   const [currentPlayUrl, setCurrentPlayUrl] = useState<string | null>(null);
   const [currentPlayTitle, setCurrentPlayTitle] = useState<string>("");
+  const [currentPlayCanRegenerate, setCurrentPlayCanRegenerate] = useState<boolean>(false);
   const [globalPlayerPlaying, setGlobalPlayerPlaying] = useState<boolean>(false);
 
-  const handlePlayAudio = (url: string, title: string) => {
+  const handlePlayAudio = useCallback((url: string, title: string, canRegen = false) => {
     setCurrentPlayUrl(url);
     setCurrentPlayTitle(title);
+    setCurrentPlayCanRegenerate(canRegen);
     setGlobalPlayerPlaying(true);
-  };
+  }, []);
 
-  const handleTogglePlay = () => {
+  const handleTogglePlay = useCallback(() => {
     setGlobalPlayerPlaying(prev => !prev);
-  };
+  }, []);
+
   const [connectionStatus, setConnectionStatus] = useState<"checking" | "connected" | "disconnected">("checking");
   const [apiBaseUrl] = useState<string>(() => api.getApiBaseUrl() || (typeof window !== "undefined" ? window.location.origin : ""));
   const [showSettingsModal, setShowSettingsModal] = useState(false);
@@ -146,9 +199,42 @@ function App() {
 
   const handleLogout = useCallback(() => {
     localStorage.removeItem("VITE_JWT_TOKEN");
+    for (const k of USER_SCOPED_STORAGE_KEYS) {
+      localStorage.removeItem(k);
+    }
+    audioEngine.clearCache();
     setToken(null);
     setCurrentUser(null);
+    setActiveVoiceSampleId(null);
+    setCurrentPlayUrl(null);
+    setCurrentPlayTitle("");
+    setCurrentPlayCanRegenerate(false);
+    setGlobalPlayerPlaying(false);
+    setShowSettingsModal(false);
+    setShowApiKeyModal(false);
   }, []);
+
+  // Multi-tab auth sync + automatic 401 session expiry handling
+  useEffect(() => {
+    const onUnauthorized = () => {
+      handleLogout();
+    };
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === "VITE_JWT_TOKEN") {
+        if (!e.newValue) {
+          handleLogout();
+        } else {
+          setToken(e.newValue);
+        }
+      }
+    };
+    window.addEventListener("omnivoice:unauthorized", onUnauthorized);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener("omnivoice:unauthorized", onUnauthorized);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, [handleLogout]);
 
   const fetchSettings = useCallback(async () => {
     try {
@@ -186,17 +272,19 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    (async () => {
+    const runCheck = async () => {
       try {
         await api.getHealth();
         if (active) setConnectionStatus("connected");
-      } catch (err) {
-        console.error("Health check failed", err);
+      } catch {
         if (active) setConnectionStatus("disconnected");
       }
-    })();
+    };
+    void runCheck();
+    const timer = setInterval(runCheck, 45000);
     return () => {
       active = false;
+      clearInterval(timer);
     };
   }, []);
 
@@ -239,18 +327,18 @@ function App() {
 
   const effectiveUser = token ? currentUser : null;
 
-  const handleVoiceSampleActive = (sampleId: string) => {
-    setActiveVoiceSampleId(sampleId);
-  };
+  const handleVoiceSampleActive = useCallback((sampleId: string | null) => {
+    setActiveVoiceSampleId(sampleId || null);
+  }, []);
 
   if (!token) {
-    if (activeTab === "docs") {
+    const hasOAuthParams =
+      typeof window !== "undefined" &&
+      (window.location.search.includes("code=") || window.location.search.includes("error="));
+    if (activeTab === "docs" && !hasOAuthParams) {
       return (
         <ApiDocsPage
-          onBack={() => {
-            window.location.hash = "#/";
-            setActiveTab("workspace");
-          }}
+          onBack={() => navigateToTab("workspace")}
           isLoggedIn={false}
         />
       );
@@ -262,6 +350,8 @@ function App() {
     connectionStatus,
     kaggleStatus
   );
+
+  const hasActivePlayer = Boolean(currentPlayUrl);
 
   const sidebarContent = (
     <div className="flex flex-col h-full bg-card border-r border-border text-foreground">
@@ -293,10 +383,11 @@ function App() {
           <div className="text-[9px] font-extrabold text-muted-foreground/60 uppercase tracking-widest px-3 mb-1.5">
             Menu
           </div>
-          
+
           <button
+            type="button"
             onClick={() => navigateToTab("workspace")}
-            className={`w-full px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
+            className={`w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
               activeTab === "workspace"
                 ? "bg-secondary text-foreground shadow-sm font-bold"
                 : "text-muted-foreground hover:text-foreground hover:bg-secondary/40"
@@ -307,8 +398,9 @@ function App() {
           </button>
 
           <button
+            type="button"
             onClick={() => navigateToTab("asr")}
-            className={`w-full px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
+            className={`w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
               activeTab === "asr"
                 ? "bg-secondary text-foreground shadow-sm font-bold"
                 : "text-muted-foreground hover:text-foreground hover:bg-secondary/40"
@@ -319,12 +411,13 @@ function App() {
           </button>
 
           <button
+            type="button"
             onClick={() => {
               setPendingDubbingJobId(null);
               setDubbingListNavTrigger(prev => prev + 1);
               navigateToTab("dubbing");
             }}
-            className={`w-full px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
+            className={`w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
               activeTab === "dubbing"
                 ? "bg-secondary text-foreground shadow-sm font-bold"
                 : "text-muted-foreground hover:text-foreground hover:bg-secondary/40"
@@ -335,8 +428,9 @@ function App() {
           </button>
 
           <button
+            type="button"
             onClick={() => navigateToTab("library")}
-            className={`w-full px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
+            className={`w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
               activeTab === "library"
                 ? "bg-secondary text-foreground shadow-sm font-bold"
                 : "text-muted-foreground hover:text-foreground hover:bg-secondary/40"
@@ -347,8 +441,9 @@ function App() {
           </button>
 
           <button
+            type="button"
             onClick={() => navigateToTab("voice-lab")}
-            className={`w-full px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
+            className={`w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
               activeTab === "voice-lab"
                 ? "bg-secondary text-foreground shadow-sm font-bold"
                 : "text-muted-foreground hover:text-foreground hover:bg-secondary/40"
@@ -359,8 +454,9 @@ function App() {
           </button>
 
           <button
+            type="button"
             onClick={() => navigateToTab("history")}
-            className={`w-full px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
+            className={`w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
               activeTab === "history"
                 ? "bg-secondary text-foreground shadow-sm font-bold"
                 : "text-muted-foreground hover:text-foreground hover:bg-secondary/40"
@@ -371,8 +467,9 @@ function App() {
           </button>
 
           <button
+            type="button"
             onClick={() => navigateToTab("docs")}
-            className={`w-full px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
+            className={`w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
               activeTab === "docs"
                 ? "bg-secondary text-foreground shadow-sm font-bold"
                 : "text-muted-foreground hover:text-foreground hover:bg-secondary/40"
@@ -388,7 +485,7 @@ function App() {
           <div className="text-[9px] font-extrabold text-muted-foreground/60 uppercase tracking-widest px-3">
             Active Voice
           </div>
-          
+
           <div className="px-1">
             {activeVoiceSampleId ? (
               <div className="bg-secondary/40 border border-border/40 rounded-lg p-2.5 flex items-center justify-between gap-2 shadow-sm">
@@ -400,14 +497,15 @@ function App() {
                     <span className="text-[8px] font-bold text-primary uppercase tracking-wider leading-none">
                       Active
                     </span>
-                    <span className="text-[10px] font-mono font-bold text-foreground truncate max-w-[100px] mt-0.5" title={activeVoiceSampleId}>
+                    <span className="text-[10px] font-mono font-bold text-foreground truncate max-w-[105px] mt-0.5" title={activeVoiceSampleId}>
                       {activeVoiceSampleId}
                     </span>
                   </div>
                 </div>
                 <button
+                  type="button"
                   onClick={() => setActiveVoiceSampleId(null)}
-                  className="text-[9px] hover:text-foreground text-muted-foreground border border-border bg-card hover:bg-secondary px-2 py-0.5 rounded transition-colors cursor-pointer font-bold shrink-0"
+                  className="min-h-[32px] text-[10px] hover:text-foreground text-muted-foreground border border-border bg-card hover:bg-secondary px-2.5 py-1 rounded-md transition-colors cursor-pointer font-bold shrink-0"
                 >
                   Clear
                 </button>
@@ -427,16 +525,18 @@ function App() {
           </div>
 
           <button
+            type="button"
             onClick={() => setShowSettingsModal(true)}
-            className="w-full px-3 py-1.5 rounded-lg text-xs font-semibold text-muted-foreground hover:text-foreground hover:bg-secondary/40 transition-all flex items-center gap-2.5 cursor-pointer"
+            className="w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold text-muted-foreground hover:text-foreground hover:bg-secondary/40 transition-all flex items-center gap-2.5 cursor-pointer"
           >
             <Server className="w-3.5 h-3.5 shrink-0" />
             <span>Kaggle Settings</span>
           </button>
 
           <button
+            type="button"
             onClick={() => setShowApiKeyModal(true)}
-            className="w-full px-3 py-1.5 rounded-lg text-xs font-semibold text-muted-foreground hover:text-foreground hover:bg-secondary/40 transition-all flex items-center gap-2.5 cursor-pointer"
+            className="w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold text-muted-foreground hover:text-foreground hover:bg-secondary/40 transition-all flex items-center gap-2.5 cursor-pointer"
           >
             <KeyRound className="w-3.5 h-3.5 shrink-0" />
             <span>API Keys</span>
@@ -445,8 +545,9 @@ function App() {
           {currentUser?.is_admin && (
             <>
               <button
+                type="button"
                 onClick={() => navigateToTab("playground")}
-                className={`w-full px-3 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
+                className={`w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
                   activeTab === "playground"
                     ? "bg-secondary text-foreground font-bold"
                     : "text-muted-foreground hover:text-foreground hover:bg-secondary/40"
@@ -457,8 +558,9 @@ function App() {
               </button>
 
               <button
+                type="button"
                 onClick={() => navigateToTab("admin")}
-                className={`w-full px-3 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
+                className={`w-full min-h-[40px] px-3 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2.5 cursor-pointer ${
                   activeTab === "admin"
                     ? "bg-secondary text-foreground font-bold"
                     : "text-muted-foreground hover:text-foreground hover:bg-secondary/40"
@@ -486,26 +588,26 @@ function App() {
               type="button"
               onClick={handleLogout}
               aria-label="Đăng xuất"
-              className="min-w-[40px] min-h-[40px] flex items-center justify-center p-1.5 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded transition-colors cursor-pointer shrink-0"
+              className="min-w-[44px] min-h-[44px] flex items-center justify-center p-1.5 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded-lg transition-colors cursor-pointer shrink-0"
               title="Đăng xuất"
             >
-              <LogOut className="w-3.5 h-3.5" />
+              <LogOut className="w-4 h-4" />
             </button>
           </div>
         )}
 
         <div className="flex items-center justify-between gap-1 text-[10px] text-muted-foreground px-1">
           <span className="truncate">Status: {connectionStatus === "connected" ? "Online" : "Offline"}</span>
-          
-          <div className="flex items-center gap-2">
-            <button 
+
+          <div className="flex items-center gap-1">
+            <button
               type="button"
               aria-label="Kiểm tra kết nối lại"
               onClick={checkHealth}
-              className="min-w-[36px] min-h-[36px] justify-center hover:text-foreground cursor-pointer flex items-center gap-0.5 font-bold"
+              className="min-w-[40px] min-h-[40px] justify-center hover:text-foreground cursor-pointer flex items-center gap-0.5 font-bold rounded-lg hover:bg-secondary/50"
               title="Reload connection"
             >
-              <RefreshCw className="w-3 h-3" />
+              <RefreshCw className="w-3.5 h-3.5" />
             </button>
 
             <button
@@ -518,12 +620,12 @@ function App() {
                   return "system";
                 });
               }}
-              className="min-w-[36px] min-h-[36px] flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer shrink-0"
+              className="min-w-[40px] min-h-[40px] flex items-center justify-center text-muted-foreground hover:text-foreground cursor-pointer shrink-0 rounded-lg hover:bg-secondary/50"
               title={`Giao diện: ${theme === "system" ? "Tự động" : theme === "light" ? "Sáng" : "Tối"}`}
             >
-              {theme === "system" && <Monitor className="w-3 h-3" />}
-              {theme === "light" && <Sun className="w-3 h-3 text-warning" />}
-              {theme === "dark" && <Moon className="w-3 h-3 text-primary" />}
+              {theme === "system" && <Monitor className="w-3.5 h-3.5" />}
+              {theme === "light" && <Sun className="w-3.5 h-3.5 text-warning" />}
+              {theme === "dark" && <Moon className="w-3.5 h-3.5 text-primary" />}
             </button>
           </div>
         </div>
@@ -536,14 +638,14 @@ function App() {
 
   return (
     <div className="min-h-screen bg-background text-foreground flex font-sans overflow-x-hidden relative">
-      {/* Sidebar 240px */}
+      {/* Desktop Sidebar */}
       <aside className="hidden lg:block w-fluid-sidebar h-screen fixed top-0 left-0 shrink-0 z-40">
         {sidebarContent}
       </aside>
 
       {sidebarOpen && (
         <div className="lg:hidden fixed inset-0 z-[60] flex" role="dialog" aria-modal="true" aria-label="Menu điều hướng">
-          <div 
+          <div
             onClick={() => setSidebarOpen(false)}
             className="fixed inset-0 bg-black/60 backdrop-blur-sm"
           />
@@ -561,7 +663,6 @@ function App() {
         </div>
       )}
 
-      {/* Padding left changed to pl-fluid-sidebar */}
       <div className="flex-grow flex flex-col min-w-0 lg:pl-fluid-sidebar min-h-screen">
         <header className="lg:hidden sticky top-0 z-30 bg-background/85 backdrop-blur-md border-b border-border px-4 py-2.5 flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -589,8 +690,7 @@ function App() {
           </div>
         </header>
 
-        <main className="flex-grow p-4 md:p-6 lg:p-8 w-full max-w-7xl mx-auto flex flex-col gap-6 relative pb-32">
-          
+        <main className={`flex-grow p-4 md:p-6 lg:p-8 w-full max-w-[1400px] mx-auto flex flex-col gap-6 relative ${hasActivePlayer ? "pb-28" : "pb-10"}`}>
           <SettingsPanel
             isOpen={showSettingsModal}
             onClose={() => setShowSettingsModal(false)}
@@ -600,19 +700,23 @@ function App() {
           <ApiKeyPanel
             isOpen={showApiKeyModal}
             onClose={() => setShowApiKeyModal(false)}
-            onNavigateToDocs={() => navigateToTab("docs")}
+            onNavigateToDocs={() => {
+              setShowApiKeyModal(false);
+              navigateToTab("docs");
+            }}
           />
 
           {activeTab === "workspace" && (
             <div className="w-full flex flex-col gap-6">
               <ErrorBoundary fallbackTitle="Lỗi hiển thị Text to Speech">
-                <TTSPanel 
-                  activeVoiceSampleId={activeVoiceSampleId} 
+                <TTSPanel
+                  activeVoiceSampleId={activeVoiceSampleId}
+                  onSelectVoiceSample={handleVoiceSampleActive}
                   onJobCreatedOrUpdated={handleJobCreatedOrUpdated}
                   layout={uiLayout}
                   currentPlayUrl={currentPlayUrl}
                   globalPlayerPlaying={globalPlayerPlaying}
-                  onPlayAudio={handlePlayAudio}
+                  onPlayAudio={(url, title) => handlePlayAudio(url, title, true)}
                   onTogglePlay={handleTogglePlay}
                 />
               </ErrorBoundary>
@@ -621,15 +725,17 @@ function App() {
 
           {activeTab === "voice-lab" && (
             <div className="w-full grid grid-cols-1 xl:grid-cols-2 gap-6 animate-fadeIn items-start">
-              <ErrorBoundary fallbackTitle="Lỗi hiển thị Voice Design">
+              <ErrorBoundary fallbackTitle="Lỗi hiển thị Tải Mẫu Giọng">
                 <VoiceSampleUpload onUploadSuccess={handleVoiceSampleActive} layout={uiLayout} />
-                <VoiceDesignPanel 
-                  onAcceptSuccess={handleVoiceSampleActive} 
+              </ErrorBoundary>
+              <ErrorBoundary fallbackTitle="Lỗi hiển thị Voice Design">
+                <VoiceDesignPanel
+                  onAcceptSuccess={handleVoiceSampleActive}
                   onJobCreatedOrUpdated={handleJobCreatedOrUpdated}
                   layout={uiLayout}
                   currentPlayUrl={currentPlayUrl}
                   globalPlayerPlaying={globalPlayerPlaying}
-                  onPlayAudio={handlePlayAudio}
+                  onPlayAudio={(url, title) => handlePlayAudio(url, title, false)}
                   onTogglePlay={handleTogglePlay}
                 />
               </ErrorBoundary>
@@ -639,17 +745,22 @@ function App() {
           {activeTab === "library" && (
             <div className="w-full animate-fadeIn">
               <ErrorBoundary fallbackTitle="Lỗi hiển thị Voice Library">
-                <VoiceLibraryPanel 
+                <VoiceLibraryPanel
                   activeVoiceSampleId={activeVoiceSampleId}
                   currentUser={effectiveUser}
-                  onUseVoice={(id) => { 
-                    setActiveVoiceSampleId(id); 
-                    navigateToTab("workspace"); 
-                  }} 
-                  layout={uiLayout} 
+                  onUseVoice={(id) => {
+                    setActiveVoiceSampleId(id);
+                    navigateToTab("workspace");
+                  }}
+                  onVoiceDeleted={(deletedId) => {
+                    if (activeVoiceSampleId === deletedId) {
+                      setActiveVoiceSampleId(null);
+                    }
+                  }}
+                  layout={uiLayout}
                   currentPlayUrl={currentPlayUrl}
                   globalPlayerPlaying={globalPlayerPlaying}
-                  onPlayAudio={handlePlayAudio}
+                  onPlayAudio={(url, title) => handlePlayAudio(url, title, false)}
                   onTogglePlay={handleTogglePlay}
                 />
               </ErrorBoundary>
@@ -659,13 +770,19 @@ function App() {
           {activeTab === "history" && (
             <div className="w-full animate-fadeIn">
               <ErrorBoundary fallbackTitle="Lỗi hiển thị History">
-                <JobHistoryPanel 
-                  refreshTrigger={refreshHistory} 
-                  layout={uiLayout} 
+                <JobHistoryPanel
+                  refreshTrigger={refreshHistory}
+                  layout={uiLayout}
                   currentPlayUrl={currentPlayUrl}
                   globalPlayerPlaying={globalPlayerPlaying}
-                  onPlayAudio={handlePlayAudio}
+                  onPlayAudio={(url, title) => handlePlayAudio(url, title, false)}
                   onTogglePlay={handleTogglePlay}
+                  onClosePlayerIfUrl={(deletedUrl) => {
+                    if (currentPlayUrl && deletedUrl && currentPlayUrl.includes(deletedUrl)) {
+                      setCurrentPlayUrl(null);
+                      setGlobalPlayerPlaying(false);
+                    }
+                  }}
                   onOpenDubbingJob={(dubId) => {
                     localStorage.setItem("active_dubbing_job_id", dubId);
                     setPendingDubbingJobId(dubId);
@@ -720,27 +837,30 @@ function App() {
               </ErrorBoundary>
             </div>
           )}
-
         </main>
 
-        <footer className="border-t border-border/60 py-6 text-center text-[10px] text-muted-foreground font-semibold bg-background/20 mt-auto pb-32">
+        <footer className={`border-t border-border/60 py-6 text-center text-[10px] text-muted-foreground font-semibold bg-background/20 mt-auto ${hasActivePlayer ? "pb-24" : ""}`}>
           OmniVoice On-Demand Gateway MVP &copy; {new Date().getFullYear()} &nbsp;•&nbsp; Built for High-Performance Audio Synthesis
         </footer>
       </div>
 
-      {/* Global Sticky Bottom Audio Player */}
-      <div className="fixed bottom-0 left-0 lg:left-fluid-sidebar right-0 z-50 h-fluid-player bg-card/90 backdrop-blur-md border-t border-border">
-        <AudioPlayer
-          url={currentPlayUrl || ""}
-          title={currentPlayTitle || ""}
-          isPlayingGlobal={globalPlayerPlaying}
-          onPlayingGlobalChange={setGlobalPlayerPlaying}
-          onClose={() => {
-            setCurrentPlayUrl(null);
-            setGlobalPlayerPlaying(false);
-          }}
-        />
-      </div>
+      {/* Global Sticky Bottom Audio Player — rendered ONLY when a track is loaded */}
+      {hasActivePlayer && (
+        <div className="fixed bottom-0 left-0 lg:left-fluid-sidebar right-0 z-40 h-fluid-player bg-card/95 backdrop-blur-md border-t border-border shadow-lg">
+          <AudioPlayer
+            url={currentPlayUrl || ""}
+            title={currentPlayTitle || ""}
+            isPlayingGlobal={globalPlayerPlaying}
+            onPlayingGlobalChange={setGlobalPlayerPlaying}
+            canRegenerate={currentPlayCanRegenerate && activeTab === "workspace"}
+            onClose={() => {
+              setCurrentPlayUrl(null);
+              setCurrentPlayCanRegenerate(false);
+              setGlobalPlayerPlaying(false);
+            }}
+          />
+        </div>
+      )}
     </div>
   );
 }

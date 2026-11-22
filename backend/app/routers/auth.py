@@ -90,7 +90,12 @@ def register(
     # Check if registration feature is enabled
     from app.models import SystemSetting
     allow_reg = db.query(SystemSetting).filter(SystemSetting.key == "allow_registration").first()
-    if allow_reg and allow_reg.value.strip().lower() == "false":
+    is_reg_allowed = (
+        allow_reg.value.strip().lower() != "false"
+        if (allow_reg and allow_reg.value.strip())
+        else bool(settings.ALLOW_REGISTRATION)
+    )
+    if not is_reg_allowed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Tính năng đăng ký tài khoản mới hiện đang bị tạm khóa bởi Quản trị viên."
@@ -193,6 +198,12 @@ def verify_email(payload: VerifyEmailRequest, request: Request, db: Session = De
     user.verification_code = None
     user.verification_expires_at = None
     db.commit()
+
+    if not user.is_approved:
+        return {
+            "status": "pending_approval",
+            "message": "Xác thực email thành công! Tài khoản của bạn đang chờ Quản trị viên phê duyệt trước khi có thể đăng nhập.",
+        }
 
     return {"status": "success", "message": "Xác thực email thành công! Tài khoản đã được kích hoạt."}
 
@@ -456,6 +467,19 @@ def oauth_mock(payload: MockOAuthRequest, db: Session = Depends(get_db)):
                 user.is_verified = True
             db.commit()
         else:
+            is_admin_user = (payload.email == "phucsd@gmail.com")
+            if not is_admin_user:
+                allow_reg = db.query(SystemSetting).filter(SystemSetting.key == "allow_registration").first()
+                is_reg_allowed = (
+                    allow_reg.value.strip().lower() != "false"
+                    if (allow_reg and allow_reg.value.strip())
+                    else bool(settings.ALLOW_REGISTRATION)
+                )
+                if not is_reg_allowed:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Tính năng đăng ký tài khoản mới hiện đang bị tạm khóa bởi Quản trị viên.",
+                    )
             # Auto-register new OAuth user
             user_id = generate_id("usr")
             rand_pwd = secrets.token_hex(16)
@@ -470,7 +494,6 @@ def oauth_mock(payload: MockOAuthRequest, db: Session = Depends(get_db)):
                 username = f"{base_username}_{counter}"
                 counter += 1
                 
-            is_admin_user = (payload.email == "phucsd@gmail.com")
             is_approved = True if (is_admin_user or not system_requires_approval) else False
 
             user = User(
@@ -625,6 +648,19 @@ def oauth_callback(
                 user.is_approved = True
             db.commit()
         else:
+            is_admin_user = (email == "phucsd@gmail.com")
+            if not is_admin_user:
+                allow_reg = db.query(SystemSetting).filter(SystemSetting.key == "allow_registration").first()
+                is_reg_allowed = (
+                    allow_reg.value.strip().lower() != "false"
+                    if (allow_reg and allow_reg.value.strip())
+                    else bool(settings.ALLOW_REGISTRATION)
+                )
+                if not is_reg_allowed:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Tính năng đăng ký tài khoản mới hiện đang bị tạm khóa bởi Quản trị viên.",
+                    )
             # Create user
             user_id = generate_id("usr")
             rand_pwd = secrets.token_hex(16)
@@ -638,7 +674,6 @@ def oauth_callback(
                 username = f"{base_username}_{counter}"
                 counter += 1
                 
-            is_admin_user = (email == "phucsd@gmail.com")
             is_approved = True if (is_admin_user or not system_requires_approval) else False
 
             user = User(

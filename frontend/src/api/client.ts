@@ -275,6 +275,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, newOptions);
   
   if (!response.ok) {
+    if (response.status === 401 && token && !path.startsWith("/v1/auth/login")) {
+      localStorage.removeItem("VITE_JWT_TOKEN");
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("omnivoice:unauthorized"));
+      }
+    }
     let errorDetail: string;
     try {
       const errData = (await response.json()) as { detail?: string };
@@ -389,8 +395,10 @@ export const api = {
   },
 
   getASRAudioUrl: (jobId: string): string => {
+    const token = localStorage.getItem("VITE_JWT_TOKEN");
     const baseUrl = getApiBaseUrl();
-    return `${baseUrl}/v1/asr/jobs/${jobId}/audio`;
+    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
+    return `${baseUrl}/v1/asr/jobs/${encodeURIComponent(jobId)}/audio${qs}`;
   },
   
   getJobStatus: async (jobId: string): Promise<JobStatusResponse> => {
@@ -657,7 +665,7 @@ export const api = {
     });
   },
 
-  scanLlmModels: async (provider?: string, apiKey?: string, customEndpoint?: string): Promise<{ status: string; models: string[]; count: number }> => {
+  scanLlmModels: async (provider?: string, apiKey?: string, customEndpoint?: string, profileId?: string): Promise<{ status: string; models: string[]; count: number }> => {
     return request<{ status: string; models: string[]; count: number }>("/v1/admin/llm/scan-models", {
       method: "POST",
       headers: {
@@ -666,7 +674,8 @@ export const api = {
       body: JSON.stringify({
         provider: provider || "gemini",
         api_key: apiKey || null,
-        custom_endpoint: customEndpoint || null
+        custom_endpoint: customEndpoint || null,
+        profile_id: profileId || null,
       }),
     });
   },
@@ -731,6 +740,7 @@ export const api = {
       videoDuration?: number;
       voiceMode?: string;
       voiceSampleId?: string;
+      enableSeparation?: boolean;
     }
   ): Promise<VideoDubbingJobResponse> => {
     const formData = new FormData();
@@ -744,6 +754,7 @@ export const api = {
     if (extra?.videoDuration !== undefined) formData.append("video_duration", String(extra.videoDuration));
     if (extra?.voiceMode) formData.append("voice_mode", extra.voiceMode);
     if (extra?.voiceSampleId) formData.append("voice_sample_id", extra.voiceSampleId);
+    if (extra?.enableSeparation !== undefined) formData.append("enable_separation", String(extra.enableSeparation));
     formData.append("target_language", targetLanguage || "Vietnamese");
     
     const savedOauth = localStorage.getItem("youtube_oauth_token");
@@ -778,6 +789,12 @@ export const api = {
         preferred_quality: preferredQuality,
         target_language: targetLanguage,
       }),
+    });
+  },
+
+  cancelDubbingJob: async (jobId: string): Promise<VideoDubbingJobResponse> => {
+    return request<VideoDubbingJobResponse>(`/v1/video-dubbing/jobs/${jobId}/cancel`, {
+      method: "POST",
     });
   },
 
@@ -832,12 +849,26 @@ export const api = {
     });
   },
 
-  uploadDubbingVideo: async (file: File, onProgress: (progress: number) => void): Promise<VideoDubbingJobResponse> => {
+  uploadDubbingVideo: async (file: File, onProgress: (progress: number) => void, signal?: AbortSignal): Promise<VideoDubbingJobResponse> => {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       const url = `${getApiBaseUrl()}/v1/video-dubbing/upload`;
       
       xhr.open("POST", url, true);
+
+      if (signal) {
+        if (signal.aborted) {
+          reject(new Error("Đã hủy tải video lên."));
+          return;
+        }
+        signal.addEventListener("abort", () => {
+          xhr.abort();
+        }, { once: true });
+      }
+      
+      xhr.onabort = () => {
+        reject(new Error("Đã hủy tải video lên."));
+      };
       
       // Add Authorization header if token exists
       const token = localStorage.getItem("VITE_JWT_TOKEN");
@@ -1290,6 +1321,7 @@ export interface VideoDubbingJobResponse {
   voice_mode?: string | null;
   voice_sample_id?: string | null;
   llm_profile_id?: string | null;
+  enable_separation?: boolean;
   original_subtitles: SubtitleSegment[] | null;
   translated_subtitles: SubtitleSegment[] | null;
   vocals_audio_path: string | null;
