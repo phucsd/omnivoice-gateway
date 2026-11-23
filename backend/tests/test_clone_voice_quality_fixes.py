@@ -158,3 +158,13 @@ def test_generated_worker_contains_clone_voice_prompt_guard_and_qa_gate():
         bsrc = open(batch_path, encoding="utf-8").read()
         ast.parse(bsrc)
         assert "REF_TEXT = None" in bsrc
+
+
+def test_file_sqlite_engine_uses_nullpool():
+    from sqlalchemy.pool import NullPool
+    from app.config import settings
+    from app.database import engine
+
+    if settings.DATABASE_URL.startswith("sqlite") and ":memory:" not in settings.DATABASE_URL:
+        assert isinstance(engine.pool, NullPool)
+

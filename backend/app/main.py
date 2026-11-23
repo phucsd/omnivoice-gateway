@@ -398,6 +398,10 @@ async def log_api_usage(request: Request, call_next):
         db.add(log_entry)
         db.commit()
     except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         print(f"[Middleware API Logger] Failed to save log: {e}")
     finally:
         db.close()

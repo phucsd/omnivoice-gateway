@@ -5,6 +5,7 @@ import sqlite3
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.event import listens_for
+from sqlalchemy.pool import NullPool
 from app.config import settings
 
 def get_sqlite_path(db_url: str) -> str:
@@ -158,28 +159,32 @@ if settings.DATABASE_URL.startswith("sqlite"):
                     except Exception:
                         pass
 
-# For SQLite, we set timeout=60 and check_same_thread=False
+# For file-based SQLite (especially on HF Spaces FUSE bucket /data), use NullPool so
+# connections are never held open across FUSE inode updates or rolling deploys (prevents
+# permanently poisoned QueuePool connections causing periodic HTTP 500s).
 connect_args = {}
+engine_kwargs = {"echo": False}
 if settings.DATABASE_URL.startswith("sqlite"):
     connect_args = {
         "check_same_thread": False,
         "timeout": 60
     }
+    if ":memory:" not in settings.DATABASE_URL:
+        engine_kwargs["poolclass"] = NullPool
 
 engine = create_engine(
     settings.DATABASE_URL,
     connect_args=connect_args,
-    echo=False
+    **engine_kwargs
 )
 
-# Apply performance and lock-avoidance pragmas to SQLite connections
+# Apply read-safe per-connection pragmas only (journal_mode=DELETE is already set once at startup;
+# re-issuing journal_mode=DELETE on every connection acquires write locks even for SELECT queries).
 @listens_for(engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
     if settings.DATABASE_URL.startswith("sqlite"):
         try:
             cursor = dbapi_connection.cursor()
-            # Force DELETE journal mode to avoid .shm / .wal lock files on NFS
-            cursor.execute("PRAGMA journal_mode=DELETE")
             cursor.execute("PRAGMA busy_timeout=60000")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
@@ -631,5 +636,11 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         db.close()
