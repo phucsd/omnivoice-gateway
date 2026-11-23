@@ -77,9 +77,83 @@ class VoiceLibraryItemResponse(BaseModel):
     created_at: datetime
 
 
+class VoiceDesignAttributes(BaseModel):
+    gender: Optional[str] = None
+    age: Optional[str] = None
+    pitch: Optional[str] = None
+    style: Optional[str] = None
+    accent: Optional[str] = None
+
+
+class VoiceDesignRecommendedParams(BaseModel):
+    speed: float = 1.0
+    guidance_scale: float = 2.0
+    position_temperature: float = 5.0
+    class_temperature: float = 0.0
+    t_shift: float = 0.1
+    num_step: int = 32
+    denoise: bool = True
+    language: Optional[str] = "vi"
+
+
+class VoiceDesignVariant(BaseModel):
+    label: str
+    summary: str
+    instruct: str
+    attributes: VoiceDesignAttributes
+    speed: float = 1.0
+    guidance_scale: float = 2.0
+    position_temperature: float = 5.0
+    class_temperature: float = 0.0
+    preview_text: str
+
+
+class VoiceDesignAssistRequest(BaseModel):
+    voice_request: str
+    target_language: Optional[str] = "auto"
+    current_preview_text: Optional[str] = None
+    preserve_preview_text: bool = False
+    llm_profile_id: Optional[str] = None
+
+
+class VoiceDesignAssistResponse(BaseModel):
+    source: str
+    llm_model: Optional[str] = None
+    profile_name: Optional[str] = None
+    instruct: str
+    attributes: VoiceDesignAttributes
+    recommended_params: VoiceDesignRecommendedParams
+    preview_text: str
+    suggested_name: str
+    suggested_slug: str
+    suggested_tags: List[str] = []
+    explanation: str
+    variants: List[VoiceDesignVariant] = []
+
+
+class VoiceDesignScriptRequest(BaseModel):
+    voice_request: Optional[str] = ""
+    instruct: Optional[str] = ""
+    style_or_topic: Optional[str] = "Kể chuyện tự nhiên"
+    language: Optional[str] = "vi"
+    include_paralinguistic: bool = False
+    llm_profile_id: Optional[str] = None
+
+
+class VoiceDesignScriptResponse(BaseModel):
+    source: str
+    preview_text: str
+    language: str
+    estimated_duration: float
+    llm_model: Optional[str] = None
+
+
 class VoiceDesignPreviewCreate(BaseModel):
     voice_request: str
     preview_text: str
+    instruct: Optional[str] = None
+    use_llm: Optional[bool] = True
+    llm_profile_id: Optional[str] = None
     speed: Optional[float] = 1.0
     num_step: Optional[int] = 32
     denoise: Optional[bool] = True
@@ -103,6 +177,7 @@ class VoiceDesignPreviewResponse(BaseModel):
     job_id: str
     status: str
     message: str
+    instruct: Optional[str] = None
 
 class VoiceDesignPreviewDetail(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -115,6 +190,36 @@ class VoiceDesignPreviewDetail(BaseModel):
     accepted_sample_id: Optional[str] = None
     status: str
     created_at: datetime
+
+
+class VoiceDesignPreviewHistoryItem(BaseModel):
+    id: str
+    job_id: Optional[str] = None
+    voice_request: str
+    instruct: str
+    preview_text: str
+    status: str
+    progress: int = 0
+    audio_url: Optional[str] = None
+    cdn_audio_url: Optional[str] = None
+    accepted_sample_id: Optional[str] = None
+    speed: Optional[float] = 1.0
+    num_step: Optional[int] = 32
+    guidance_scale: Optional[float] = 2.0
+    position_temperature: Optional[float] = 5.0
+    class_temperature: Optional[float] = 0.0
+    t_shift: Optional[float] = 0.1
+    language: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime
+
+
+class AcceptPreviewRequest(BaseModel):
+    name: Optional[str] = Field(None, max_length=100)
+    tags: Optional[List[str]] = None
+    is_public: bool = False
+    custom_id: Optional[str] = Field(None, max_length=50)
+
 
 class AcceptPreviewResponse(BaseModel):
     voice_sample_id: str
@@ -145,6 +250,14 @@ class TTSJobCreate(BaseModel):
     pad_duration: Optional[float] = None
     fade_duration: Optional[float] = None
     normalize_text: Optional[bool] = Field(True, description="Tự động chuẩn hóa số (1.6 -> một chấm sáu, 1.600 -> một nghìn sáu trăm, 1,3456 -> một phẩy ba bốn năm sáu), ngày tháng, tiền tệ thành chữ đọc tiếng Việt tự nhiên. Mặc định: true.")
+
+    @field_validator("ref_text", "language", mode="before")
+    @classmethod
+    def _empty_str_to_none(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            stripped = v.strip()
+            return stripped if stripped else None
+        return v
 
 class TTSJobResponse(BaseModel):
     job_id: str
@@ -383,3 +496,12 @@ class TestLLMProfileResponse(BaseModel):
 class SubtitleUpdateRequest(BaseModel):
     original_subtitles: Optional[List[SubtitleSegment]] = None
     translated_subtitles: Optional[List[SubtitleSegment]] = None
+
+
+class VoiceDesignLLMStatusResponse(BaseModel):
+    is_configured: bool
+    active_provider: str
+    active_model: str
+    active_profile_id: Optional[str] = None
+    active_profile_name: str
+    profiles: List[LLMProfilePublicResponse] = []

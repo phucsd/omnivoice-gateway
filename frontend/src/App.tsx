@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from "react";
-import { Sparkles, Radio, RefreshCw, Layers, LogOut, Server, KeyRound, BookOpen, Sun, Moon, Monitor, Volume2, Menu, X, Mic, Sliders, Video } from "lucide-react";
+import { Sparkles, Radio, RefreshCw, Layers, LogOut, Server, KeyRound, BookOpen, Sun, Moon, Monitor, Volume2, Menu, X, Mic, Sliders, Video, Upload, Wand2 } from "lucide-react";
 import { api } from "./api/client";
 import { audioEngine } from "./services/audioEngine";
 
 import { VoiceSampleUpload } from "./components/VoiceSampleUpload";
 import { VoiceDesignPanel } from "./components/VoiceDesignPanel";
+import { PageHeader } from "./components/ui/PageHeader";
 import { TTSPanel } from "./components/TTSPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ApiKeyPanel } from "./components/ApiKeyPanel";
@@ -107,6 +108,7 @@ function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem("VITE_JWT_TOKEN"));
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<AppTab>(() => parseTabFromHash(window.location.hash));
+  const [voiceLabMode, setVoiceLabMode] = useState<"design" | "upload">("design");
   const [pendingDubbingJobId, setPendingDubbingJobId] = useState<string | null>(null);
   const [dubbingListNavTrigger, setDubbingListNavTrigger] = useState<number>(0);
 
@@ -724,21 +726,73 @@ function App() {
           )}
 
           {activeTab === "voice-lab" && (
-            <div className="w-full grid grid-cols-1 xl:grid-cols-2 gap-6 animate-fadeIn items-start">
-              <ErrorBoundary fallbackTitle="Lỗi hiển thị Tải Mẫu Giọng">
-                <VoiceSampleUpload onUploadSuccess={handleVoiceSampleActive} layout={uiLayout} />
-              </ErrorBoundary>
-              <ErrorBoundary fallbackTitle="Lỗi hiển thị Voice Design">
-                <VoiceDesignPanel
-                  onAcceptSuccess={handleVoiceSampleActive}
-                  onJobCreatedOrUpdated={handleJobCreatedOrUpdated}
-                  layout={uiLayout}
-                  currentPlayUrl={currentPlayUrl}
-                  globalPlayerPlaying={globalPlayerPlaying}
-                  onPlayAudio={(url, title) => handlePlayAudio(url, title, false)}
-                  onTogglePlay={handleTogglePlay}
+            <div className="w-full flex flex-col gap-6 animate-fadeIn">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <PageHeader
+                  title="Thiết kế giọng nói"
+                  description="Kiến tạo giọng đọc nhân tạo từ mô tả ngôn ngữ tự nhiên với trợ lý LLM hoặc tải lên mẫu âm thanh có sẵn."
+                  icon={<Sliders className="w-6 h-6" />}
                 />
-              </ErrorBoundary>
+
+                <div
+                  role="tablist"
+                  aria-label="Chế độ tạo giọng mẫu"
+                  className="inline-flex bg-card border border-border p-1 rounded-xl shrink-0 self-start sm:self-auto"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={voiceLabMode === "design"}
+                    onClick={() => setVoiceLabMode("design")}
+                    className={`min-h-[42px] px-4 py-2 rounded-lg text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
+                      voiceLabMode === "design"
+                        ? "bg-primary text-primary-foreground"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <Wand2 className="w-3.5 h-3.5" />
+                    <span>Thiết kế giọng AI</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={voiceLabMode === "upload"}
+                    onClick={() => setVoiceLabMode("upload")}
+                    className={`min-h-[42px] px-4 py-2 rounded-lg text-xs font-bold transition-colors cursor-pointer flex items-center gap-2 ${
+                      voiceLabMode === "upload"
+                        ? "bg-primary text-primary-foreground"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>Tải lên mẫu âm thanh</span>
+                  </button>
+                </div>
+              </div>
+
+              {voiceLabMode === "design" ? (
+                <ErrorBoundary fallbackTitle="Lỗi hiển thị Voice Design">
+                  <VoiceDesignPanel
+                    onAcceptSuccess={handleVoiceSampleActive}
+                    onUseVoiceInTTS={(id) => {
+                      setActiveVoiceSampleId(id);
+                      navigateToTab("workspace");
+                    }}
+                    onJobCreatedOrUpdated={handleJobCreatedOrUpdated}
+                    layout={uiLayout}
+                    currentPlayUrl={currentPlayUrl}
+                    globalPlayerPlaying={globalPlayerPlaying}
+                    onPlayAudio={(url, title) => handlePlayAudio(url, title, false)}
+                    onTogglePlay={handleTogglePlay}
+                  />
+                </ErrorBoundary>
+              ) : (
+                <div className="max-w-2xl w-full">
+                  <ErrorBoundary fallbackTitle="Lỗi hiển thị Tải Mẫu Giọng">
+                    <VoiceSampleUpload onUploadSuccess={handleVoiceSampleActive} layout={uiLayout} />
+                  </ErrorBoundary>
+                </div>
+              )}
             </div>
           )}
 

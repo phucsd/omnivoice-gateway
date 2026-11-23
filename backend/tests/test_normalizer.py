@@ -120,4 +120,17 @@ def test_phonetic_syllable_count_and_duration_estimator():
     assert budget["min_syl"] < budget["ideal_syl"] < budget["max_syl"]
 
 
+def test_science_and_tech_terms_vietnamese_pronunciation():
+    assert normalize_vietnamese_text("Chỉnh sửa gen CRISPR-Cas9 cắt mạch ADN và ARN.") == (
+        "Chỉnh sửa gen crít spơ cát chín cắt mạch a đê en và a rờ en."
+    )
+    assert normalize_vietnamese_text("CRISPR dùng đoạn RNA dẫn đường cho Cas9.") == (
+        "Crít spơ dùng đoạn rờ en ây dẫn đường cho cát chín."
+    )
+    assert normalize_vietnamese_text("Mỗi GPU và CPU xử lý hàng tỷ phép tính.") == (
+        "Mỗi gờ pê u và xê pê u xử lý hàng tỷ phép tính."
+    )
+
+
+
 

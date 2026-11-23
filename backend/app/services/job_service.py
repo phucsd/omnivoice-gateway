@@ -21,64 +21,83 @@ class JobService:
         Maps a Vietnamese voice design description into valid OmniVoice English instruct tags.
         If the input is already an English instruct sequence (e.g. comma-separated tags), it is preserved.
         """
-        req_lower = voice_request.lower().strip()
-        
+        import re as _re
+
+        req_lower = (voice_request or "").lower().strip()
+        if not req_lower:
+            return "female, young adult"
+
         # 1. If it doesn't contain Vietnamese diacritics and matches typical English keywords, pass it through directly
         vietnamese_chars = "àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệđìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵ"
         has_vietnamese = any(c in vietnamese_chars for c in req_lower)
-        
-        english_keywords = ["male", "female", "child", "young", "adult", "middle", "elderly", "pitch", "whisper", "accent", "laughter", "giggle"]
+
+        english_keywords = [
+            "male", "female", "child", "teenager", "young", "adult", "middle", "elderly",
+            "pitch", "whisper", "accent", "laughter", "giggle",
+        ]
         has_english_keyword = any(kw in req_lower for kw in english_keywords)
-        
+
         if not has_vietnamese and (has_english_keyword or "," in req_lower):
-            # Clean and return the comma-separated English instruct tags
             parts = [p.strip() for p in voice_request.split(",") if p.strip()]
             if parts:
                 return ", ".join(parts)
             return req_lower
 
+        def _has_word(phrase: str) -> bool:
+            return bool(_re.search(r"(?<!\w)" + _re.escape(phrase) + r"(?!\w)", req_lower))
+
         # 2. Otherwise, map Vietnamese description to standard English instruct tags
         instructs = []
 
         # Gender
-        if "nữ" in req_lower:
+        if _has_word("nữ") or _has_word("cô") or _has_word("chị") or _has_word("bà"):
             instructs.append("female")
-        elif "nam" in req_lower:
+        elif _has_word("nam") or _has_word("anh") or _has_word("chú") or _has_word("ông"):
             instructs.append("male")
 
         # Age group
-        if "trẻ em" in req_lower or "con nít" in req_lower or "bé" in req_lower:
+        if "trẻ em" in req_lower or "con nít" in req_lower or "thiếu nhi" in req_lower or _has_word("bé"):
             instructs.append("child")
         elif "thiếu niên" in req_lower:
             instructs.append("teenager")
-        elif "trẻ" in req_lower or "thanh niên" in req_lower:
-            instructs.append("young adult")
         elif "trung niên" in req_lower:
             instructs.append("middle-aged")
-        elif "già" in req_lower or "lớn tuổi" in req_lower or "lão" in req_lower:
+        elif "cao tuổi" in req_lower or "lớn tuổi" in req_lower or _has_word("già") or _has_word("lão") or _has_word("cụ"):
             instructs.append("elderly")
+        elif _has_word("trẻ") or "thanh niên" in req_lower:
+            instructs.append("young adult")
 
         # Pitch/Tone
-        if "trầm" in req_lower or "thấp" in req_lower:
+        if "rất trầm" in req_lower or "cực trầm" in req_lower:
+            instructs.append("very low pitch")
+        elif "rất cao" in req_lower or "cao vút" in req_lower:
+            instructs.append("very high pitch")
+        elif _has_word("trầm") or _has_word("thấp"):
             instructs.append("low pitch")
-        elif "cao" in req_lower:
+        elif _has_word("cao") or "trong sáng" in req_lower:
             instructs.append("high pitch")
-        elif "vừa" in req_lower or "bình thường" in req_lower:
+        elif _has_word("vừa") or "bình thường" in req_lower or "cân bằng" in req_lower:
             instructs.append("moderate pitch")
 
         # Style
-        if "thì thầm" in req_lower or "nhẹ nhàng" in req_lower or "nói nhỏ" in req_lower:
+        if "thì thầm" in req_lower or "nhẹ nhàng" in req_lower or "nói nhỏ" in req_lower or "asmr" in req_lower:
             instructs.append("whisper")
-        if "cười" in req_lower:
-            instructs.append("laughter")
 
         # Accents
         if "giọng mỹ" in req_lower or "tiếng mỹ" in req_lower or "accent mỹ" in req_lower:
             instructs.append("american accent")
         elif "giọng anh" in req_lower or "tiếng anh" in req_lower or "accent anh" in req_lower:
             instructs.append("british accent")
+        elif "giọng úc" in req_lower or "accent úc" in req_lower:
+            instructs.append("australian accent")
+        elif "canada" in req_lower:
+            instructs.append("canadian accent")
         elif "giọng ấn" in req_lower or "accent ấn" in req_lower:
             instructs.append("indian accent")
+        elif "accent nhật" in req_lower:
+            instructs.append("japanese accent")
+        elif "accent hàn" in req_lower:
+            instructs.append("korean accent")
 
         # Fallback defaults if empty
         if not instructs:
@@ -109,13 +128,25 @@ class JobService:
         language: str = None,
         pad_duration: float = None,
         fade_duration: float = None,
-        normalize_text: bool = True
+        normalize_text: bool = True,
+        instruct_override: str = None,
+        use_llm: bool = True,
+        llm_profile_id: str = None,
     ) -> tuple[VoiceDesignPreview, TTSJob]:
         """Creates a VoiceDesignPreview entry and triggers a background preview TTS job."""
+        from app.services.voice_design_service import VoiceDesignService
+
         preview_id = generate_id("vd")
         job_id = generate_id("job")
-        
-        instruct = JobService.map_vietnamese_request_to_instruct(voice_request)
+
+        instruct = VoiceDesignService.resolve_instruct_fast(
+            db=db,
+            voice_request=voice_request,
+            explicit_instruct=instruct_override,
+            use_llm=bool(use_llm),
+            llm_profile_id=llm_profile_id,
+            fallback_mapper=JobService.map_vietnamese_request_to_instruct,
+        )
 
         if normalize_text:
             from app.utils.vietnamese_normalizer import normalize_vietnamese_text
@@ -224,15 +255,26 @@ class JobService:
                 raise ValueError("Bạn không có quyền sử dụng mẫu giọng riêng tư này.")
 
             ref_audio_path = sample.file_path
-            ref_text_val = ref_text if ref_text is not None else sample.ref_text
+            explicit_ref_text = ref_text.strip() if isinstance(ref_text, str) and ref_text.strip() else None
+            sample_ref_text = sample.ref_text.strip() if isinstance(sample.ref_text, str) and sample.ref_text.strip() else None
+            ref_text_val = explicit_ref_text or sample_ref_text
             if ref_text_val and normalize_text:
                 ref_text_val = normalize_vietnamese_text(ref_text_val)
         elif mode == "auto_voice":
             job_type = "auto_voice"
         elif mode == "voice_design":
             job_type = "voice_design_tts"
-            if not instruct:
+            if not instruct or not instruct.strip():
                 instruct = "female, young adult"
+            else:
+                from app.services.voice_design_service import VoiceDesignService
+                instruct = VoiceDesignService.resolve_instruct_fast(
+                    db=db,
+                    voice_request=instruct,
+                    explicit_instruct=instruct,
+                    use_llm=True,
+                    fallback_mapper=JobService.map_vietnamese_request_to_instruct,
+                )
         else:
             raise ValueError(f"Chế độ TTS không hợp lệ: {mode}")
 
@@ -410,8 +452,19 @@ class JobService:
         return job
 
     @staticmethod
-    def accept_preview(db: Session, preview_id: str, user_id: str = None) -> VoiceSample:
+    def accept_preview(
+        db: Session,
+        preview_id: str,
+        user_id: str = None,
+        name: str = None,
+        tags: Optional[List[str]] = None,
+        is_public: bool = False,
+        custom_id: str = None,
+    ) -> VoiceSample:
         """Takes a completed preview audio and registers it as a reusable cloned VoiceSample."""
+        import json as _json
+        from app.utils.slugify import slugify
+
         preview = db.query(VoiceDesignPreview).filter(VoiceDesignPreview.id == preview_id).first()
         if not preview:
             raise ValueError(f"Không tìm thấy Voice Design Preview {preview_id}")
@@ -419,20 +472,27 @@ class JobService:
         if preview.status != "completed" or not preview.preview_audio_path or not os.path.exists(preview.preview_audio_path):
             raise ValueError(f"Bản nghe thử {preview_id} chưa sẵn sàng hoặc không tồn tại audio file.")
 
-        sample_id = f"vs_from_{preview_id}"
-
         # Idempotent return if this preview was already accepted earlier
         if preview.accepted_sample_id:
             existing_accepted = db.query(VoiceSample).filter(VoiceSample.id == preview.accepted_sample_id).first()
             if existing_accepted:
                 return existing_accepted
 
-        existing_sample = db.query(VoiceSample).filter(VoiceSample.id == sample_id).first()
-        if existing_sample:
-            preview.accepted_sample_id = existing_sample.id
-            db.commit()
-            db.refresh(existing_sample)
-            return existing_sample
+        if custom_id and custom_id.strip():
+            norm_id = slugify(custom_id.strip())
+            if not norm_id:
+                raise ValueError("Mã ID giọng nói (custom_id) không hợp lệ.")
+            if db.query(VoiceSample).filter(VoiceSample.id == norm_id).first():
+                raise ValueError(f"Mã ID giọng nói '{norm_id}' đã tồn tại.")
+            sample_id = norm_id
+        else:
+            sample_id = f"vs_from_{preview_id}"
+            existing_sample = db.query(VoiceSample).filter(VoiceSample.id == sample_id).first()
+            if existing_sample:
+                preview.accepted_sample_id = existing_sample.id
+                db.commit()
+                db.refresh(existing_sample)
+                return existing_sample
 
         # Determine paths
         AudioService.ensure_directories()
@@ -453,25 +513,56 @@ class JobService:
             duration = 5.0
             sample_rate = 24000
 
+        resolved_name = (name or "").strip()[:100]
+        if not resolved_name:
+            req_snippet = (preview.voice_request or preview.instruct or "Voice Design").strip()
+            resolved_name = f"Thiết kế: {req_snippet[:60]}"
+
+        source_job = db.query(TTSJob).filter(TTSJob.preview_id == preview_id).first()
+        source_job_data_str = None
+        if source_job:
+            source_job_data_str = _json.dumps(
+                {
+                    "mode": source_job.job_type,
+                    "voice_request": preview.voice_request,
+                    "instruct": preview.instruct,
+                    "speed": source_job.speed,
+                    "num_step": source_job.num_step,
+                    "denoise": source_job.denoise,
+                    "guidance_scale": source_job.guidance_scale,
+                    "t_shift": source_job.t_shift,
+                    "position_temperature": source_job.position_temperature,
+                    "class_temperature": source_job.class_temperature,
+                },
+                ensure_ascii=False,
+            )
+
+        tags_str = _json.dumps(tags, ensure_ascii=False) if tags else None
+
         # Save voice sample entry
         sample = VoiceSample(
             id=sample_id,
             user_id=user_id or preview.user_id,
+            name=resolved_name,
+            is_public=bool(is_public),
             source_type="voice_design_preview",
+            source_job_id=source_job.id if source_job else preview_id,
             file_path=dest_path,
-            ref_text=preview.preview_text,
+            ref_text=(preview.preview_text or "").strip() or None,
             duration=duration,
             sample_rate=sample_rate,
-            status="ready"
+            status="ready",
+            tags=tags_str,
+            source_job_data=source_job_data_str,
         )
-        
+
         db.add(sample)
         preview.accepted_sample_id = sample_id
         db.commit()
-        
+
         db.refresh(sample)
         db.refresh(preview)
-        
+
         return sample
 
     @staticmethod

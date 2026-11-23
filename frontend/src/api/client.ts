@@ -71,11 +71,92 @@ export interface VoiceSampleUpdateRequest {
   is_public?: boolean;
 }
 
+export interface VoiceDesignAttributes {
+  gender?: string | null;
+  age?: string | null;
+  pitch?: string | null;
+  style?: string | null;
+  accent?: string | null;
+}
+
+export interface VoiceDesignRecommendedParams {
+  speed: number;
+  guidance_scale: number;
+  position_temperature: number;
+  class_temperature: number;
+  t_shift: number;
+  num_step: number;
+  denoise: boolean;
+  language?: string | null;
+}
+
+export interface VoiceDesignVariant {
+  label: string;
+  summary: string;
+  instruct: string;
+  attributes: VoiceDesignAttributes;
+  speed: number;
+  guidance_scale: number;
+  position_temperature: number;
+  class_temperature: number;
+  preview_text: string;
+}
+
+export interface VoiceDesignAssistRequest {
+  voice_request: string;
+  target_language?: string;
+  current_preview_text?: string;
+  preserve_preview_text?: boolean;
+  llm_profile_id?: string | null;
+}
+
+export interface VoiceDesignAssistResponse {
+  source: "llm" | "heuristic_fallback" | string;
+  llm_model?: string | null;
+  profile_name?: string | null;
+  instruct: string;
+  attributes: VoiceDesignAttributes;
+  recommended_params: VoiceDesignRecommendedParams;
+  preview_text: string;
+  suggested_name: string;
+  suggested_slug: string;
+  suggested_tags: string[];
+  explanation: string;
+  variants: VoiceDesignVariant[];
+}
+
+export interface VoiceDesignScriptRequest {
+  voice_request?: string;
+  instruct?: string;
+  style_or_topic?: string;
+  language?: string;
+  include_paralinguistic?: boolean;
+  llm_profile_id?: string | null;
+}
+
+export interface VoiceDesignScriptResponse {
+  source: string;
+  preview_text: string;
+  language: string;
+  estimated_duration: number;
+  llm_model?: string | null;
+}
+
+export interface VoiceDesignLLMStatusResponse {
+  is_configured: boolean;
+  active_provider: string;
+  active_model: string;
+  active_profile_id?: string | null;
+  active_profile_name: string;
+  profiles: LLMProfilePublic[];
+}
+
 export interface VoiceDesignPreviewResponse {
   preview_id: string;
   job_id: string;
   status: string;
   message: string;
+  instruct?: string | null;
 }
 
 export interface VoiceDesignPreviewDetail {
@@ -86,6 +167,28 @@ export interface VoiceDesignPreviewDetail {
   preview_audio_path: string | null;
   accepted_sample_id: string | null;
   status: string;
+  created_at: string;
+}
+
+export interface VoiceDesignPreviewHistoryItem {
+  id: string;
+  job_id?: string | null;
+  voice_request: string;
+  instruct: string;
+  preview_text: string;
+  status: string;
+  progress: number;
+  audio_url?: string | null;
+  cdn_audio_url?: string | null;
+  accepted_sample_id?: string | null;
+  speed?: number;
+  num_step?: number;
+  guidance_scale?: number;
+  position_temperature?: number;
+  class_temperature?: number;
+  t_shift?: number;
+  language?: string | null;
+  error_message?: string | null;
   created_at: string;
 }
 
@@ -340,7 +443,48 @@ export const api = {
     });
   },
   
-  createVoiceDesignPreview: async (voiceRequest: string, previewText: string, speed?: number, numStep?: number, params?: OmniVoiceParams): Promise<VoiceDesignPreviewResponse> => {
+  getVoiceDesignLlmStatus: async (): Promise<VoiceDesignLLMStatusResponse> => {
+    return request<VoiceDesignLLMStatusResponse>(`/v1/voice-design/llm-status?t=${Date.now()}`);
+  },
+
+  assistVoiceDesign: async (payload: VoiceDesignAssistRequest): Promise<VoiceDesignAssistResponse> => {
+    return request<VoiceDesignAssistResponse>("/v1/voice-design/assist", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+  },
+
+  generateVoiceDesignScript: async (payload: VoiceDesignScriptRequest): Promise<VoiceDesignScriptResponse> => {
+    return request<VoiceDesignScriptResponse>("/v1/voice-design/generate-script", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+  },
+
+  listVoiceDesignPreviews: async (limit = 15): Promise<VoiceDesignPreviewHistoryItem[]> => {
+    return request<VoiceDesignPreviewHistoryItem[]>(`/v1/voice-design/previews?limit=${limit}&t=${Date.now()}`);
+  },
+
+  deleteVoiceDesignPreview: async (previewId: string): Promise<{ status: string; message: string }> => {
+    return request<{ status: string; message: string }>(`/v1/voice-design/previews/${previewId}`, {
+      method: "DELETE",
+    });
+  },
+
+  createVoiceDesignPreview: async (
+    voiceRequest: string,
+    previewText: string,
+    speed?: number,
+    numStep?: number,
+    params?: OmniVoiceParams,
+    extra?: { instruct?: string; use_llm?: boolean; llm_profile_id?: string | null }
+  ): Promise<VoiceDesignPreviewResponse> => {
     return request<VoiceDesignPreviewResponse>("/v1/voice-design/previews", {
       method: "POST",
       headers: {
@@ -351,6 +495,9 @@ export const api = {
         preview_text: previewText,
         speed: speed !== undefined ? speed : 1.0,
         num_step: numStep !== undefined ? numStep : 32,
+        instruct: extra?.instruct || undefined,
+        use_llm: extra?.use_llm !== undefined ? extra.use_llm : true,
+        llm_profile_id: extra?.llm_profile_id || undefined,
         ...params
       }),
     });
@@ -360,9 +507,14 @@ export const api = {
     return request<VoiceDesignPreviewDetail>(`/v1/voice-design/previews/${previewId}?t=${Date.now()}`);
   },
   
-  acceptPreview: async (previewId: string): Promise<AcceptPreviewResponse> => {
+  acceptPreview: async (
+    previewId: string,
+    payload?: { name?: string; tags?: string[]; is_public?: boolean; custom_id?: string }
+  ): Promise<AcceptPreviewResponse> => {
     return request<AcceptPreviewResponse>(`/v1/voice-design/previews/${previewId}/accept`, {
       method: "POST",
+      headers: payload ? { "Content-Type": "application/json" } : undefined,
+      body: payload ? JSON.stringify(payload) : undefined,
     });
   },
   

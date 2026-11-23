@@ -31,7 +31,9 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
   const [text, setText] = useState("Học sinh hôm nay được nghỉ học do thời tiết xấu. Xin nhắc lại, học sinh được nghỉ học.");
   const [customVoiceSampleId, setCustomVoiceSampleId] = useState(() => activeVoiceSampleId || "");
   const [refText, setRefText] = useState("");
-  const [instruct, setInstruct] = useState("female, young adult, warm");
+  const [instruct, setInstruct] = useState("female, young adult, low pitch");
+  const [assistingInstruct, setAssistingInstruct] = useState(false);
+  const [instructHint, setInstructHint] = useState<string | null>(null);
   
   const [loading, setLoading] = useState(false);
   const [jobId, setJobId] = useState<string | null>(() => localStorage.getItem("VITE_TTS_JOB_ID"));
@@ -416,28 +418,76 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
               {mode === "voice_design" && (
                 <div className="flex flex-col gap-2">
                   <label htmlFor="tts-voice-instruct" className="text-xs font-semibold text-foreground">
-                    Mô tả đặc điểm giọng nói (Instruct)
+                    Mô tả đặc điểm giọng nói (Tiếng Việt tự nhiên hoặc OmniVoice Instruct)
                   </label>
-                  <input
-                    id="tts-voice-instruct"
-                    type="text"
-                    value={instruct}
-                    onChange={(e) => setInstruct(e.target.value)}
-                    placeholder="Ví dụ: female, young adult, american accent hoặc Giọng nữ trẻ ấm áp"
-                    className="min-h-[44px] w-full px-3.5 py-2.5 bg-background border border-input rounded-xl text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/30"
-                  />
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      id="tts-voice-instruct"
+                      type="text"
+                      value={instruct}
+                      onChange={(e) => {
+                        setInstruct(e.target.value);
+                        setInstructHint(null);
+                      }}
+                      placeholder="Ví dụ: Giọng nam trung niên đọc bản tin thời sự hoặc female, young adult, low pitch"
+                      className="min-h-[44px] flex-1 px-3.5 py-2.5 bg-background border border-input rounded-xl text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/30"
+                    />
+                    <button
+                      type="button"
+                      disabled={assistingInstruct || !instruct.trim()}
+                      onClick={async () => {
+                        if (!instruct.trim() || assistingInstruct) return;
+                        setAssistingInstruct(true);
+                        setErrorMsg(null);
+                        try {
+                          const res = await api.assistVoiceDesign({
+                            voice_request: instruct.trim(),
+                            target_language: language || "auto",
+                            preserve_preview_text: true,
+                          });
+                          setInstruct(res.instruct);
+                          setSpeed(res.recommended_params.speed);
+                          setGuidanceScale(res.recommended_params.guidance_scale);
+                          setPositionTemperature(res.recommended_params.position_temperature);
+                          setClassTemperature(res.recommended_params.class_temperature);
+                          setActivePreset("");
+                          setInstructHint(res.explanation);
+                        } catch (err: unknown) {
+                          setErrorMsg(getErrorMessage(err, "Không thể tối ưu mô tả giọng bằng AI."));
+                        } finally {
+                          setAssistingInstruct(false);
+                        }
+                      }}
+                      className="min-h-[44px] px-4 py-2 rounded-xl bg-secondary hover:bg-secondary/80 border border-border text-xs font-bold text-foreground flex items-center justify-center gap-1.5 cursor-pointer shrink-0 transition-colors"
+                    >
+                      {assistingInstruct ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Wand2 className="w-3.5 h-3.5 text-primary" />
+                      )}
+                      <span>AI Tối ưu</span>
+                    </button>
+                  </div>
+                  {instructHint && (
+                    <p className="text-xs text-muted-foreground bg-secondary/40 border border-border rounded-xl px-3 py-2">
+                      {instructHint}
+                    </p>
+                  )}
                   <div className="flex flex-wrap gap-1.5">
                     {[
-                      "female, young adult",
+                      "female, young adult, low pitch",
                       "male, middle-aged, low pitch",
-                      "female, calm, whisper",
+                      "female, young adult, whisper",
                       "male, young adult, british accent",
                     ].map((sample) => (
                       <button
                         type="button"
                         key={sample}
-                        onClick={() => setInstruct(sample)}
-                        className="min-h-[36px] px-2.5 py-1 rounded-lg bg-muted hover:bg-secondary border border-border text-xs text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
+                        onClick={() => {
+                          setInstruct(sample);
+                          setInstructHint(null);
+                        }}
+                        className="min-h-[36px] px-2.5 py-1 rounded-lg bg-muted hover:bg-secondary border border-border text-xs font-mono text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
                       >
                         {sample}
                       </button>

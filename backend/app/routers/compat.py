@@ -139,11 +139,20 @@ async def single_inference(
     # 3. Normalize & Create TTS Job
     job_id = generate_id("job")
     synth_text = payload.text
+    clean_ref_text = payload.ref_text.strip() if isinstance(payload.ref_text, str) and payload.ref_text.strip() else None
+    if clean_ref_text is None and voice_sample_id:
+        sample_row = db.query(VoiceSample).filter(VoiceSample.id == voice_sample_id).first()
+        if sample_row and isinstance(sample_row.ref_text, str) and sample_row.ref_text.strip():
+            clean_ref_text = sample_row.ref_text.strip()
     try:
         from app.utils.vietnamese_normalizer import normalize_vietnamese_text
         synth_text = normalize_vietnamese_text(payload.text)
+        if clean_ref_text:
+            clean_ref_text = normalize_vietnamese_text(clean_ref_text)
     except Exception:
         pass
+
+    clean_lang = payload.language_id.strip() if isinstance(payload.language_id, str) and payload.language_id.strip() else None
 
     db_job = TTSJob(
         id=job_id,
@@ -153,7 +162,8 @@ async def single_inference(
         voice_sample_id=voice_sample_id,
         instruct=payload.instruct,
         ref_audio_path=ref_audio_path,
-        ref_text=payload.ref_text,
+        ref_text=clean_ref_text,
+        language=clean_lang,
         speed=payload.speed,
         duration=payload.duration,
         with_alignment=payload.with_alignment,
@@ -333,7 +343,13 @@ async def batch_inference(
             job_type = "voice_design_tts"
         else:
             job_type = "auto_voice"
-            
+
+        clean_batch_ref_text = ref_text.strip() if isinstance(ref_text, str) and ref_text.strip() else None
+        if clean_batch_ref_text is None and voice_sample_id:
+            sample_row = db.query(VoiceSample).filter(VoiceSample.id == voice_sample_id).first()
+            if sample_row and isinstance(sample_row.ref_text, str) and sample_row.ref_text.strip():
+                clean_batch_ref_text = sample_row.ref_text.strip()
+
         job_id = generate_id("job")
         db_job = TTSJob(
             id=job_id,
@@ -343,7 +359,7 @@ async def batch_inference(
             voice_sample_id=voice_sample_id,
             instruct=instruct,
             ref_audio_path=ref_audio_path,
-            ref_text=ref_text,
+            ref_text=clean_batch_ref_text,
             speed=speed,
             duration=duration,
             status="queued",

@@ -120,13 +120,20 @@ def get_next_job(worker_id: str, request: Request, db: Session = Depends(get_db)
 
     output_kind = "preview" if job.job_type == "voice_design_preview" else "tts"
 
+    # Never send empty string "" as ref_text to GPU workers — OmniVoice only auto-transcribes when ref_text is None.
+    resolved_ref_text = job.ref_text.strip() if isinstance(job.ref_text, str) and job.ref_text.strip() else None
+    if resolved_ref_text is None and job.voice_sample_id:
+        sample_row = db.query(VoiceSample).filter(VoiceSample.id == job.voice_sample_id).first()
+        if sample_row and isinstance(sample_row.ref_text, str) and sample_row.ref_text.strip():
+            resolved_ref_text = sample_row.ref_text.strip()
+
     payload = WorkerJobPayload(
         job_id=job.id,
         job_type=job.job_type,
         text=job.text,
         instruct=job.instruct,
         ref_audio_url=ref_audio_url,
-        ref_text=job.ref_text,
+        ref_text=resolved_ref_text,
         output_kind=output_kind,
         speed=job.speed,
         num_step=job.num_step,

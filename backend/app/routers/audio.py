@@ -87,13 +87,15 @@ async def text_to_speech(
     num_step = payload.num_step if payload.num_step is not None else 32
     
     # 3. Create the TTS Job
+    clean_ref_text = payload.ref_text.strip() if isinstance(payload.ref_text, str) and payload.ref_text.strip() else None
+    clean_language = payload.language.strip() if isinstance(payload.language, str) and payload.language.strip() else None
     try:
         job = JobService.create_tts_job(
             db=db,
             mode=mode,
             text=payload.input,
             voice_sample_id=voice_sample_id,
-            ref_text=payload.ref_text,
+            ref_text=clean_ref_text,
             instruct=instruct,
             public_api_url=str(request.base_url).rstrip("/"),
             speed=payload.speed,
@@ -111,7 +113,7 @@ async def text_to_speech(
             audio_chunk_duration=payload.audio_chunk_duration,
             audio_chunk_threshold=payload.audio_chunk_threshold,
             with_alignment=payload.with_alignment,
-            language=payload.language,
+            language=clean_language,
             pad_duration=payload.pad_duration,
             fade_duration=payload.fade_duration,
             normalize_text=payload.normalize_text if payload.normalize_text is not None else True,

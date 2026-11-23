@@ -146,7 +146,7 @@ def _build_job_response(job: TTSJob) -> JobStatusResponse:
         "mode": mode_val,
         "text": display_text,
         "voice_sample_id": job.voice_sample_id,
-        "ref_text": job.ref_text,
+        "ref_text": (job.ref_text.strip() or None) if isinstance(job.ref_text, str) else job.ref_text,
         "instruct": job.instruct,
         "speed": job.speed,
         "num_step": job.num_step,

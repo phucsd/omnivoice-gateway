@@ -102,6 +102,18 @@ WORD_ACRONYMS = {
     "NATO", "COVID", "ASEAN", "RADAR", "SONAR", "UNESCO", "UNICEF", "FIFA", "VISA",
 }
 
+SPECIAL_ACRONYMS_VI = {
+    "ADN": "a đê en",
+    "ARN": "a rờ en",
+    "DNA": "đi en ây",
+    "RNA": "rờ en ây",
+    "GPU": "gờ pê u",
+    "CPU": "xê pê u",
+    "TPU": "tê pê u",
+    "NPU": "en pê u",
+    "CRISPR": "crít spơ",
+}
+
 
 def _expand_alnum_code(code_str: str) -> str:
     """Expands technical alphanumeric codes like 'MIS-C1XD', 'C1', '3D', '5G' into Vietnamese phonetics."""
@@ -235,6 +247,11 @@ def normalize_vietnamese_text(text: str) -> str:
     # 9. Number ranges: 1-2, 10-15 -> 1 đến 2
     s = re.sub(r'\b(\d+)\s*[-–—]\s*(\d+)\b', lambda m: f"{read_int(int(m.group(1)))} đến {read_int(int(m.group(2)))}", s)
 
+    # 9b. Domain-specific scientific / tech terms before generic alphanumeric code expansion
+    s = re.sub(r'\bCRISPR\s*[-–—]\s*Cas9\b', 'crít spơ cát chín', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bCRISPR\b', 'crít spơ', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bCas9\b', 'cát chín', s, flags=re.IGNORECASE)
+
     # 10. Mixed uppercase+digit technical/product codes (e.g. MIS-C1XD, C1XD, C1, 3D, 4K, 5G)
     s = re.sub(
         r'\b(?=[A-Z0-9-]*[A-Z])(?=[A-Z0-9-]*\d)[A-Z0-9]+(?:-[A-Z0-9]+)*\b',
@@ -246,6 +263,8 @@ def normalize_vietnamese_text(text: str) -> str:
     if any(c.islower() for c in s) or len(s.strip(".,!?;: ")) <= 5:
         def repl_acronym(m):
             tok = m.group(0)
+            if tok in SPECIAL_ACRONYMS_VI:
+                return SPECIAL_ACRONYMS_VI[tok]
             if tok in WORD_ACRONYMS:
                 return tok.lower()
             return _expand_alnum_code(tok)

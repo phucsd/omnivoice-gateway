@@ -122,6 +122,8 @@ class KaggleNotebookBuilder:
 import sys
 import io
 import glob
+import difflib
+import re
 import time
 import uuid
 import ctypes
@@ -754,8 +756,8 @@ def _copy_dataset_to_local_ssd(src_root: str) -> str:
 
 def _attach_fast_asr_bridge(model):
     \"\"\"
-    1. Binds faster-whisper onto model.transcribe so load_asr=False saves 1.62GB download & 1.6GB VRAM.
-    2. Wraps create_voice_clone_prompt in torch.inference_mode() (upstream PR #283 fix preventing autograd VRAM leak/OOM).
+    1. Binds faster-whisper (large-v3-turbo on GPU, small fallback) onto model.transcribe so load_asr=False saves 1.62GB download & VRAM.
+    2. Wraps create_voice_clone_prompt in torch.inference_mode() (upstream PR #283 fix) and sanitizes empty ref_text="" -> None so auto-ASR is never skipped.
     \"\"\"
     orig_load_asr = model.load_asr_model
     orig_transcribe = model.transcribe
@@ -763,16 +765,19 @@ def _attach_fast_asr_bridge(model):
     model._orig_load_asr_model = orig_load_asr
     model._asr_pipe = True
 
-    def _fast_transcribe(audio):
+    def _fast_transcribe(audio, language=None):
         try:
-            wm = get_whisper_model()
+            wm = get_asr_whisper_model()
             if isinstance(audio, str):
                 raw_wav, raw_sr = sf.read(audio, dtype="float32")
                 audio_16k = resample_to_16k(raw_wav, orig_sr=raw_sr)
             else:
                 waveform, sr = audio
                 audio_16k = resample_to_16k(waveform, orig_sr=sr)
-            segs, _ = wm.transcribe(audio_16k, without_timestamps=True)
+            tr_kwargs = dict(beam_size=5, condition_on_previous_text=False, without_timestamps=True)
+            if language in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es"):
+                tr_kwargs["language"] = language
+            segs, _ = wm.transcribe(audio_16k, **tr_kwargs)
             return " ".join(s.text.strip() for s in segs if s.text).strip()
         except Exception as fw_err:
             log(f"Notice: fast transcribe bridge fallback to HF ASR ({{fw_err}})")
@@ -785,11 +790,201 @@ def _attach_fast_asr_bridge(model):
 
     if callable(orig_create_prompt):
         def _inference_mode_create_prompt(*args, **kwargs):
+            if "ref_text" in kwargs and isinstance(kwargs["ref_text"], str) and not kwargs["ref_text"].strip():
+                kwargs["ref_text"] = None
+            if len(args) >= 2 and isinstance(args[1], str) and not args[1].strip():
+                args = (args[0], None) + args[2:]
             with torch.inference_mode():
                 return orig_create_prompt(*args, **kwargs)
         model.create_voice_clone_prompt = _inference_mode_create_prompt
 
     return model
+
+_VI_DIACRITICS = set("áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ")
+
+def _detect_target_language(text_str, explicit_lang=None):
+    exp = (explicit_lang or "").strip() if isinstance(explicit_lang, str) else ""
+    if exp:
+        return exp
+    if any(ch in _VI_DIACRITICS for ch in (text_str or "").lower()):
+        return "vi"
+    return None
+
+def _gentle_trim_tts_wav(wav_arr, sr=24000):
+    \"\"\"Trims only dead digital silence while preserving 50ms onset pre-roll and 160ms trailing consonant decay.\"\"\"
+    arr = np.asarray(wav_arr, dtype=np.float32).reshape(-1)
+    if len(arr) < int(0.15 * sr):
+        return arr
+    hop = max(1, int(0.01 * sr))
+    win = max(hop, int(0.02 * sr))
+    rms_env = np.array([
+        float(np.sqrt(np.mean(np.square(arr[p:p + win]))))
+        for p in range(0, max(1, len(arr) - win + 1), hop)
+    ])
+    active = np.where(rms_env > 0.0035)[0]
+    if len(active) == 0:
+        return arr
+    s_idx = max(0, int(active[0] * hop - 0.050 * sr))
+    e_idx = min(len(arr), int((active[-1] + 1) * hop + 0.160 * sr))
+    out = arr[s_idx:e_idx].copy()
+    fi = min(len(out) // 6, int(0.015 * sr))
+    fo = min(len(out) // 6, int(0.028 * sr))
+    if fi > 1:
+        out[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)
+    if fo > 1:
+        out[-fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)
+    pad = np.zeros(int(0.10 * sr), dtype=np.float32)
+    return np.concatenate([pad, out, pad])
+
+def _prepare_clean_clone_prompt(model, local_ref_path, raw_ref_text=None, target_lang=None, preprocess_prompt=True):
+    \"\"\"Prepares boundary-padded mono reference audio + guaranteed accurate ref_text for VoiceClonePrompt.\"\"\"
+    chosen_ref_text = raw_ref_text.strip() if isinstance(raw_ref_text, str) and raw_ref_text.strip() else None
+    clean_clip_path = local_ref_path
+    temp_clean_path = None
+    try:
+        full_vox, full_sr = sf.read(local_ref_path, dtype="float32")
+        mono_vox = np.mean(full_vox, axis=1) if full_vox.ndim > 1 else full_vox
+        cand_raw = mono_vox[: min(len(mono_vox), int(12.0 * full_sr))].copy()
+        fade_in_n = min(len(cand_raw) // 10, int(0.020 * full_sr))
+        fade_out_n = min(len(cand_raw) // 10, int(0.040 * full_sr))
+        if fade_in_n > 1:
+            cand_raw[:fade_in_n] *= np.linspace(0.0, 1.0, fade_in_n, dtype=np.float32)
+        if fade_out_n > 1:
+            cand_raw[-fade_out_n:] *= np.linspace(1.0, 0.0, fade_out_n, dtype=np.float32)
+        peak_v = float(np.max(np.abs(cand_raw))) if len(cand_raw) else 0.0
+        if peak_v > 1e-4:
+            cand_raw = cand_raw * min(2.5, 0.88 / peak_v)
+        pad_pre = np.zeros(int(0.10 * full_sr), dtype=np.float32)
+        pad_post = np.zeros(int(0.30 * full_sr), dtype=np.float32)
+        padded_ref = np.concatenate([pad_pre, cand_raw, pad_post])
+
+        tfd, temp_clean_path = tempfile.mkstemp(suffix="_clean_ref.wav")
+        os.close(tfd)
+        sf.write(temp_clean_path, padded_ref, full_sr, format="WAV", subtype="PCM_16")
+        clean_clip_path = temp_clean_path
+
+        if not chosen_ref_text:
+            try:
+                asr_m = get_asr_whisper_model()
+                asr_lang = target_lang if target_lang in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None
+                r_segs, _ = asr_m.transcribe(
+                    resample_to_16k(cand_raw, full_sr),
+                    language=asr_lang,
+                    beam_size=5,
+                    condition_on_previous_text=False,
+                )
+                tr_ref = " ".join(s.text.strip() for s in r_segs if s.text).strip()
+                if tr_ref:
+                    if not tr_ref.endswith((".", "!", "?")):
+                        tr_ref += "."
+                    chosen_ref_text = tr_ref
+                    log(f"Auto-transcribed clone_voice ref_text ({{asr_lang or 'auto'}}): '{{tr_ref[:90]}}'")
+            except Exception as tr_err:
+                log(f"Notice: clone_voice auto-ASR ref_text fallback: {{tr_err}}")
+        elif not chosen_ref_text.endswith((".", "!", "?")):
+            chosen_ref_text = chosen_ref_text + "."
+
+        try:
+            prompt = model.create_voice_clone_prompt(
+                ref_audio=clean_clip_path,
+                ref_text=chosen_ref_text,
+                preprocess_prompt=bool(preprocess_prompt),
+            )
+        except TypeError:
+            prompt = model.create_voice_clone_prompt(
+                ref_audio=clean_clip_path,
+                ref_text=chosen_ref_text,
+            )
+        eff_ref = (getattr(prompt, "ref_text", None) or chosen_ref_text or "").strip() or None
+        return prompt, eff_ref
+    finally:
+        if temp_clean_path and os.path.exists(temp_clean_path):
+            try:
+                os.remove(temp_clean_path)
+            except Exception:
+                pass
+
+def _norm_qa_words(text_s):
+    if not text_s:
+        return []
+    cleaned = re.sub(r"[^\\w\\sáàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ]", " ", str(text_s).lower())
+    return [w for w in cleaned.split() if w]
+
+def _evaluate_tts_output_qa(audio_arr, expected_text, ref_text_used=None, lang_code=None, need_word_timestamps=False):
+    \"\"\"Audits synthesized audio via faster-whisper for head truncation, reference bleed, coverage, and stuttering.\"\"\"
+    exp_words = _norm_qa_words(expected_text)
+    if len(exp_words) < 4:
+        return dict(ok=True, score=1.0, coverage=1.0, head_missing=False, ref_bleed=False, extra_stutters=0, transcribed_words=[])
+    try:
+        wm = ASR_WHISPER_MODEL if ASR_WHISPER_MODEL is not None else get_whisper_model()
+        resampled = resample_to_16k(audio_arr, 24000)
+        tr_lang = lang_code if lang_code in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None
+        segs, _ = wm.transcribe(
+            resampled,
+            word_timestamps=bool(need_word_timestamps),
+            language=tr_lang,
+            condition_on_previous_text=False,
+        )
+        transcribed_words = []
+        raw_text_parts = []
+        for seg in segs:
+            if getattr(seg, "text", None):
+                raw_text_parts.append(seg.text.strip())
+            if need_word_timestamps and getattr(seg, "words", None):
+                for w in seg.words:
+                    ws = (w.word or "").strip()
+                    if ws:
+                        transcribed_words.append(dict(word=ws, start=w.start, end=w.end))
+        trans_text = " ".join(raw_text_parts).strip()
+        trans_words = _norm_qa_words(trans_text)
+        if not trans_words:
+            return dict(ok=False, score=0.0, coverage=0.0, head_missing=True, ref_bleed=False, extra_stutters=0, transcribed_words=transcribed_words)
+
+        head_missing = False
+        if len(exp_words) >= 5:
+            head_window = trans_words[:6]
+            first_hit = any(levenshtein_ratio(exp_words[0], tw) >= 0.7 for tw in head_window)
+            second_hit = any(levenshtein_ratio(exp_words[1], tw) >= 0.7 for tw in head_window)
+            if (not first_hit) and (not second_hit):
+                head_missing = True
+
+        ref_bleed = False
+        if ref_text_used:
+            ref_words = _norm_qa_words(ref_text_used)
+            exp_head_set = set(exp_words[:5])
+            ref_tail = [rw for rw in ref_words[-5:] if rw not in exp_head_set and len(rw) >= 2]
+            if len(ref_tail) >= 2:
+                bleed_hits = sum(1 for tw in trans_words[:5] if any(levenshtein_ratio(rw, tw) >= 0.8 for rw in ref_tail))
+                if bleed_hits >= 2:
+                    ref_bleed = True
+
+        coverage = difflib.SequenceMatcher(None, exp_words, trans_words).ratio()
+
+        exp_bi = set(tuple(exp_words[k:k+2]) for k in range(max(0, len(exp_words) - 1)))
+        extra_stutters = 0
+        for k in range(len(trans_words) - 3):
+            bg = tuple(trans_words[k:k+2])
+            if bg == tuple(trans_words[k+2:k+4]) and bg not in exp_bi:
+                extra_stutters += 1
+        exp_adj_dup = sum(1 for k in range(len(exp_words) - 1) if exp_words[k] == exp_words[k+1])
+        trans_adj_dup = sum(1 for k in range(len(trans_words) - 1) if trans_words[k] == trans_words[k+1] and len(trans_words[k]) >= 2)
+        if trans_adj_dup > exp_adj_dup:
+            extra_stutters += (trans_adj_dup - exp_adj_dup)
+
+        score = coverage - (0.35 if head_missing else 0.0) - (0.30 if ref_bleed else 0.0) - min(0.25, 0.12 * extra_stutters)
+        ok = (not head_missing) and (not ref_bleed) and (coverage >= 0.76) and (extra_stutters == 0)
+        return dict(
+            ok=ok,
+            score=round(score, 4),
+            coverage=round(coverage, 3),
+            head_missing=head_missing,
+            ref_bleed=ref_bleed,
+            extra_stutters=extra_stutters,
+            transcribed_words=transcribed_words,
+        )
+    except Exception as qa_err:
+        log(f"Notice: TTS QA evaluation skipped ({{qa_err}})")
+        return dict(ok=True, score=1.0, coverage=1.0, head_missing=False, ref_bleed=False, extra_stutters=0, transcribed_words=[])
 
 VOICE_PROMPT_CACHE = {{}}
 
@@ -1031,12 +1226,19 @@ def main():
                     ref_path = parsed_ref.path + (f"?{{parsed_ref.query}}" if parsed_ref.query else "")
 
                 # Reuse cached VoiceClonePrompt (OmniVoice 0.2.1+) for saved voice samples — skips HTTP download & tokenizer encode!
+                clean_job_ref_text = job.get("ref_text").strip() if isinstance(job.get("ref_text"), str) and job.get("ref_text").strip() else None
+                resolved_job_lang = _detect_target_language(job.get("text") or "", job.get("language"))
                 prompt_cache_key = None
-                if job_type == "clone_voice" and ref_path and "/voice-samples/" in ref_path and job.get("preprocess_prompt", True) is not False:
-                    prompt_cache_key = (ref_path, job.get("ref_text") or "")
-                    cached_voice_prompt = VOICE_PROMPT_CACHE.get(prompt_cache_key)
-                    if cached_voice_prompt is not None:
-                        log(f"Reusing cached VoiceClonePrompt for {{ref_path}} (zero download/encode latency)")
+                if job_type == "clone_voice" and ref_path and "/voice-samples/" in ref_path:
+                    prompt_cache_key = (ref_path, clean_job_ref_text or "", resolved_job_lang or "", bool(job.get("preprocess_prompt", True)))
+                    cached_candidate = VOICE_PROMPT_CACHE.get(prompt_cache_key)
+                    if cached_candidate is not None:
+                        cached_rt = getattr(cached_candidate, "ref_text", None)
+                        if isinstance(cached_rt, str) and cached_rt.strip():
+                            cached_voice_prompt = cached_candidate
+                            log(f"Reusing cached VoiceClonePrompt for {{ref_path}} (ref_text_len={{len(cached_rt.strip())}})")
+                        else:
+                            VOICE_PROMPT_CACHE.pop(prompt_cache_key, None)
 
                 if job_type in ["clone_voice", "asr", "separate_audio", "dub_segments"] and ref_audio_url and cached_voice_prompt is None:
                     make_request(
@@ -1692,37 +1894,45 @@ def main():
                 )
 
                 # Build generate arguments
+                job_text = job.get("text") or ""
                 generate_args = {{
-                    "text": job["text"]
+                    "text": job_text
                 }}
-                
+                effective_ref_text = clean_job_ref_text
+
                 if job_type == "clone_voice":
                     if cached_voice_prompt is not None:
                         generate_args["voice_clone_prompt"] = cached_voice_prompt
-                    elif prompt_cache_key is not None and local_ref_path and hasattr(model, "create_voice_clone_prompt"):
+                        effective_ref_text = (getattr(cached_voice_prompt, "ref_text", None) or effective_ref_text or "").strip() or None
+                    elif local_ref_path and hasattr(model, "create_voice_clone_prompt"):
                         try:
-                            cached_voice_prompt = model.create_voice_clone_prompt(
-                                ref_audio=local_ref_path,
-                                ref_text=job.get("ref_text"),
+                            built_prompt, eff_ref = _prepare_clean_clone_prompt(
+                                model=model,
+                                local_ref_path=local_ref_path,
+                                raw_ref_text=clean_job_ref_text,
+                                target_lang=resolved_job_lang,
+                                preprocess_prompt=job.get("preprocess_prompt", True),
                             )
-                            if len(VOICE_PROMPT_CACHE) >= 32:
-                                VOICE_PROMPT_CACHE.pop(next(iter(VOICE_PROMPT_CACHE)), None)
-                            VOICE_PROMPT_CACHE[prompt_cache_key] = cached_voice_prompt
-                            generate_args["voice_clone_prompt"] = cached_voice_prompt
+                            effective_ref_text = eff_ref
+                            if prompt_cache_key is not None and built_prompt is not None and eff_ref:
+                                if len(VOICE_PROMPT_CACHE) >= 32:
+                                    VOICE_PROMPT_CACHE.pop(next(iter(VOICE_PROMPT_CACHE)), None)
+                                VOICE_PROMPT_CACHE[prompt_cache_key] = built_prompt
+                            generate_args["voice_clone_prompt"] = built_prompt
                         except Exception as cp_err:
-                            log(f"Notice: VoiceClonePrompt cache fallback ({{cp_err}})")
+                            log(f"Notice: VoiceClonePrompt preparation fallback ({{cp_err}})")
                             generate_args["ref_audio"] = local_ref_path
-                            if job.get("ref_text"):
-                                generate_args["ref_text"] = job["ref_text"]
+                            if clean_job_ref_text:
+                                generate_args["ref_text"] = clean_job_ref_text
                     else:
                         generate_args["ref_audio"] = local_ref_path
-                        if job.get("ref_text"):
-                            generate_args["ref_text"] = job["ref_text"]
+                        if clean_job_ref_text:
+                            generate_args["ref_text"] = clean_job_ref_text
                 elif job_type in ["voice_design_preview", "voice_design_tts"]:
                     generate_args["instruct"] = job.get("instruct")
                 elif job_type != "auto_voice":
                     raise Exception(f"Unknown job type: {{job_type}}")
-                
+
                 optional_keys = [
                     "num_step", "denoise", "guidance_scale", "t_shift",
                     "position_temperature", "class_temperature", "layer_penalty_factor",
@@ -1732,19 +1942,77 @@ def main():
                 ]
                 for key in optional_keys:
                     if key in job and job[key] is not None:
+                        if key == "language" and isinstance(job[key], str) and not job[key].strip():
+                            continue
                         generate_args[key] = job[key]
 
-                log(f"Calling model.generate with arguments: {{list(generate_args.keys())}}")
-                try:
-                    audio_result = model.generate(**generate_args)
-                except (TypeError, ImportError, Exception) as gen_err:
-                    err_str = str(gen_err).lower()
-                    if any(k in err_str for k in ["normalize_text", "wetextprocessing", "pynini", "no module named 'tn'", "module 'tn'"]):
-                        log(f"Notice: normalize_text failed ({{gen_err}}). Retrying model.generate without text normalization...")
-                        generate_args.pop("normalize_text", None)
-                        audio_result = model.generate(**generate_args)
-                    else:
+                if resolved_job_lang and not generate_args.get("language"):
+                    generate_args["language"] = resolved_job_lang
+
+                def _call_model_generate(kw):
+                    try:
+                        return model.generate(**kw)
+                    except (TypeError, ImportError, Exception) as gen_err:
+                        err_str = str(gen_err).lower()
+                        if any(k in err_str for k in ["normalize_text", "wetextprocessing", "pynini", "no module named 'tn'", "module 'tn'"]):
+                            log(f"Notice: normalize_text failed ({{gen_err}}). Retrying without text normalization...")
+                            kw.pop("normalize_text", None)
+                            return model.generate(**kw)
+                        if "language" in err_str and "unexpected keyword" in err_str:
+                            kw.pop("language", None)
+                            return model.generate(**kw)
                         raise
+
+                log(f"Calling model.generate with arguments: {{list(generate_args.keys())}} (lang={{generate_args.get('language')}}, has_ref_text={{bool(effective_ref_text)}})")
+                run_qa_gate = (job_type == "clone_voice" or bool(job.get("with_alignment"))) and len(job_text.split()) >= 4
+                need_ts_in_qa = bool(job.get("with_alignment"))
+                best_wav = None
+                best_qa = None
+                max_takes = 3 if run_qa_gate else 1
+
+                for take_idx in range(max_takes):
+                    take_args = dict(generate_args)
+                    apply_gentle_trim = False
+                    if take_idx == 1:
+                        take_args["postprocess_output"] = False
+                        if "position_temperature" in take_args and take_args["position_temperature"] is not None:
+                            take_args["position_temperature"] = min(float(take_args["position_temperature"]), 3.5)
+                        else:
+                            take_args["position_temperature"] = 3.5
+                        apply_gentle_trim = True
+                    elif take_idx >= 2:
+                        take_args["postprocess_output"] = False
+                        take_args["position_temperature"] = 3.0
+                        base_gs = float(take_args.get("guidance_scale") or 2.0)
+                        take_args["guidance_scale"] = max(2.0, min(2.5, base_gs))
+                        apply_gentle_trim = True
+
+                    audio_result = _call_model_generate(take_args)
+                    cand_wav = audio_result[0]
+                    if apply_gentle_trim:
+                        cand_wav = _gentle_trim_tts_wav(cand_wav, sr=24000)
+
+                    if not run_qa_gate:
+                        best_wav = cand_wav
+                        break
+
+                    qa = _evaluate_tts_output_qa(
+                        cand_wav,
+                        expected_text=job_text,
+                        ref_text_used=effective_ref_text,
+                        lang_code=resolved_job_lang,
+                        need_word_timestamps=need_ts_in_qa,
+                    )
+                    log(f"TTS QA take {{take_idx + 1}}/{{max_takes}}: ok={{qa['ok']}} score={{qa['score']}} cov={{qa['coverage']}} head_missing={{qa['head_missing']}} ref_bleed={{qa['ref_bleed']}} stutters={{qa['extra_stutters']}}")
+                    if best_qa is None or qa["score"] > best_qa["score"]:
+                        best_wav = cand_wav
+                        best_qa = qa
+                    if qa["ok"]:
+                        break
+                    if take_idx + 1 < max_takes:
+                        log(f"TTS QA flagged issue on take {{take_idx + 1}}; retrying generation ({{take_idx + 2}}/{{max_takes}})...")
+
+                audio_result = [best_wav]
 
                 # Clean up local ref path if exists
                 if local_ref_path and os.path.exists(local_ref_path):
@@ -1763,44 +2031,34 @@ def main():
                 sf.write(local_out_path, audio_result[0], 24000, format='WAV', subtype='PCM_16')
                 log(f"Generated audio saved to {{local_out_path}}")
 
-                # Generate word alignments
+                # Generate word alignments (reuse winning QA transcription when available to avoid duplicate Whisper pass!)
                 alignment_str = None
                 if job.get("with_alignment"):
                     log("Generating word alignment...")
                     alignment_list = None
                     try:
-                        log("Attempting precise word alignment using faster-whisper...")
-                        w_model = get_whisper_model()
-                        log(f"Transcribing audio {{local_out_path}} with word timestamps...")
-                        
-                        # Dynamic language detection
-                        job_text = job.get("text") or ""
-                        vi_chars = set("áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ")
-                        is_vi = any(c in vi_chars for c in job_text.lower())
-                        lang = "vi" if is_vi else None
-                        log(f"Language detection: is_vi={{is_vi}}, using language_param={{lang}}")
-                        
                         duration_sec = len(audio_result[0]) / 24000.0
+                        transcribed_words = list(best_qa.get("transcribed_words") or []) if isinstance(best_qa, dict) else []
+                        if not transcribed_words:
+                            log("Attempting precise word alignment using faster-whisper...")
+                            w_model = ASR_WHISPER_MODEL if ASR_WHISPER_MODEL is not None else get_whisper_model()
+                            lang = resolved_job_lang if resolved_job_lang in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None
+                            resampled_16k = resample_to_16k(audio_result[0], 24000)
+                            segments, info = w_model.transcribe(
+                                resampled_16k, 
+                                word_timestamps=True,
+                                language=lang
+                            )
+                            for segment in segments:
+                                if segment.words:
+                                    for w in segment.words:
+                                        transcribed_words.append(dict(
+                                            word=w.word.strip(),
+                                            start=w.start,
+                                            end=w.end
+                                        ))
                         
-                        # Resample to 16kHz float32 numpy array to bypass PyAV av.open bug
-                        resampled_16k = resample_to_16k(audio_result[0], 24000)
-                        segments, info = w_model.transcribe(
-                            resampled_16k, 
-                            word_timestamps=True,
-                            language=lang
-                        )
-                        
-                        transcribed_words = []
-                        for segment in segments:
-                            if segment.words:
-                                for w in segment.words:
-                                    transcribed_words.append(dict(
-                                        word=w.word.strip(),
-                                        start=w.start,
-                                        end=w.end
-                                    ))
-                        
-                        log(f"Whisper transcribed {{len(transcribed_words)}} words.")
+                        log(f"Whisper transcribed {{len(transcribed_words)}} words for alignment.")
                         
                         original_words = job_text.split()
                         if original_words and transcribed_words:
@@ -1922,7 +2180,8 @@ if __name__ == '__main__':
             job_id = job_params["id"]
             job_type = job_params["job_type"]
             text = job_params["text"]
-            ref_text = job_params["ref_text"]
+            raw_rt = job_params["ref_text"]
+            ref_text = raw_rt.strip() if isinstance(raw_rt, str) and raw_rt.strip() else None
             instruct = job_params["instruct"]
             voice_sample_id = job_params["voice_sample_id"]
             speed = job_params["speed"]
@@ -2185,8 +2444,9 @@ def main():
                 raise Exception("Missing reference audio path for clone_voice")
             print(f"Generating voice cloning for: {{TEXT}}")
             generate_args["ref_audio"] = local_ref_path
-            if REF_TEXT:
-                generate_args["ref_text"] = REF_TEXT
+            clean_rt = REF_TEXT.strip() if isinstance(REF_TEXT, str) and REF_TEXT.strip() else None
+            if clean_rt:
+                generate_args["ref_text"] = clean_rt
         elif JOB_TYPE in ["voice_design_preview", "voice_design_tts"]:
             print(f"Generating voice design for: {{TEXT}} with instruct: {{INSTRUCT}}")
             generate_args["instruct"] = INSTRUCT

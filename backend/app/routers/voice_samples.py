@@ -120,14 +120,15 @@ async def upload_voice_sample(
         if parsed_list:
             normalized_tags = json_mod.dumps(parsed_list, ensure_ascii=False)
 
-    # Save details to database
+    # Save details to database (never store empty string for ref_text — None allows auto-ASR fallback)
+    normalized_ref_text = ref_text.strip() if isinstance(ref_text, str) and ref_text.strip() else None
     db_sample = VoiceSample(
         id=resolved_id,
         user_id=current_user.id,
         name=resolved_name,
         source_type="uploaded",
         file_path=saved_path,
-        ref_text=ref_text,
+        ref_text=normalized_ref_text,
         duration=duration,
         sample_rate=sample_rate,
         tags=normalized_tags,
@@ -232,16 +233,22 @@ def save_favorite_voice(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Lỗi khi xử lý cắt âm thanh: {e}")
 
-    # 4. Build source_job_data from the original TTS Job
+    # 4. Build source_job_data from the original TTS Job or VoiceDesignPreview
     import json as json_mod
+    from app.models import TTSJob, VoiceDesignPreview
     source_job_data_str = None
     source_job = None
+    preview_row = None
     if payload.job_id:
         source_job = db.query(TTSJob).filter(TTSJob.id == payload.job_id).first()
+    elif payload.preview_id:
+        source_job = db.query(TTSJob).filter(TTSJob.preview_id == payload.preview_id).first()
+        preview_row = db.query(VoiceDesignPreview).filter(VoiceDesignPreview.id == payload.preview_id).first()
     if source_job:
         source_job_data_str = json_mod.dumps({
             "mode": source_job.job_type,
             "text": source_job.text,
+            "voice_request": preview_row.voice_request if preview_row else None,
             "voice_sample_id": source_job.voice_sample_id,
             "ref_text": source_job.ref_text,
             "instruct": source_job.instruct,
@@ -261,6 +268,7 @@ def save_favorite_voice(
     tags_str = json_mod.dumps(payload.tags, ensure_ascii=False) if payload.tags else None
 
     # 5. Create VoiceSample record
+    normalized_fav_ref_text = payload.ref_text.strip() if isinstance(payload.ref_text, str) and payload.ref_text.strip() else None
     db_sample = VoiceSample(
         id=resolved_id,
         user_id=current_user.id,
@@ -269,7 +277,7 @@ def save_favorite_voice(
         source_type="saved_favorite",
         source_job_id=payload.job_id or payload.preview_id,
         file_path=saved_path,
-        ref_text=payload.ref_text,
+        ref_text=normalized_fav_ref_text,
         duration=duration,
         sample_rate=sr,
         status="ready",
@@ -277,6 +285,8 @@ def save_favorite_voice(
         source_job_data=source_job_data_str
     )
     db.add(db_sample)
+    if preview_row and not preview_row.accepted_sample_id:
+        preview_row.accepted_sample_id = resolved_id
     db.commit()
     db.refresh(db_sample)
 
@@ -318,7 +328,7 @@ def update_voice_sample(
     if payload.name is not None:
         sample.name = payload.name
     if payload.ref_text is not None:
-        sample.ref_text = payload.ref_text
+        sample.ref_text = payload.ref_text.strip() or None
     if payload.is_public is not None:
         sample.is_public = payload.is_public
     if payload.tags is not None:
