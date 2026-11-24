@@ -112,6 +112,9 @@ def _read_digit_sequence_grouped(digits_str: str) -> str:
         chunks = [clean[:4], clean[4:8], clean[8:]]
     else:
         chunks = [clean[i:i + 4] for i in range(0, n, 4)]
+        if len(chunks) >= 2 and len(chunks[-1]) == 1:
+            tail5 = chunks[-2] + chunks[-1]
+            chunks = chunks[:-2] + [tail5[:3], tail5[3:]]
     return ", ".join(read_digits_verbatim(c) for c in chunks if c)
 
 
