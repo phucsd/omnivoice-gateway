@@ -955,11 +955,18 @@ def _norm_qa_words(text_s):
     cleaned = re.sub(r"[^\\w\\sáàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ]", " ", str(text_s).lower())
     return [w for w in cleaned.split() if w]
 
+_NUM_QA_WORDS = frozenset({{
+    "không", "một", "mốt", "hai", "ba", "bốn", "tư", "năm", "lăm",
+    "sáu", "bảy", "tám", "chín", "mười", "mươi", "trăm", "nghìn", "ngàn",
+    "triệu", "tỷ", "lẻ", "linh", "phẩy", "chấm", "âm", "rưỡi",
+}})
+_NUM_QA_EQUIV = {{"tư": "bốn", "ngàn": "nghìn", "linh": "lẻ", "mốt": "một", "lăm": "năm"}}
+
 def _evaluate_tts_output_qa(audio_arr, expected_text, ref_text_used=None, lang_code=None, need_word_timestamps=False):
-    \"\"\"Audits synthesized audio via faster-whisper for head truncation, reference bleed, coverage, and stuttering.\"\"\"
+    \"\"\"Audits synthesized audio via faster-whisper for head truncation, reference bleed, coverage, numeric accuracy, and stuttering.\"\"\"
     exp_words = _norm_qa_words(expected_text)
     if len(exp_words) < 4:
-        return dict(ok=True, score=1.0, coverage=1.0, head_missing=False, ref_bleed=False, extra_stutters=0, transcribed_words=[])
+        return dict(ok=True, score=1.0, coverage=1.0, num_coverage=1.0, head_missing=False, ref_bleed=False, extra_stutters=0, transcribed_words=[])
     try:
         wm = ASR_WHISPER_MODEL if ASR_WHISPER_MODEL is not None else get_whisper_model()
         resampled = resample_to_16k(audio_arr, 24000)
@@ -985,7 +992,7 @@ def _evaluate_tts_output_qa(audio_arr, expected_text, ref_text_used=None, lang_c
         trans_text_for_qa = normalize_vietnamese_text(trans_text) if (is_vi_qa and trans_text) else trans_text
         trans_words = _norm_qa_words(trans_text_for_qa)
         if not trans_words:
-            return dict(ok=False, score=0.0, coverage=0.0, head_missing=True, ref_bleed=False, extra_stutters=0, transcribed_words=transcribed_words)
+            return dict(ok=False, score=0.0, coverage=0.0, num_coverage=0.0, head_missing=True, ref_bleed=False, extra_stutters=0, transcribed_words=transcribed_words)
 
         head_missing = False
         if len(exp_words) >= 5:
@@ -1007,6 +1014,17 @@ def _evaluate_tts_output_qa(audio_arr, expected_text, ref_text_used=None, lang_c
 
         coverage = difflib.SequenceMatcher(None, exp_words, trans_words).ratio()
 
+        exp_nums = [_NUM_QA_EQUIV.get(w, w) for w in exp_words if w in _NUM_QA_WORDS]
+        trans_nums = [_NUM_QA_EQUIV.get(w, w) for w in trans_words if w in _NUM_QA_WORDS]
+        if len(exp_nums) >= 3:
+            num_coverage = difflib.SequenceMatcher(None, exp_nums, trans_nums).ratio()
+            num_ok = num_coverage >= 0.80
+            blended_cov = 0.65 * coverage + 0.35 * num_coverage
+        else:
+            num_coverage = 1.0
+            num_ok = True
+            blended_cov = coverage
+
         exp_bi = set(tuple(exp_words[k:k+2]) for k in range(max(0, len(exp_words) - 1)))
         extra_stutters = 0
         for k in range(len(trans_words) - 3):
@@ -1018,12 +1036,13 @@ def _evaluate_tts_output_qa(audio_arr, expected_text, ref_text_used=None, lang_c
         if trans_adj_dup > exp_adj_dup:
             extra_stutters += (trans_adj_dup - exp_adj_dup)
 
-        score = coverage - (0.35 if head_missing else 0.0) - (0.30 if ref_bleed else 0.0) - min(0.25, 0.12 * extra_stutters)
-        ok = (not head_missing) and (not ref_bleed) and (coverage >= 0.76) and (extra_stutters == 0)
+        score = blended_cov - (0.35 if head_missing else 0.0) - (0.30 if ref_bleed else 0.0) - min(0.25, 0.12 * extra_stutters)
+        ok = (not head_missing) and (not ref_bleed) and (coverage >= 0.76) and num_ok and (extra_stutters == 0)
         return dict(
             ok=ok,
             score=round(score, 4),
             coverage=round(coverage, 3),
+            num_coverage=round(num_coverage, 3),
             head_missing=head_missing,
             ref_bleed=ref_bleed,
             extra_stutters=extra_stutters,
@@ -1031,7 +1050,7 @@ def _evaluate_tts_output_qa(audio_arr, expected_text, ref_text_used=None, lang_c
         )
     except Exception as qa_err:
         log(f"Notice: TTS QA evaluation skipped ({{qa_err}})")
-        return dict(ok=True, score=1.0, coverage=1.0, head_missing=False, ref_bleed=False, extra_stutters=0, transcribed_words=[])
+        return dict(ok=True, score=1.0, coverage=1.0, num_coverage=1.0, head_missing=False, ref_bleed=False, extra_stutters=0, transcribed_words=[])
 
 VOICE_PROMPT_CACHE = {{}}
 
@@ -2024,9 +2043,13 @@ def main():
 
                 log(f"Calling model.generate with arguments: {{list(generate_args.keys())}} (lang={{generate_args.get('language')}}, has_ref_text={{bool(effective_ref_text)}})")
                 need_ts_in_qa = bool(job.get("with_alignment"))
+                norm_job_tokens = _norm_qa_words(job_text)
                 word_cnt = len(job_text.split())
+                num_word_cnt = sum(1 for w in norm_job_tokens if w in _NUM_QA_WORDS)
+                has_dense_numbers = (" phẩy " in f" {{job_text.lower()}} ") or (" chấm " in f" {{job_text.lower()}} ") or (num_word_cnt >= 4)
                 run_qa_gate = word_cnt >= 4 and (
                     need_ts_in_qa
+                    or has_dense_numbers
                     or (
                         job_type == "clone_voice"
                         and (word_cnt > 20 or not effective_ref_text)
@@ -2039,18 +2062,27 @@ def main():
                 for take_idx in range(max_takes):
                     take_args = dict(generate_args)
                     apply_gentle_trim = False
-                    if take_idx == 1:
+                    if take_idx == 0 and has_dense_numbers:
+                        curr_pt = float(take_args.get("position_temperature") if take_args.get("position_temperature") is not None else 5.0)
+                        if curr_pt >= 4.5:
+                            take_args["position_temperature"] = 2.6
+                        base_gs0 = float(take_args.get("guidance_scale") or 2.0)
+                        take_args["guidance_scale"] = max(2.2, base_gs0)
+                    elif take_idx == 1:
                         take_args["postprocess_output"] = False
+                        target_pt1 = 2.2 if has_dense_numbers else 3.5
                         if "position_temperature" in take_args and take_args["position_temperature"] is not None:
-                            take_args["position_temperature"] = min(float(take_args["position_temperature"]), 3.5)
+                            take_args["position_temperature"] = min(float(take_args["position_temperature"]), target_pt1)
                         else:
-                            take_args["position_temperature"] = 3.5
+                            take_args["position_temperature"] = target_pt1
+                        if has_dense_numbers:
+                            take_args["guidance_scale"] = max(2.4, float(take_args.get("guidance_scale") or 2.0))
                         apply_gentle_trim = True
                     elif take_idx >= 2:
                         take_args["postprocess_output"] = False
-                        take_args["position_temperature"] = 3.0
+                        take_args["position_temperature"] = 1.8 if has_dense_numbers else 3.0
                         base_gs = float(take_args.get("guidance_scale") or 2.0)
-                        take_args["guidance_scale"] = max(2.0, min(2.5, base_gs))
+                        take_args["guidance_scale"] = max(2.5 if has_dense_numbers else 2.0, min(2.8, base_gs))
                         apply_gentle_trim = True
 
                     audio_result = _call_model_generate(take_args)

@@ -145,5 +145,70 @@ def test_science_and_tech_terms_vietnamese_pronunciation():
     )
 
 
+def test_mixed_thousands_decimals_and_signed_numbers():
+    # Digit-by-digit decimals combined with thousands separators
+    assert normalize_vietnamese_text("1.284,65 điểm") == "một nghìn hai trăm tám mươi tư phẩy sáu năm điểm"
+    assert normalize_vietnamese_text("18.450,75 tỷ đồng") == "mười tám nghìn bốn trăm năm mươi phẩy bảy năm tỷ đồng"
+    assert normalize_vietnamese_text("1,234.56 USD") == "một nghìn hai trăm ba mươi tư chấm năm sáu đô la Mỹ"
+    assert normalize_vietnamese_text("1,200,000 lượt xem") == "một triệu hai trăm nghìn lượt xem"
+    assert normalize_vietnamese_text("1 500 000 người") == "một triệu năm trăm nghìn người"
+    assert normalize_vietnamese_text("1.000.050.000") == "một tỷ không trăm năm mươi nghìn"
+
+    # Negative / positive signs without duplicate 'âm âm'
+    assert normalize_vietnamese_text("Nhiệt độ -5°C đến 22,5°C") == (
+        "Nhiệt độ âm năm độ xê đến hai mươi hai phẩy năm độ xê"
+    )
+    assert normalize_vietnamese_text("Lợi nhuận âm -125 tỷ") == "Lợi nhuận âm một trăm hai mươi lăm tỷ"
+    assert normalize_vietnamese_text("Tăng +0,45% và lạm phát -0,15%") == (
+        "Tăng cộng không phẩy bốn năm phần trăm và lạm phát âm không phẩy một năm phần trăm"
+    )
+    assert normalize_vietnamese_text("Lãi suất từ 4,8% - 6,25%/năm") == (
+        "Lãi suất từ bốn phẩy tám phần trăm đến sáu phẩy hai năm phần trăm một năm"
+    )
+
+
+def test_phones_otp_cccd_and_leading_zeros():
+    assert normalize_vietnamese_text("Gọi 0901234567") == "Gọi không chín không một, hai ba bốn, năm sáu bảy"
+    assert normalize_vietnamese_text("Liên hệ 0987.654.321") == "Liên hệ không chín tám bảy, sáu năm bốn, ba hai một"
+    assert normalize_vietnamese_text("Hotline 1900 1080 hoặc 028 3822 5678") == (
+        "Hotline một chín không không, một không tám không hoặc không hai tám, ba tám hai hai, năm sáu bảy tám"
+    )
+    assert normalize_vietnamese_text("Số +84 912 345 678") == (
+        "Số cộng tám tư, chín một hai, ba bốn năm, sáu bảy tám"
+    )
+    assert normalize_vietnamese_text("Mã OTP của bạn là 048291") == (
+        "Mã ô ti pi của bạn là không bốn tám hai chín một"
+    )
+    assert normalize_vietnamese_text("Điệp viên 007") == "Điệp viên không không bảy"
+    assert normalize_vietnamese_text("Căn cước 079095001234") == (
+        "Căn cước không bảy chín không, chín năm không không, một hai ba bốn"
+    )
+
+
+def test_ecommerce_currencies_units_versions_ips_roman_and_bilingual():
+    assert normalize_vietnamese_text("Chỉ 199k hoặc mẫu 2tr5 và 100$") == (
+        "Chỉ một trăm chín mươi chín ca hoặc mẫu hai triệu rưỡi và một trăm đô la"
+    )
+    assert normalize_vietnamese_text("Căn hộ 120 m² và 50m2 sân vườn") == (
+        "Căn hộ một trăm hai mươi mét vuông và năm mươi mét vuông sân vườn"
+    )
+    assert normalize_vietnamese_text("Video 4K 60fps hoặc 1080p qua cổng USB-C") == (
+        "Video bốn ca sáu mươi ép pê ét hoặc một không tám không pê qua cổng iu ét bi xi"
+    )
+    assert normalize_vietnamese_text("Phiên bản v2.4.1 tại IP 192.168.1.1 tối ưu 2/3 băng thông 24/7") == (
+        "Phiên bản hai chấm bốn chấm một tại ai pi một chín hai chấm một sáu tám chấm một chấm một "
+        "tối ưu hai phần ba băng thông hai mươi tư trên bảy"
+    )
+    assert normalize_vietnamese_text("Báo cáo Quý III và Quý IV lúc 8h30p và 14:05:30") == (
+        "Báo cáo Quý ba và Quý tư lúc tám giờ ba mươi phút và mười bốn giờ năm phút ba mươi giây"
+    )
+    assert normalize_vietnamese_text("Đội nhà thắng với tỷ số 2-1 trên màn hình tỷ lệ 16:9") == (
+        "Đội nhà thắng với tỷ số hai một trên màn hình tỷ lệ mười sáu chín"
+    )
+    assert normalize_vietnamese_text("Kết nối Cloudflare qua REST API chuẩn UI/UX lúc 14h00") == (
+        "Kết nối Cloudflare qua rest ây pi ai chuẩn iu ai iu ích lúc mười bốn giờ"
+    )
+
+
 
 
