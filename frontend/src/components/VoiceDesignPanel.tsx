@@ -1501,6 +1501,10 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
                 message={jobStatus.message}
                 progress={jobStatus.progress}
                 errorMessage={jobStatus.error_message}
+                queueTime={jobStatus.queue_time}
+                processingTime={jobStatus.processing_time}
+                totalTime={jobStatus.total_time}
+                startedAt={jobStatus.started_at}
               />
 
               {(jobStatus.text || previewText) && (

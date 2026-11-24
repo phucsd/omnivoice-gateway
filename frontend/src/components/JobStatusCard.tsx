@@ -1,5 +1,5 @@
 import React from "react";
-import { Loader2, CheckCircle2, AlertCircle, Clock } from "lucide-react";
+import { Loader2, CheckCircle2, AlertCircle, Clock, Server, Zap } from "lucide-react";
 
 interface JobStatusCardProps {
   jobId: string;
@@ -7,6 +7,10 @@ interface JobStatusCardProps {
   message?: string | null;
   progress: number;
   errorMessage?: string | null;
+  queueTime?: number | null;
+  processingTime?: number | null;
+  totalTime?: number | null;
+  startedAt?: string | null;
 }
 
 const statusMap: Record<string, { label: string; color: string; icon: React.ComponentType<{ className?: string }>; spin?: boolean }> = {
@@ -150,6 +154,10 @@ export const JobStatusCard: React.FC<JobStatusCardProps> = ({
   message,
   progress,
   errorMessage,
+  queueTime,
+  processingTime,
+  totalTime,
+  startedAt,
 }) => {
   const currentStatus = statusMap[status] || {
     label: status,
@@ -160,6 +168,13 @@ export const JobStatusCard: React.FC<JobStatusCardProps> = ({
 
   const IconComponent = currentStatus.icon;
   const shouldSpin = Boolean(currentStatus.spin);
+  const isTerminal = status === "completed" || status === "failed" || status === "cancelled";
+  const isWaitingForWorker =
+    !isTerminal &&
+    !startedAt &&
+    (status === "queued" || status === "starting_worker" || status === "queued_kaggle" || status === "booting_kaggle");
+  const hasAnyTiming =
+    typeof queueTime === "number" || typeof processingTime === "number" || typeof totalTime === "number";
 
   return (
     <div className="bg-card border border-border rounded-[20px] p-5 shadow-sm flex flex-col gap-4">
@@ -194,6 +209,61 @@ export const JobStatusCard: React.FC<JobStatusCardProps> = ({
           />
         </div>
       </div>
+
+      {hasAnyTiming && (
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
+          <div className="bg-secondary/35 border border-border/70 rounded-xl px-3 py-2 flex flex-col gap-0.5">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground inline-flex items-center gap-1">
+              <Server className="w-3 h-3 text-warning" />
+              <span>Khởi động Worker</span>
+            </span>
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-sm font-mono font-bold text-foreground">
+                {typeof queueTime === "number" ? `${queueTime.toFixed(1)}s` : "0.0s"}
+              </span>
+              {!isWaitingForWorker && typeof queueTime === "number" && queueTime < 2.5 && (
+                <span className="text-[10px] font-semibold text-success">(Sẵn sàng)</span>
+              )}
+              {isWaitingForWorker && (
+                <span className="text-[10px] font-medium text-warning animate-pulse">đang cấp GPU...</span>
+              )}
+            </div>
+          </div>
+
+          <div className="bg-secondary/35 border border-border/70 rounded-xl px-3 py-2 flex flex-col gap-0.5">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground inline-flex items-center gap-1">
+              <Zap className="w-3 h-3 text-primary" />
+              <span>Thời gian Gen Audio</span>
+            </span>
+            <div className="flex items-baseline gap-1.5">
+              {typeof processingTime === "number" ? (
+                <>
+                  <span className="text-sm font-mono font-bold text-primary">
+                    {processingTime.toFixed(1)}s
+                  </span>
+                  {!isTerminal && (
+                    <span className="text-[10px] font-medium text-primary animate-pulse">đang tổng hợp...</span>
+                  )}
+                </>
+              ) : (
+                <span className="text-xs font-medium text-muted-foreground italic">
+                  {isWaitingForWorker ? "Chờ worker..." : "—"}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="bg-secondary/35 border border-border/70 rounded-xl px-3 py-2 flex flex-col gap-0.5">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground inline-flex items-center gap-1">
+              <Clock className="w-3 h-3 text-success" />
+              <span>Tổng thời gian</span>
+            </span>
+            <span className="text-sm font-mono font-bold text-foreground">
+              {typeof totalTime === "number" ? `${totalTime.toFixed(1)}s` : "0.0s"}
+            </span>
+          </div>
+        </div>
+      )}
 
       {(message || errorMessage) && (
         <div className="text-sm border-t border-border pt-3 mt-1 flex flex-col gap-1.5">

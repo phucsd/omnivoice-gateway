@@ -357,6 +357,23 @@ class JobService:
         job.progress = progress
         if error_message:
             job.error_message = error_message
+
+        if (
+            job.started_at is None
+            and status in (
+                "preparing_input",
+                "loading_model",
+                "running",
+                "generating_audio",
+                "generating_preview",
+                "cloning_voice",
+                "transcribing",
+                "separating_audio",
+                "generating_tts",
+                "exporting_wav",
+            )
+        ):
+            job.started_at = datetime.utcnow()
         
         if status in ["completed", "failed"]:
             job.completed_at = datetime.utcnow()

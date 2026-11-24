@@ -118,17 +118,30 @@ def _build_job_response(job: TTSJob) -> JobStatusResponse:
         except Exception:
             pass
 
+    now_utc = datetime.utcnow()
+    is_terminal = job.status in ("completed", "failed", "cancelled")
+
     processing_time = None
     if job.completed_at and job.started_at:
-        processing_time = (job.completed_at - job.started_at).total_seconds()
+        processing_time = max(0.0, (job.completed_at - job.started_at).total_seconds())
+    elif job.completed_at and job.created_at and not job.started_at:
+        processing_time = max(0.0, (job.completed_at - job.created_at).total_seconds())
+    elif job.started_at and not is_terminal:
+        processing_time = max(0.0, (now_utc - job.started_at).total_seconds())
         
     queue_time = None
-    if job.started_at:
-        queue_time = (job.started_at - job.created_at).total_seconds()
+    if job.started_at and job.created_at:
+        queue_time = max(0.0, (job.started_at - job.created_at).total_seconds())
+    elif job.completed_at and not job.started_at:
+        queue_time = 0.0
+    elif job.created_at and not job.started_at and not is_terminal:
+        queue_time = max(0.0, (now_utc - job.created_at).total_seconds())
         
     total_time = None
-    if job.completed_at:
-        total_time = (job.completed_at - job.created_at).total_seconds()
+    if job.completed_at and job.created_at:
+        total_time = max(0.0, (job.completed_at - job.created_at).total_seconds())
+    elif job.created_at and not is_terminal:
+        total_time = max(0.0, (now_utc - job.created_at).total_seconds())
 
     mode_val = "clone_voice"
     if job.job_type == "auto_voice":

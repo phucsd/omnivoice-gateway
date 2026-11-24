@@ -83,9 +83,35 @@ def get_tts_job(job_id: str, db: Session = Depends(get_db), current_user: User =
             alignment_data = json.loads(job.alignment)
         except Exception:
             pass
+    from datetime import datetime
+    now_utc = datetime.utcnow()
+    is_term = job.status in ("completed", "failed", "cancelled")
+    queue_time = None
+    if job.started_at and job.created_at:
+        queue_time = max(0.0, (job.started_at - job.created_at).total_seconds())
+    elif job.completed_at and not job.started_at:
+        queue_time = 0.0
+    elif job.created_at and not job.started_at and not is_term:
+        queue_time = max(0.0, (now_utc - job.created_at).total_seconds())
+
+    processing_time = None
+    if job.completed_at and job.started_at:
+        processing_time = max(0.0, (job.completed_at - job.started_at).total_seconds())
+    elif job.completed_at and job.created_at and not job.started_at:
+        processing_time = max(0.0, (job.completed_at - job.created_at).total_seconds())
+    elif job.started_at and not is_term:
+        processing_time = max(0.0, (now_utc - job.started_at).total_seconds())
+
+    total_time = None
+    if job.completed_at and job.created_at:
+        total_time = max(0.0, (job.completed_at - job.created_at).total_seconds())
+    elif job.created_at and not is_term:
+        total_time = max(0.0, (now_utc - job.created_at).total_seconds())
+
     return {
         "job_id": job.id,
         "job_type": job.job_type,
+        "text": job.text,
         "status": job.status,
         "message": job.message,
         "progress": job.progress,
@@ -94,6 +120,11 @@ def get_tts_job(job_id: str, db: Session = Depends(get_db), current_user: User =
         "error_message": job.error_message,
         "alignment": alignment_data,
         "created_at": job.created_at,
+        "started_at": job.started_at,
+        "completed_at": job.completed_at,
+        "queue_time": queue_time,
+        "processing_time": processing_time,
+        "total_time": total_time,
         "updated_at": job.updated_at
     }
 

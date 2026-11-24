@@ -343,6 +343,8 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
         error_message: null,
         job_type: mode === "voice_design" ? "voice_design_tts" : mode,
         text: res.text || rawSubmitted,
+        queue_time: 0,
+        total_time: 0,
       });
       setIsPolling(true);
       onJobUpdatedRef.current?.();
@@ -794,6 +796,10 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
                   message={jobStatus.message}
                   progress={jobStatus.progress}
                   errorMessage={jobStatus.error_message}
+                  queueTime={jobStatus.queue_time}
+                  processingTime={jobStatus.processing_time}
+                  totalTime={jobStatus.total_time}
+                  startedAt={jobStatus.started_at}
                 />
 
                 {/* TTS Text Cross-Check Panel */}
@@ -980,9 +986,26 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
                                 })}
                               </span>
                             )}
+                            {typeof item.queue_time === "number" && (
+                              <span
+                                className="text-[10px] font-mono text-muted-foreground bg-background border border-border px-2 py-0.5 rounded-full"
+                                title="Thời gian khởi động / chờ GPU Worker nhận tác vụ"
+                              >
+                                Worker: {item.queue_time.toFixed(1)}s
+                              </span>
+                            )}
+                            {typeof item.processing_time === "number" && (
+                              <span
+                                className="text-[10px] font-mono font-bold text-primary bg-primary/10 border border-primary/20 px-2 py-0.5 rounded-full inline-flex items-center gap-1"
+                                title="Thời gian GPU tổng hợp (gen) ra tệp âm thanh"
+                              >
+                                <Zap className="w-2.5 h-2.5" />
+                                Gen: {item.processing_time.toFixed(1)}s
+                              </span>
+                            )}
                             {typeof item.total_time === "number" && (
-                              <span className="text-[10px] font-mono text-primary bg-primary/10 px-2 py-0.5 rounded-full">
-                                {item.total_time.toFixed(1)}s
+                              <span className="text-[10px] font-mono text-muted-foreground">
+                                (Tổng {item.total_time.toFixed(1)}s)
                               </span>
                             )}
                           </div>

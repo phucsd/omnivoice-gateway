@@ -611,10 +611,10 @@ export const JobHistoryPanel: React.FC<JobHistoryPanelProps> = ({
                   
                   {typeof job.total_time === "number" && (
                     <span className="text-[10px] text-muted-foreground">
-                      Xử lý: <span className="font-mono font-bold text-foreground">{typeof job.processing_time === "number" ? job.processing_time.toFixed(1) : 0}s</span>
                       {typeof job.queue_time === "number" && (
-                        <> (Chờ: <span className="font-mono font-bold text-foreground">{job.queue_time.toFixed(1)}s</span>)</>
+                        <>Khởi động Worker: <span className="font-mono font-bold text-foreground">{job.queue_time.toFixed(1)}s</span> • </>
                       )}
+                      Gen Audio: <span className="font-mono font-bold text-primary">{typeof job.processing_time === "number" ? job.processing_time.toFixed(1) : 0}s</span>
                     </span>
                   )}
                 </div>
