@@ -210,5 +210,32 @@ def test_ecommerce_currencies_units_versions_ips_roman_and_bilingual():
     )
 
 
+def test_trillion_scale_and_coderabbit_edge_cases():
+    # Large scale integers >= 10^12
+    assert read_int(1_000_000_000_000) == "một nghìn tỷ"
+    assert read_int(1_500_000_000_000) == "một nghìn năm trăm tỷ"
+    assert read_int(1_000_000_000_000_000) == "một triệu tỷ"
+    assert read_int(1_000_000_000_000_000_000) == "một tỷ tỷ"
+    assert read_int(1_000_000_000_005) == "một nghìn tỷ không trăm lẻ năm"
+
+    # 24/7 date precedence vs 24/7 idiom
+    assert normalize_vietnamese_text("Ngày 24/7/2026 khai mạc") == (
+        "Ngày hai mươi tư tháng bảy năm hai nghìn không trăm hai mươi sáu khai mạc"
+    )
+    assert normalize_vietnamese_text("Sự kiện ngày 24/7 và hỗ trợ 24/7") == (
+        "Sự kiện ngày hai mươi tư tháng bảy và hỗ trợ hai mươi tư trên bảy"
+    )
+
+    # Roman numerals XL / L, spaced metres, postfix USD comma-thousands, colon/quote left boundary
+    assert normalize_vietnamese_text("Chương XL và Chương L") == "Chương bốn mươi và Chương năm mươi"
+    assert normalize_vietnamese_text("Dài 5 m và rộng 2,5 m") == "Dài năm mét và rộng hai phẩy năm mét"
+    assert normalize_vietnamese_text("Giá 1,234$ hoặc $1,234") == (
+        "Giá một nghìn hai trăm ba mươi tư đô la hoặc một nghìn hai trăm ba mươi tư đô la"
+    )
+    assert normalize_vietnamese_text("(Giá:1.500đ)") == "(Giá:một nghìn năm trăm đồng)"
+    assert normalize_vietnamese_text('Nhiệt độ:"-5°C"') == 'Nhiệt độ:"âm năm độ xê"'
+
+
+
 
 
