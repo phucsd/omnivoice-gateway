@@ -5,7 +5,7 @@ from typing import Optional
 from app.database import get_db
 from app.models import User, UserSetting, SystemSetting
 from app.config import settings
-from app.utils.auth import get_current_user
+from app.utils.auth import get_current_user, get_user_or_api_key
 
 router = APIRouter(prefix="/v1/settings", tags=["Settings"])
 
@@ -355,4 +355,46 @@ def push_dubbing_notebook_to_kaggle(db: Session = Depends(get_db), current_user:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Lỗi hệ thống khi đẩy Notebook Dubbing: {e}"
         )
+
+
+@router.post("/reset-workers", response_model=dict)
+def reset_kaggle_workers(
+    last_worker_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_user_or_api_key),
+):
+    """
+    Terminates disposable Kaggle GPU worker kernels (omnivoice-worker-1 / omnivoice-worker-2)
+    and immediately marks Gateway WorkerSession rows as stopped so subsequent jobs perform a clean cold-start.
+    """
+    from datetime import datetime, timedelta
+    from app.models import WorkerSession
+    from app.services.kaggle_orchestrator import KaggleOrchestrator
+
+    KaggleOrchestrator._purge_wedged_worker_kernels(
+        user_id=current_user.id,
+        slugs=("omnivoice-worker-1", "omnivoice-worker-2"),
+    )
+    KaggleOrchestrator._push_cooldown_until = 0.0
+
+    now_utc = datetime.utcnow()
+    older_utc = now_utc - timedelta(minutes=10)
+    sessions = db.query(WorkerSession).all()
+    for sess in sessions:
+        sess.status = "stopped"
+        sess.current_job_id = None
+        sess.message = "Reset via /v1/settings/reset-workers"
+        if last_worker_id and sess.worker_id == last_worker_id:
+            sess.stopped_at = now_utc
+            sess.last_heartbeat_at = older_utc
+        else:
+            sess.stopped_at = older_utc
+            sess.last_heartbeat_at = older_utc
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Đã hủy các phiên GPU Worker Kaggle đang chạy và làm sạch trạng thái WorkerSession.",
+    }
+
 
