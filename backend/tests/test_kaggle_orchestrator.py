@@ -582,4 +582,29 @@ def test_dead_worker_recovered_at_75s_heartbeat_timeout_and_resets_orphan_jobs(d
     assert JobService.get_next_job(db, "worker_2") is None
 
 
+def test_python311_eager_annotations_across_app_modules():
+    """Ensures all type annotations evaluate eagerly (Python 3.11 container compatibility vs Python 3.14 PEP 649)."""
+    import importlib
+    import inspect
+    import pkgutil
+    import app
+
+    annotationlib = None
+    try:
+        import annotationlib as _al
+        annotationlib = _al
+    except ImportError:
+        pass
+
+    for m in pkgutil.walk_packages(app.__path__, "app."):
+        mod = importlib.import_module(m.name)
+        if annotationlib is not None:
+            for _, obj in inspect.getmembers(mod):
+                if inspect.isfunction(obj) and obj.__module__ == mod.__name__:
+                    annotationlib.get_annotations(obj, format=annotationlib.Format.VALUE)
+                elif inspect.isclass(obj) and obj.__module__ == mod.__name__:
+                    for _, meth in inspect.getmembers(obj, predicate=inspect.isfunction):
+                        annotationlib.get_annotations(meth, format=annotationlib.Format.VALUE)
+
+
 
