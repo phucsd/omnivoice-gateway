@@ -674,32 +674,61 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
     };
   }, []);
 
-  // Poll job status
+  // Poll job status with transient error tolerance & visibility resync
   useEffect(() => {
-    if (isPolling && jobId) {
-      pollIntervalRef.current = window.setInterval(async () => {
-        try {
-          const status = await api.getJobStatus(jobId);
-          setJobStatus(status);
+    if (!isPolling || !jobId) return;
 
-          if (status.status === "completed" || status.status === "failed") {
-            stopPolling();
-            onJobUpdatedRef.current?.();
-            void fetchRecentPreviews();
-          }
-        } catch (err: unknown) {
-          setErrorMsg(`Lỗi khi thăm dò trạng thái: ${getErrorMessage(err)}`);
+    let consecutiveErrors = 0;
+    let inFlight = false;
+
+    const runPoll = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const status = await api.getJobStatus(jobId);
+        consecutiveErrors = 0;
+        setJobStatus(status);
+
+        if (status.status === "completed" || status.status === "failed" || status.status === "cancelled") {
+          stopPolling();
+          onJobUpdatedRef.current?.();
+          void fetchRecentPreviews();
+        }
+      } catch (err: unknown) {
+        const msg = getErrorMessage(err);
+        const isNotFound = msg.includes("404") || msg.toLowerCase().includes("không tìm thấy job");
+        consecutiveErrors += 1;
+        if (isNotFound || consecutiveErrors >= 10) {
+          setErrorMsg(`Lỗi khi thăm dò trạng thái: ${msg}`);
           stopPolling();
         }
-      }, 2000);
+      } finally {
+        inFlight = false;
+      }
+    };
 
-      timeoutRef.current = window.setTimeout(() => {
-        setErrorMsg("Hết thời gian chờ xử lý (Timeout 15 phút).");
-        stopPolling();
-      }, 900000);
-    }
+    void runPoll();
+    pollIntervalRef.current = window.setInterval(() => {
+      void runPoll();
+    }, 1500);
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        void runPoll();
+        void fetchRecentPreviews();
+      }
+    };
+    window.addEventListener("focus", onVisible);
+    document.addEventListener("visibilitychange", onVisible);
+
+    timeoutRef.current = window.setTimeout(() => {
+      setErrorMsg("Hết thời gian chờ xử lý (Timeout 15 phút).");
+      stopPolling();
+    }, 900000);
 
     return () => {
+      window.removeEventListener("focus", onVisible);
+      document.removeEventListener("visibilitychange", onVisible);
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
         pollIntervalRef.current = null;
@@ -1473,6 +1502,17 @@ export const VoiceDesignPanel: React.FC<VoiceDesignPanelProps> = ({
                 progress={jobStatus.progress}
                 errorMessage={jobStatus.error_message}
               />
+
+              {(jobStatus.text || previewText) && (
+                <div className="bg-secondary/30 border border-border rounded-xl p-3 flex flex-col gap-1">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    Văn bản TTS đối soát:
+                  </span>
+                  <p className="text-xs text-foreground whitespace-pre-wrap leading-relaxed select-text">
+                    {jobStatus.text || previewText}
+                  </p>
+                </div>
+              )}
 
               {jobStatus.status === "completed" && activePlaybackUrl && (
                 <div className="flex flex-col gap-3 p-3.5 rounded-2xl bg-secondary/35 border border-border">

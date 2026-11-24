@@ -137,28 +137,48 @@ export const ASRPanel: React.FC = () => {
     };
   }, []);
 
-  // Job Polling Loop
+  // Job Polling Loop with transient error resilience & focus resync
   useEffect(() => {
     if (!isPolling || !jobId) return;
 
+    let consecutiveErrors = 0;
+    let inFlight = false;
+
     const poll = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const status = await api.getJobStatus(jobId);
+        consecutiveErrors = 0;
         setJobStatus(status);
 
-        if (status.status === "completed" || status.status === "failed") {
+        if (status.status === "completed" || status.status === "failed" || status.status === "cancelled") {
           setIsPolling(false);
           setLoading(false);
         }
       } catch (err: unknown) {
-        console.error("ASR job polling error:", err);
-        setErrorMsg(getErrorMessage(err, "Lỗi khi kiểm tra trạng thái tác vụ."));
-        setIsPolling(false);
-        setLoading(false);
+        const msg = getErrorMessage(err, "Lỗi khi kiểm tra trạng thái tác vụ.");
+        const isNotFound = msg.includes("404") || msg.toLowerCase().includes("không tìm thấy job");
+        consecutiveErrors += 1;
+        if (isNotFound || consecutiveErrors >= 10) {
+          console.error("ASR job polling error:", err);
+          setErrorMsg(msg);
+          setIsPolling(false);
+          setLoading(false);
+        }
+      } finally {
+        inFlight = false;
       }
     };
 
+    void poll();
     pollIntervalRef.current = window.setInterval(poll, 1500);
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void poll();
+    };
+    window.addEventListener("focus", onVisible);
+    document.addEventListener("visibilitychange", onVisible);
 
     timeoutRef.current = window.setTimeout(() => {
       setIsPolling(false);
@@ -168,6 +188,8 @@ export const ASRPanel: React.FC = () => {
     }, 600000); // 10 minutes timeout
 
     return () => {
+      window.removeEventListener("focus", onVisible);
+      document.removeEventListener("visibilitychange", onVisible);
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
     };

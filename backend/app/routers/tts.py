@@ -51,7 +51,8 @@ def create_tts_job(payload: TTSJobCreate, request: Request, db: Session = Depend
         return TTSJobResponse(
             job_id=job.id,
             status=job.status,
-            message=job.message
+            message=job.message,
+            text=job.text,
         )
     except ValueError as e:
         raise HTTPException(

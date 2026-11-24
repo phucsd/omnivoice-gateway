@@ -1,5 +1,25 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { Play, Pause, Loader2, Sparkles, Settings2, CheckCircle2, Mic, Sliders, Wand2, ChevronDown, ChevronUp } from "lucide-react";
+import {
+  Play,
+  Pause,
+  Loader2,
+  Sparkles,
+  Settings2,
+  CheckCircle2,
+  Mic,
+  Sliders,
+  Wand2,
+  ChevronDown,
+  ChevronUp,
+  Copy,
+  Check,
+  Download,
+  RotateCcw,
+  RefreshCw,
+  FileText,
+  Clock,
+  Zap,
+} from "lucide-react";
 import { api, getErrorMessage } from "../api/client";
 import type { JobStatusResponse, VoiceSampleResponse } from "../api/client";
 
@@ -18,6 +38,52 @@ interface TTSPanelProps {
   onTogglePlay: () => void;
 }
 
+const DEFAULT_SAMPLE_TEXT =
+  "Học sinh hôm nay được nghỉ học do thời tiết xấu. Xin nhắc lại, học sinh được nghỉ học.";
+
+function loadRawInputMap(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem("VITE_TTS_RAW_INPUT_MAP");
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, string>;
+    }
+  } catch {
+    // ignore storage parse error
+  }
+  return {};
+}
+
+function saveRawInputForJob(jobId: string, rawText: string) {
+  try {
+    const current = loadRawInputMap();
+    const entries = Object.entries({ ...current, [jobId]: rawText });
+    const trimmed = Object.fromEntries(entries.slice(-20));
+    localStorage.setItem("VITE_TTS_RAW_INPUT_MAP", JSON.stringify(trimmed));
+  } catch {
+    // ignore quota error
+  }
+}
+
+function isTerminalStatus(st?: string | null): boolean {
+  return st === "completed" || st === "failed" || st === "cancelled";
+}
+
+function getModeLabel(jobType?: string): { label: string; className: string } {
+  switch (jobType) {
+    case "clone_voice":
+      return { label: "Nhân bản giọng", className: "bg-primary/10 text-primary border-primary/25" };
+    case "voice_design_tts":
+    case "voice_design":
+      return { label: "Thiết kế giọng", className: "bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border-indigo-500/25" };
+    case "auto_voice":
+      return { label: "Giọng tự động", className: "bg-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/25" };
+    default:
+      return { label: "TTS", className: "bg-secondary text-muted-foreground border-border" };
+  }
+}
+
 export const TTSPanel: React.FC<TTSPanelProps> = ({
   activeVoiceSampleId,
   onSelectVoiceSample,
@@ -28,19 +94,30 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
   onTogglePlay,
 }) => {
   const [mode, setMode] = useState<"clone_voice" | "auto_voice" | "voice_design">("clone_voice");
-  const [text, setText] = useState("Học sinh hôm nay được nghỉ học do thời tiết xấu. Xin nhắc lại, học sinh được nghỉ học.");
+  const [text, setText] = useState<string>(() => {
+    const saved = localStorage.getItem("VITE_TTS_DRAFT_TEXT");
+    return saved !== null ? saved : DEFAULT_SAMPLE_TEXT;
+  });
   const [customVoiceSampleId, setCustomVoiceSampleId] = useState(() => activeVoiceSampleId || "");
   const [refText, setRefText] = useState("");
   const [instruct, setInstruct] = useState("female, young adult, low pitch");
   const [assistingInstruct, setAssistingInstruct] = useState(false);
   const [instructHint, setInstructHint] = useState<string | null>(null);
-  
+
   const [loading, setLoading] = useState(false);
   const [jobId, setJobId] = useState<string | null>(() => localStorage.getItem("VITE_TTS_JOB_ID"));
   const [jobStatus, setJobStatus] = useState<JobStatusResponse | null>(null);
   const [isPolling, setIsPolling] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  
+  const [rawInputMap, setRawInputMap] = useState<Record<string, string>>(() => loadRawInputMap());
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [downloadingJobId, setDownloadingJobId] = useState<string | null>(null);
+
+  // Live recent TTS jobs feed on the same page
+  const [recentJobs, setRecentJobs] = useState<JobStatusResponse[]>([]);
+  const [loadingRecent, setLoadingRecent] = useState<boolean>(true);
+  const [expandedRecentIds, setExpandedRecentIds] = useState<Record<string, boolean>>({});
+
   const [speed, setSpeed] = useState(1.0);
   const [numStep, setNumStep] = useState(32);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -60,7 +137,7 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
   const [padDuration, setPadDuration] = useState<string>("");
   const [fadeDuration, setFadeDuration] = useState<string>("");
   const [normalizeText, setNormalizeText] = useState<boolean>(true);
-  
+
   const [activePreset, setActivePreset] = useState("Tự nhiên");
 
   const applyPreset = (presetName: string) => {
@@ -90,6 +167,21 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const pollIntervalRef = useRef<number | null>(null);
   const timeoutRef = useRef<number | null>(null);
+  const pollInFlightRef = useRef<boolean>(false);
+  const pollErrorCountRef = useRef<number>(0);
+  const jobIdRef = useRef<string | null>(jobId);
+
+  useEffect(() => {
+    jobIdRef.current = jobId;
+  }, [jobId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("VITE_TTS_DRAFT_TEXT", text);
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [text]);
 
   const [voiceSamples, setVoiceSamples] = useState<VoiceSampleResponse[]>([]);
   const onJobUpdatedRef = useRef(onJobCreatedOrUpdated);
@@ -97,7 +189,8 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
     onJobUpdatedRef.current = onJobCreatedOrUpdated;
   }, [onJobCreatedOrUpdated]);
 
-  const stopPolling = useCallback(() => {
+  // Clears timers ONLY — safe to call inside useEffect cleanup without resetting React state in StrictMode!
+  const clearPollTimers = useCallback(() => {
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
@@ -106,18 +199,58 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
     }
+    pollInFlightRef.current = false;
+  }, []);
+
+  const finishPolling = useCallback(() => {
+    clearPollTimers();
+    pollErrorCountRef.current = 0;
     setIsPolling(false);
     setLoading(false);
-  }, []);
+  }, [clearPollTimers]);
+
+  const fetchRecentJobs = useCallback(async (silent = false) => {
+    if (!silent) setLoadingRecent(true);
+    try {
+      const res = await api.listJobs({ page: 1, page_size: 8, job_type: "tts" });
+      const items = res.items || [];
+      setRecentJobs(items);
+
+      // Sync active card immediately if the active job is present in the fresh listing
+      const currentActiveId = jobIdRef.current;
+      if (currentActiveId) {
+        const matched = items.find((it) => it.job_id === currentActiveId);
+        if (matched) {
+          setJobStatus(matched);
+          if (isTerminalStatus(matched.status)) {
+            finishPolling();
+          }
+        }
+      }
+    } catch (err) {
+      if (!silent) {
+        console.warn("Không thể tải danh sách TTS gần đây:", err);
+      }
+    } finally {
+      if (!silent) setLoadingRecent(false);
+    }
+  }, [finishPolling]);
 
   useEffect(() => {
     let active = true;
     (async () => {
       try {
-        const samples = await api.listVoiceSamples();
-        if (active) setVoiceSamples(samples);
-      } catch (err) {
-        console.error("Lỗi lấy danh sách mẫu giọng:", err);
+        const [samples, jobsRes] = await Promise.all([
+          api.listVoiceSamples().catch(() => [] as VoiceSampleResponse[]),
+          api.listJobs({ page: 1, page_size: 8, job_type: "tts" }).catch(() => null),
+        ]);
+        if (!active) return;
+        setVoiceSamples(samples);
+        if (jobsRes) {
+          setRecentJobs(jobsRes.items || []);
+        }
+      } finally {
+        if (active) setLoadingRecent(false);
       }
     })();
     return () => {
@@ -158,6 +291,9 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
       setErrorMsg("Văn bản vượt quá giới hạn 5.000 ký tự. Vui lòng rút gọn nội dung.");
       return;
     }
+    const rawSubmitted = text.trim();
+    clearPollTimers();
+    pollErrorCountRef.current = 0;
     setLoading(true);
     setJobId(null);
     setJobStatus(null);
@@ -188,12 +324,15 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
       language: language || undefined,
       pad_duration: padDuration !== "" ? parseFloat(padDuration) : undefined,
       fade_duration: fadeDuration !== "" ? parseFloat(fadeDuration) : undefined,
-      normalize_text: normalizeText
+      normalize_text: normalizeText,
     };
 
     try {
-      const res = await api.createTTSJob(mode, text, voiceSampleId, instructParam, speed, numStep, params, refTextParam);
+      const res = await api.createTTSJob(mode, rawSubmitted, voiceSampleId, instructParam, speed, numStep, params, refTextParam);
+      saveRawInputForJob(res.job_id, rawSubmitted);
+      setRawInputMap((prev) => ({ ...prev, [res.job_id]: rawSubmitted }));
       setJobId(res.job_id);
+      jobIdRef.current = res.job_id;
       localStorage.setItem("VITE_TTS_JOB_ID", res.job_id);
       setJobStatus({
         job_id: res.job_id,
@@ -202,9 +341,12 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
         progress: 0,
         audio_url: null,
         error_message: null,
+        job_type: mode === "voice_design" ? "voice_design_tts" : mode,
+        text: res.text || rawSubmitted,
       });
       setIsPolling(true);
       onJobUpdatedRef.current?.();
+      void fetchRecentJobs(true);
     } catch (err: unknown) {
       setErrorMsg(getErrorMessage(err, "Không thể khởi tạo tiến trình TTS."));
       setLoading(false);
@@ -234,6 +376,8 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
     numStep,
     loading,
     isPolling,
+    clearPollTimers,
+    fetchRecentJobs,
   ]);
 
   const handleGenerateRef = useRef(handleGenerate);
@@ -251,6 +395,7 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
     };
   }, []);
 
+  // Restore saved active TTS job on mount
   useEffect(() => {
     const savedJobId = localStorage.getItem("VITE_TTS_JOB_ID");
     if (!savedJobId) return;
@@ -259,9 +404,10 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
       try {
         const status = await api.getJobStatus(savedJobId);
         if (!active) return;
+        setJobId(savedJobId);
         setJobStatus(status);
         setLoading(false);
-        if (status.status !== "completed" && status.status !== "failed") {
+        if (!isTerminalStatus(status.status)) {
           setIsPolling(true);
         }
       } catch (err) {
@@ -279,42 +425,154 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
     };
   }, []);
 
-  useEffect(() => {
-    if (isPolling && jobId) {
-      pollIntervalRef.current = window.setInterval(async () => {
-        try {
-          const status = await api.getJobStatus(jobId);
-          setJobStatus(status);
-          if (status.status === "completed" || status.status === "failed") {
-            stopPolling();
-            onJobUpdatedRef.current?.();
-          }
-        } catch (err: unknown) {
-          setErrorMsg(`Lỗi khi thăm dò trạng thái: ${getErrorMessage(err)}`);
-          stopPolling();
-        }
-      }, 2000);
-
-      timeoutRef.current = window.setTimeout(() => {
-        setErrorMsg("Hết thời gian chờ xử lý (Timeout 15 phút).");
-        stopPolling();
-      }, 900000);
+  // Fault-tolerant realtime polling for the active TTS job
+  const pollActiveJobOnce = useCallback(async (targetJobId: string) => {
+    if (!targetJobId || pollInFlightRef.current) return;
+    pollInFlightRef.current = true;
+    try {
+      const status = await api.getJobStatus(targetJobId);
+      if (jobIdRef.current !== targetJobId) return;
+      pollErrorCountRef.current = 0;
+      setJobStatus(status);
+      setRecentJobs((prev) => {
+        const idx = prev.findIndex((j) => j.job_id === status.job_id);
+        if (idx === -1) return prev;
+        const copy = [...prev];
+        copy[idx] = status;
+        return copy;
+      });
+      if (isTerminalStatus(status.status)) {
+        finishPolling();
+        onJobUpdatedRef.current?.();
+        void fetchRecentJobs(true);
+      }
+    } catch (err: unknown) {
+      const msg = getErrorMessage(err);
+      const isNotFound = msg.includes("404") || msg.toLowerCase().includes("không tìm thấy job");
+      pollErrorCountRef.current += 1;
+      if (isNotFound || pollErrorCountRef.current >= 10) {
+        setErrorMsg(`Lỗi khi thăm dò trạng thái: ${msg}`);
+        finishPolling();
+      } else {
+        console.warn(`Transient TTS poll warning (${pollErrorCountRef.current}/10):`, msg);
+      }
+    } finally {
+      pollInFlightRef.current = false;
     }
+  }, [finishPolling, fetchRecentJobs]);
 
-    return () => stopPolling();
-  }, [isPolling, jobId, stopPolling]);
+  useEffect(() => {
+    if (!isPolling || !jobId) return;
+
+    const initialTimer = window.setTimeout(() => {
+      void pollActiveJobOnce(jobId);
+    }, 50);
+
+    pollIntervalRef.current = window.setInterval(() => {
+      void pollActiveJobOnce(jobId);
+    }, 1500);
+
+    timeoutRef.current = window.setTimeout(() => {
+      setErrorMsg("Hết thời gian chờ xử lý (Timeout 15 phút).");
+      finishPolling();
+    }, 900000);
+
+    return () => {
+      window.clearTimeout(initialTimer);
+      clearPollTimers();
+    };
+  }, [isPolling, jobId, pollActiveJobOnce, clearPollTimers, finishPolling]);
+
+  // Auto-poll recent TTS jobs whenever any item is in-flight (including jobs submitted via API / other tabs)
+  const hasInFlightRecent = recentJobs.some((j) => !isTerminalStatus(j.status));
+
+  useEffect(() => {
+    const intervalMs = hasInFlightRecent ? 2500 : 10000;
+    const timer = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      void fetchRecentJobs(true);
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [hasInFlightRecent, fetchRecentJobs]);
+
+  // Instant resync when returning to browser tab / window focus (zero F5 needed!)
+  useEffect(() => {
+    const resyncNow = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      const activeId = jobIdRef.current;
+      if (activeId) {
+        void pollActiveJobOnce(activeId);
+      }
+      void fetchRecentJobs(true);
+    };
+    window.addEventListener("focus", resyncNow);
+    document.addEventListener("visibilitychange", resyncNow);
+    return () => {
+      window.removeEventListener("focus", resyncNow);
+      document.removeEventListener("visibilitychange", resyncNow);
+    };
+  }, [pollActiveJobOnce, fetchRecentJobs]);
 
   const handleClearJob = () => {
+    finishPolling();
     setJobId(null);
+    jobIdRef.current = null;
     setJobStatus(null);
     localStorage.removeItem("VITE_TTS_JOB_ID");
   };
 
+  const handleCopyText = (key: string, val: string) => {
+    if (!val) return;
+    navigator.clipboard.writeText(val).then(() => {
+      setCopiedKey(key);
+      window.setTimeout(() => setCopiedKey(null), 1800);
+    }).catch(() => {});
+  };
+
+  const handleDownloadAudio = async (targetJob: JobStatusResponse) => {
+    const rawUrl = targetJob.cdn_audio_url || (targetJob.audio_url ? `${api.getApiBaseUrl()}${targetJob.audio_url}` : "");
+    if (!rawUrl || downloadingJobId === targetJob.job_id) return;
+    setDownloadingJobId(targetJob.job_id);
+    try {
+      const { blobUrl, isObjectUrl } = await api.fetchProtectedAudioBlobUrl(rawUrl);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `omnivoice_tts_${targetJob.job_id}.wav`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      if (isObjectUrl) {
+        window.setTimeout(() => URL.revokeObjectURL(blobUrl), 2500);
+      }
+    } catch (err) {
+      setErrorMsg(`Không thể tải tệp WAV: ${getErrorMessage(err)}`);
+    } finally {
+      setDownloadingJobId(null);
+    }
+  };
+
+  const handleRestoreTextToEditor = (val: string) => {
+    if (!val) return;
+    setText(val);
+    textareaRef.current?.focus();
+  };
+
+  const activeTtsText = (jobStatus?.text || (jobStatus ? rawInputMap[jobStatus.job_id] : "") || "").trim();
+  const activeRawSubmitted = jobStatus ? (rawInputMap[jobStatus.job_id] || "").trim() : "";
+  const hasNormalizedDiff =
+    Boolean(activeRawSubmitted) &&
+    Boolean(activeTtsText) &&
+    activeRawSubmitted.replace(/\s+/g, " ") !== activeTtsText.replace(/\s+/g, " ");
+  const activeAudioUrl =
+    jobStatus && (jobStatus.cdn_audio_url || jobStatus.audio_url)
+      ? jobStatus.cdn_audio_url || `${api.getApiBaseUrl()}${jobStatus.audio_url}`
+      : "";
+
   return (
     <div className="w-full flex flex-col gap-6">
-      <PageHeader 
-        title="Tạo giọng đọc" 
-        description="Tạo audio từ văn bản theo 3 bước đơn giản."
+      <PageHeader
+        title="Tạo giọng đọc"
+        description="Tạo audio từ văn bản, cập nhật tiến trình thời gian thực và đối soát trực tiếp văn bản TTS."
         icon={<Sparkles className="w-6 h-6" />}
       />
 
@@ -375,7 +633,7 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
                       <CheckCircle2 className="w-5 h-5 text-primary shrink-0" />
                       <div className="flex flex-col">
                         <span className="text-xs font-bold text-primary">Giọng đang chọn</span>
-                        <span className="text-sm font-medium">{activeVoiceSampleId.substring(0, 15)}...</span>
+                        <span className="text-sm font-medium">{activeVoiceSampleId.substring(0, 24)}</span>
                       </div>
                     </div>
                   )}
@@ -514,85 +772,397 @@ export const TTSPanel: React.FC<TTSPanelProps> = ({
               maxLength={5000}
               onChange={(e) => setText(e.target.value)}
               placeholder="Nhập nội dung cần đọc..."
-              className="w-full bg-secondary/30 rounded-xl p-4 min-h-[200px] border border-border/60 focus:border-primary/50 focus:outline-none resize-y"
+              className="w-full bg-secondary/30 rounded-xl p-4 min-h-[200px] border border-border/60 focus:border-primary/50 focus:outline-none resize-y leading-relaxed"
             />
-            <div className={`text-xs mt-2 text-right font-mono ${text.length >= 5000 ? "text-destructive font-bold" : "text-muted-foreground"}`}>
-              {text.length} / 5000 ký tự
+            <div className="flex items-center justify-between mt-2 text-xs text-muted-foreground">
+              <span>
+                {text.trim() ? `${text.trim().split(/\s+/).length} từ` : "0 từ"}
+              </span>
+              <span className={`font-mono ${text.length >= 5000 ? "text-destructive font-bold" : "text-muted-foreground"}`}>
+                {text.length} / 5000 ký tự
+              </span>
             </div>
           </SectionCard>
 
-          {/* Step 3: Result & Progress */}
+          {/* Step 3: Result, Progress & TTS Text Cross-Check */}
           {jobId && jobStatus && (
-            <SectionCard title="3. Kết quả">
-              <JobStatusCard
-                jobId={jobStatus.job_id}
-                status={jobStatus.status}
-                message={jobStatus.message}
-                progress={jobStatus.progress}
-                errorMessage={jobStatus.error_message}
-              />
-              {jobStatus.status === "completed" && (jobStatus.cdn_audio_url || jobStatus.audio_url) && (
-                <div className="mt-4 flex flex-wrap gap-3">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const url = jobStatus.cdn_audio_url || `${api.getApiBaseUrl()}${jobStatus.audio_url}`;
-                      if (currentPlayUrl === url) onTogglePlay();
-                      else onPlayAudio(url, "TTS Output");
-                    }}
-                    className="flex-1 min-h-[44px] bg-primary text-primary-foreground hover:bg-primary-hover px-4 rounded-xl flex items-center justify-center gap-2 text-sm font-semibold transition-colors cursor-pointer"
-                  >
-                    {currentPlayUrl === (jobStatus.cdn_audio_url || `${api.getApiBaseUrl()}${jobStatus.audio_url}`) && globalPlayerPlaying ? (
-                      <><Pause className="w-4 h-4" /> Tạm dừng</>
-                    ) : (
-                      <><Play className="w-4 h-4" /> Nghe thử</>
+            <SectionCard title="3. Kết quả &amp; Đối soát văn bản TTS">
+              <div className="flex flex-col gap-4">
+                <JobStatusCard
+                  jobId={jobStatus.job_id}
+                  status={jobStatus.status}
+                  message={jobStatus.message}
+                  progress={jobStatus.progress}
+                  errorMessage={jobStatus.error_message}
+                />
+
+                {/* TTS Text Cross-Check Panel */}
+                {activeTtsText && (
+                  <div className="bg-secondary/30 border border-border rounded-2xl p-4 flex flex-col gap-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="inline-flex items-center gap-1.5 text-xs font-bold text-foreground">
+                          <FileText className="w-3.5 h-3.5 text-primary" />
+                          <span>Văn bản TTS đối soát</span>
+                        </span>
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-background border border-border text-muted-foreground">
+                          {activeTtsText.split(/\s+/).filter(Boolean).length} từ • {activeTtsText.length} ký tự
+                        </span>
+                        {hasNormalizedDiff && (
+                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20">
+                            Đã chuẩn hóa số / ký hiệu để đọc
+                          </span>
+                        )}
+                        {typeof jobStatus.total_time === "number" && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-success/10 text-success border border-success/20">
+                            <Zap className="w-3 h-3" />
+                            <span>{jobStatus.total_time.toFixed(1)}s</span>
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleCopyText(`active_${jobStatus.job_id}`, activeTtsText)}
+                          className="min-h-[32px] px-2.5 py-1 rounded-lg bg-card hover:bg-secondary border border-border text-[11px] font-semibold text-muted-foreground hover:text-foreground transition-colors cursor-pointer inline-flex items-center gap-1"
+                        >
+                          {copiedKey === `active_${jobStatus.job_id}` ? (
+                            <>
+                              <Check className="w-3 h-3 text-success" />
+                              <span>Đã chép</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3 h-3" />
+                              <span>Sao chép text</span>
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRestoreTextToEditor(activeRawSubmitted || activeTtsText)}
+                          className="min-h-[32px] px-2.5 py-1 rounded-lg bg-card hover:bg-secondary border border-border text-[11px] font-semibold text-muted-foreground hover:text-foreground transition-colors cursor-pointer inline-flex items-center gap-1"
+                          title="Đưa nội dung này lên ô nhập văn bản ở Bước 2 để chỉnh sửa và tạo lại"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>Đưa vào ô nhập</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="bg-card border border-border/80 rounded-xl p-3.5 text-sm text-foreground whitespace-pre-wrap leading-relaxed max-h-60 overflow-y-auto select-text">
+                      {activeTtsText}
+                    </div>
+
+                    {hasNormalizedDiff && (
+                      <div className="bg-background/70 border border-border/60 rounded-xl p-3 text-xs flex flex-col gap-1">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                          Văn bản gốc trước chuẩn hóa:
+                        </span>
+                        <p className="text-muted-foreground whitespace-pre-wrap leading-relaxed">
+                          {activeRawSubmitted}
+                        </p>
+                      </div>
                     )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleClearJob}
-                    className="min-h-[44px] px-4 bg-secondary text-foreground hover:bg-secondary/80 rounded-xl text-sm font-semibold cursor-pointer"
-                  >
-                    Xóa kết quả
-                  </button>
-                </div>
-              )}
+                  </div>
+                )}
+
+                {jobStatus.status === "completed" && activeAudioUrl && (
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (currentPlayUrl === activeAudioUrl) onTogglePlay();
+                        else onPlayAudio(activeAudioUrl, activeTtsText ? `TTS: ${activeTtsText.slice(0, 42)}` : "TTS Output");
+                      }}
+                      className="flex-1 min-h-[44px] bg-primary text-primary-foreground hover:bg-primary-hover px-4 rounded-xl flex items-center justify-center gap-2 text-sm font-semibold transition-colors cursor-pointer"
+                    >
+                      {currentPlayUrl === activeAudioUrl && globalPlayerPlaying ? (
+                        <><Pause className="w-4 h-4" /> Tạm dừng</>
+                      ) : (
+                        <><Play className="w-4 h-4" /> Nghe đối soát</>
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={downloadingJobId === jobStatus.job_id}
+                      onClick={() => void handleDownloadAudio(jobStatus)}
+                      className="min-h-[44px] px-4 bg-card hover:bg-secondary border border-border text-foreground rounded-xl flex items-center justify-center gap-2 text-sm font-semibold transition-colors cursor-pointer disabled:opacity-55"
+                    >
+                      {downloadingJobId === jobStatus.job_id ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Download className="w-4 h-4" />
+                      )}
+                      <span>Tải WAV</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleClearJob}
+                      className="min-h-[44px] px-4 bg-secondary text-foreground hover:bg-secondary/80 rounded-xl text-sm font-semibold cursor-pointer"
+                    >
+                      Ẩn kết quả
+                    </button>
+                  </div>
+                )}
+              </div>
             </SectionCard>
           )}
+
+          {/* Live Recent TTS Generations for Realtime Tracking & Text Verification */}
+          <SectionCard title="Kết quả tạo giọng gần đây (Tự động cập nhật Realtime)">
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-muted-foreground">
+                  Tự động đồng bộ trực tiếp cả các tác vụ tạo trên trang này lẫn qua API mà không cần nhấn F5.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void fetchRecentJobs(false)}
+                  disabled={loadingRecent}
+                  className="min-h-[34px] px-3 py-1 rounded-lg bg-secondary hover:bg-secondary/80 border border-border text-xs font-semibold text-foreground inline-flex items-center gap-1.5 cursor-pointer shrink-0"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loadingRecent ? "animate-spin text-primary" : ""}`} />
+                  <span>Làm mới</span>
+                </button>
+              </div>
+
+              {loadingRecent && recentJobs.length === 0 ? (
+                <div className="py-6 flex items-center justify-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Đang tải kết quả gần đây...</span>
+                </div>
+              ) : recentJobs.length === 0 ? (
+                <div className="py-6 text-center text-xs text-muted-foreground border border-dashed border-border rounded-xl">
+                  Chưa có kết quả tạo giọng đọc nào gần đây.
+                </div>
+              ) : (
+                <div className="flex flex-col gap-3 max-h-[520px] overflow-y-auto pr-1">
+                  {recentJobs.map((item) => {
+                    const itemUrl =
+                      item.cdn_audio_url ||
+                      (item.audio_url ? `${api.getApiBaseUrl()}${item.audio_url}` : "");
+                    const isPlayingItem = Boolean(itemUrl && currentPlayUrl === itemUrl && globalPlayerPlaying);
+                    const itemText = (item.text || rawInputMap[item.job_id] || "").trim();
+                    const isLong = itemText.length > 180;
+                    const expanded = Boolean(expandedRecentIds[item.job_id]);
+                    const shownText = isLong && !expanded ? `${itemText.slice(0, 180)}...` : itemText;
+                    const modeMeta = getModeLabel(item.job_type);
+                    const isRunning = !isTerminalStatus(item.status);
+
+                    return (
+                      <div
+                        key={item.job_id}
+                        className={`p-3.5 rounded-2xl border transition-colors flex flex-col gap-2.5 ${
+                          jobId === item.job_id
+                            ? "bg-primary/[0.04] border-primary/40"
+                            : "bg-secondary/20 border-border hover:border-border/80"
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${modeMeta.className}`}>
+                              {modeMeta.label}
+                            </span>
+                            <span className="text-[11px] font-mono text-muted-foreground">
+                              #{item.job_id.slice(0, 10)}
+                            </span>
+                            {item.created_at && (
+                              <span className="text-[11px] text-muted-foreground inline-flex items-center gap-1">
+                                <Clock className="w-3 h-3" />
+                                {new Date(item.created_at).toLocaleTimeString("vi-VN", {
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                  second: "2-digit",
+                                })}
+                              </span>
+                            )}
+                            {typeof item.total_time === "number" && (
+                              <span className="text-[10px] font-mono text-primary bg-primary/10 px-2 py-0.5 rounded-full">
+                                {item.total_time.toFixed(1)}s
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            {item.status === "completed" && (
+                              <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-success/10 text-success border border-success/20">
+                                Hoàn tất
+                              </span>
+                            )}
+                            {item.status === "failed" && (
+                              <span
+                                className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-destructive/10 text-destructive border border-destructive/20"
+                                title={item.error_message || ""}
+                              >
+                                Thất bại
+                              </span>
+                            )}
+                            {isRunning && (
+                              <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-warning/10 text-warning border border-warning/25">
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                                <span>Đang xử lý ({item.progress ?? 0}%)</span>
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* TTS Text for instant cross-checking */}
+                        {itemText ? (
+                          <div className="bg-card border border-border/70 rounded-xl p-3 text-xs text-foreground leading-relaxed whitespace-pre-wrap">
+                            <span>{shownText}</span>
+                            {isLong && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedRecentIds((prev) => ({
+                                    ...prev,
+                                    [item.job_id]: !expanded,
+                                  }))
+                                }
+                                className="ml-1.5 text-[11px] font-bold text-primary hover:underline cursor-pointer"
+                              >
+                                {expanded ? "Thu gọn" : "Xem đầy đủ"}
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <p className="text-xs italic text-muted-foreground">
+                            (Không có nội dung văn bản đính kèm)
+                          </p>
+                        )}
+
+                        {isRunning && item.message && (
+                          <p className="text-[11px] text-muted-foreground">
+                            • {item.message}
+                          </p>
+                        )}
+                        {item.status === "failed" && item.error_message && (
+                          <p className="text-[11px] text-destructive font-mono break-all">
+                            {item.error_message}
+                          </p>
+                        )}
+
+                        <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                          {item.status === "completed" && itemUrl && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (currentPlayUrl === itemUrl) onTogglePlay();
+                                  else onPlayAudio(itemUrl, itemText ? `TTS: ${itemText.slice(0, 42)}` : `TTS #${item.job_id.slice(0, 8)}`);
+                                }}
+                                className={`min-h-[36px] px-3.5 py-1 rounded-full text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer border transition-colors ${
+                                  isPlayingItem
+                                    ? "bg-primary text-primary-foreground border-primary"
+                                    : "bg-card hover:bg-secondary text-foreground border-border"
+                                }`}
+                              >
+                                {isPlayingItem ? (
+                                  <>
+                                    <Pause className="w-3.5 h-3.5 fill-current" />
+                                    <span>Tạm dừng</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Play className="w-3.5 h-3.5 fill-current" />
+                                    <span>Nghe đối soát</span>
+                                  </>
+                                )}
+                              </button>
+
+                              <button
+                                type="button"
+                                disabled={downloadingJobId === item.job_id}
+                                onClick={() => void handleDownloadAudio(item)}
+                                className="min-h-[36px] px-3 py-1 rounded-full bg-card hover:bg-secondary border border-border text-xs font-semibold text-foreground inline-flex items-center gap-1.5 cursor-pointer"
+                              >
+                                {downloadingJobId === item.job_id ? (
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <Download className="w-3 h-3" />
+                                )}
+                                <span>Tải WAV</span>
+                              </button>
+                            </>
+                          )}
+
+                          {itemText && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => handleCopyText(`rec_${item.job_id}`, itemText)}
+                                className="min-h-[36px] px-3 py-1 rounded-full bg-card hover:bg-secondary border border-border text-xs font-semibold text-muted-foreground hover:text-foreground inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                {copiedKey === `rec_${item.job_id}` ? (
+                                  <>
+                                    <Check className="w-3 h-3 text-success" />
+                                    <span>Đã chép</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="w-3 h-3" />
+                                    <span>Chép text</span>
+                                  </>
+                                )}
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => handleRestoreTextToEditor(rawInputMap[item.job_id] || itemText)}
+                                className="min-h-[36px] px-3 py-1 rounded-full bg-secondary/70 hover:bg-secondary border border-border text-xs font-semibold text-muted-foreground hover:text-foreground inline-flex items-center gap-1 cursor-pointer ml-auto"
+                              >
+                                <RotateCcw className="w-3 h-3" />
+                                <span>Nạp vào ô nhập</span>
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </SectionCard>
         </div>
 
         {/* Right column: Config & Generate */}
         <div className="lg:col-span-1 flex flex-col gap-6">
-           <button
-              type="button"
-              onClick={handleGenerate}
-              disabled={loading || isPolling || !text.trim() || text.length > 5000 || (mode === "clone_voice" && !customVoiceSampleId)}
-              className={`w-full min-h-[52px] rounded-xl font-bold text-base transition-colors flex items-center justify-center gap-2 cursor-pointer active:translate-y-[1px] ${
-                !loading && !isPolling && text.trim() && text.length <= 5000 && (mode !== "clone_voice" || customVoiceSampleId)
-                  ? "bg-primary text-primary-foreground hover:bg-primary-hover"
-                  : "bg-secondary text-muted-foreground cursor-not-allowed"
-              }`}
-            >
-              {loading || isPolling ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5 fill-current" />}
-              <span>{loading || isPolling ? "Đang xử lý..." : "Tạo Audio"}</span>
-            </button>
+          <button
+            type="button"
+            onClick={handleGenerate}
+            disabled={loading || isPolling || !text.trim() || text.length > 5000 || (mode === "clone_voice" && !customVoiceSampleId)}
+            className={`w-full min-h-[52px] rounded-xl font-bold text-base transition-colors flex items-center justify-center gap-2 cursor-pointer active:translate-y-[1px] ${
+              !loading && !isPolling && text.trim() && text.length <= 5000 && (mode !== "clone_voice" || customVoiceSampleId)
+                ? "bg-primary text-primary-foreground hover:bg-primary-hover"
+                : "bg-secondary text-muted-foreground cursor-not-allowed"
+            }`}
+          >
+            {loading || isPolling ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5 fill-current" />}
+            <span>{loading || isPolling ? "Đang xử lý..." : "Tạo Audio"}</span>
+          </button>
 
-            {errorMsg && (
-              <div className="p-3 bg-destructive/10 border border-destructive/20 text-destructive rounded-xl text-sm font-semibold">
-                {errorMsg}
-              </div>
-            )}
+          {errorMsg && (
+            <div className="p-3 bg-destructive/10 border border-destructive/20 text-destructive rounded-xl text-sm font-semibold">
+              {errorMsg}
+            </div>
+          )}
 
           <SectionCard title="Cấu hình giọng đọc">
             <div className="flex flex-col gap-5">
               <div>
-                <label className="text-xs font-bold text-muted-foreground uppercase mb-2 block">Cảm xúc & Nhịp điệu (Presets)</label>
+                <label className="text-xs font-bold text-muted-foreground uppercase mb-2 block">Cảm xúc &amp; Nhịp điệu (Presets)</label>
                 <div className="flex flex-wrap gap-2">
                   {["Tự nhiên", "Kể chuyện", "Quảng cáo", "Tin tức", "Chậm rõ", "Nhanh gọn"].map(p => (
                     <button
+                      type="button"
                       key={p}
                       onClick={() => applyPreset(p)}
-                      className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${
+                      className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors cursor-pointer ${
                         activePreset === p ? "bg-primary/10 border-primary text-primary" : "bg-secondary/40 border-border hover:border-primary/50 text-muted-foreground hover:text-foreground"
                       }`}
                     >

@@ -263,6 +263,7 @@ class TTSJobResponse(BaseModel):
     job_id: str
     status: str
     message: str
+    text: Optional[str] = None
 
 class BatchJobStatusRequest(BaseModel):
     job_ids: List[str] = Field(..., description="Danh sách các mã job_id cần lấy trạng thái")

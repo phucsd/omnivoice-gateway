@@ -338,7 +338,9 @@ def list_jobs(
 
     # Filtering by job_type (category)
     if job_type and job_type != "all":
-        if job_type == "clone_voice":
+        if job_type == "tts":
+            query = query.filter(TTSJob.job_type.in_(["clone_voice", "auto_voice", "voice_design_tts"]))
+        elif job_type == "clone_voice":
             query = query.filter(TTSJob.job_type == "clone_voice")
         elif job_type == "auto_voice":
             query = query.filter(TTSJob.job_type == "auto_voice")

@@ -465,3 +465,65 @@ def test_batch_gpu_cap_parks_job_in_queued_and_terminal_boot_failure_syncs_dubbi
         assert "Kaggle boot error" in (dub.error_message or "")
 
 
+def test_booting_worker_session_not_counted_as_confirmed_live_worker(db):
+    from app.services.worker_session_service import WorkerSessionService
+
+    # Gateway pre-push registers status="booting" (unstarted on Kaggle) -> must NOT count as confirmed live worker!
+    WorkerSessionService.register_worker(db, "worker_1", "booting", "Pushing kernel...")
+    assert KaggleOrchestrator.has_live_worker(db) is False
+    assert KaggleOrchestrator.has_live_or_booting_worker(db) is True
+
+    # Once Python actually boots on Kaggle and registers "starting" / "ready", it counts as confirmed live worker
+    WorkerSessionService.register_worker(db, "worker_1", "ready", "Ready on GPU")
+    assert KaggleOrchestrator.has_live_worker(db) is True
+
+
+@patch.object(KaggleOrchestrator, "get_credentials")
+def test_batch_cap_immediately_purges_wedged_kernels_on_first_cycle_when_zero_live_workers(mock_creds, db):
+    mock_creds.return_value = ("testuser", "testkey", "testuser/omnivoice-worker-1", "/tmp/worker")
+    job = create_mock_job(db, job_id="job_wedged_2gpu", status="queued", worker_id="worker_1")
+
+    with patch("subprocess.Popen") as mock_popen, \
+         patch("app.services.kaggle_notebook_builder.KaggleNotebookBuilder.prepare_all"), \
+         patch.object(KaggleOrchestrator, "_purge_wedged_worker_kernels") as mock_purge:
+        p1 = MagicMock()
+        p1.communicate.return_value = ("Kernel push error: Maximum batch GPU session count of 2 reached.", "")
+        p1.returncode = 0
+        p2 = MagicMock()
+        p2.communicate.return_value = ("Kernel push error: Maximum batch GPU session count of 2 reached.", "")
+        p2.returncode = 0
+        mock_popen.side_effect = [p1, p2]
+
+        KaggleOrchestrator._trigger_daemon_worker(db, job)
+        db.refresh(job)
+
+        # Must immediately purge wedged QUEUED kernels on first quota hit (wait_cycles == 0 -> 1)
+        assert mock_purge.called
+        assert job.status == "queued"
+        assert job.worker_id is None
+
+
+@patch.object(KaggleOrchestrator, "get_credentials")
+def test_poll_queued_timeout_purges_stuck_slot_before_failover(mock_creds, db):
+    import time as _time
+
+    mock_creds.return_value = ("testuser", "testkey", "testuser/omnivoice-worker-1", "/tmp/worker")
+    job = create_mock_job(db, job_id="job_q_stuck", status="queued_kaggle", worker_id="worker_1")
+    KaggleOrchestrator._boot_started_at[job.id] = _time.monotonic() - 95.0
+
+    with patch("subprocess.run") as mock_run, \
+         patch.object(KaggleOrchestrator, "_purge_wedged_worker_kernels") as mock_purge, \
+         patch.object(KaggleOrchestrator, "_trigger_daemon_worker") as mock_trigger:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='testuser/omnivoice-worker-1 has status "KernelWorkerStatus.QUEUED"',
+        )
+        KaggleOrchestrator._poll_booting_worker(db, job)
+        db.refresh(job)
+
+        mock_purge.assert_called_once_with(user_id="test_user", job_id="job_q_stuck", slugs=("omnivoice-worker-1",))
+        assert job.worker_id == "worker_2"
+        assert mock_trigger.called
+
+
+

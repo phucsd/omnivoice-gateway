@@ -202,6 +202,7 @@ export interface TTSJobResponse {
   job_id: string;
   status: string;
   message: string;
+  text?: string | null;
 }
 
 export interface JobStatusResponse {
@@ -570,6 +571,7 @@ export const api = {
     if (params?.job_type && params.job_type !== "all") query.set("job_type", params.job_type);
     if (params?.status_filter && params.status_filter !== "all") query.set("status_filter", params.status_filter);
     if (params?.search && params.search.trim()) query.set("search", params.search.trim());
+    query.set("t", String(Date.now()));
 
     return request<PaginatedJobsResponse>(`/v1/jobs?${query.toString()}`);
   },

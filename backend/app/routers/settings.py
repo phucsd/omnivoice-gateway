@@ -186,6 +186,7 @@ def push_notebook_to_kaggle(db: Session = Depends(get_db), current_user: User = 
     """Prepares and pushes the worker notebook to Kaggle for the user, returning the notebook web URL."""
     from app.services.kaggle_orchestrator import KaggleOrchestrator
     from app.services.kaggle_notebook_builder import KaggleNotebookBuilder
+    from app.services.worker_session_service import WorkerSessionService
     import os
     import sys
     import subprocess
@@ -197,9 +198,16 @@ def push_notebook_to_kaggle(db: Session = Depends(get_db), current_user: User = 
         )
         
     try:
-        # Prepare files (worker.ipynb, kernel-metadata.json, requirements.txt)
-        worker_dir = KaggleNotebookBuilder.prepare_all(db=db, user_id=current_user.id)
-        username, key, kernel_ref, worker_dir_resolved = KaggleOrchestrator.get_credentials(db, current_user.id)
+        # Prepare files in the actual active worker-1 directory (omnivoice-worker-1, dataset_sources=[])
+        worker_dir = KaggleNotebookBuilder.prepare_all(
+            job={"worker_id": "worker_1", "user_id": current_user.id},
+            db=db,
+            is_daemon=True,
+            user_id=current_user.id,
+        )
+        username, key, _, _ = KaggleOrchestrator.get_credentials(db, current_user.id)
+        target_slug = "omnivoice-worker-1"
+        kernel_ref = f"{username}/{target_slug}"
         
         # Resolve accelerator and timeout settings
         accelerator = settings.KAGGLE_ACCELERATOR
@@ -233,7 +241,12 @@ def push_notebook_to_kaggle(db: Session = Depends(get_db), current_user: User = 
             else:
                 mapped_acc = accelerator
 
-        cmd = [sys.executable, "-c", "from kaggle.cli import main; main()", "kernels", "push", "-p", os.path.abspath(worker_dir_resolved), "--timeout", str(timeout), "--accelerator", mapped_acc]
+        # If omnivoice-worker-1 already has a wedged QUEUED run with 0 live Gateway workers, clear it first so versions never stack in QUEUED
+        prior_status = KaggleOrchestrator._query_slot_kaggle_status(username, key, target_slug)
+        if "queued" in prior_status and not KaggleOrchestrator.has_live_worker(db):
+            KaggleOrchestrator._purge_wedged_worker_kernels(user_id=current_user.id, slugs=(target_slug,))
+
+        cmd = [sys.executable, "-c", "from kaggle.cli import main; main()", "kernels", "push", "-p", os.path.abspath(worker_dir), "--timeout", str(timeout), "--accelerator", mapped_acc]
         
         res = subprocess.Popen(
             cmd,
@@ -244,16 +257,27 @@ def push_notebook_to_kaggle(db: Session = Depends(get_db), current_user: User = 
             shell=False
         )
         stdout, stderr = res.communicate()
+        stdout_clean = (stdout or "").strip()
+        stderr_clean = (stderr or "").strip()
+        stdout_lower = stdout_clean.lower()
+        has_cli_push_error = (
+            "kernel push error" in stdout_lower
+            or stdout_lower.startswith("error:")
+            or "maximum batch gpu session count" in stdout_lower
+            or "403 - forbidden" in stdout_lower
+            or "401 - unauthorized" in stdout_lower
+        )
         
-        if res.returncode == 0:
+        if res.returncode == 0 and not has_cli_push_error:
+            WorkerSessionService.register_worker(db, "worker_1", "booting", "Pushed manually via Kaggle Settings...")
             notebook_url = f"https://www.kaggle.com/code/{kernel_ref}"
             return {
                 "success": True,
-                "message": "Đã đẩy notebook lên Kaggle thành công!",
+                "message": "Đã đẩy worker notebook lên Kaggle thành công!",
                 "url": notebook_url
             }
         else:
-            err_msg = stderr.strip() or stdout.strip() or "Kaggle CLI returned non-zero code."
+            err_msg = stderr_clean or stdout_clean or "Kaggle CLI returned non-zero code."
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Lỗi đẩy notebook: {err_msg}"
@@ -283,7 +307,7 @@ def push_dubbing_notebook_to_kaggle(db: Session = Depends(get_db), current_user:
 
     try:
         worker_dir = DubbingNotebookBuilder.prepare_all(db=db, user_id=current_user.id)
-        username, key, kernel_ref, worker_dir_resolved = KaggleOrchestrator.get_credentials(db, current_user.id)
+        username, key, _, _ = KaggleOrchestrator.get_credentials(db, current_user.id)
         
         env = os.environ.copy()
         env["KAGGLE_USERNAME"] = username
@@ -292,7 +316,7 @@ def push_dubbing_notebook_to_kaggle(db: Session = Depends(get_db), current_user:
         env["PYTHONUTF8"] = "1"
 
         dubbing_slug = f"{username}/omnivoice-dubbing-worker"
-        cmd = [sys.executable, "-c", "from kaggle.cli import main; main()", "kernels", "push", "-p", os.path.abspath(worker_dir_resolved), "--timeout", "3600", "--accelerator", "NvidiaTeslaT4"]
+        cmd = [sys.executable, "-c", "from kaggle.cli import main; main()", "kernels", "push", "-p", os.path.abspath(worker_dir), "--timeout", "3600", "--accelerator", "NvidiaTeslaT4"]
 
         res = subprocess.Popen(
             cmd,
@@ -303,15 +327,23 @@ def push_dubbing_notebook_to_kaggle(db: Session = Depends(get_db), current_user:
             shell=False
         )
         stdout, stderr = res.communicate()
+        stdout_clean = (stdout or "").strip()
+        stderr_clean = (stderr or "").strip()
+        stdout_lower = stdout_clean.lower()
+        has_cli_push_error = (
+            "kernel push error" in stdout_lower
+            or stdout_lower.startswith("error:")
+            or "maximum batch gpu session count" in stdout_lower
+        )
 
-        if res.returncode == 0:
+        if res.returncode == 0 and not has_cli_push_error:
             return {
                 "success": True,
                 "message": "Đã đẩy Notebook Dubbing chuyên biệt lên Kaggle thành công!",
                 "url": f"https://www.kaggle.com/code/{dubbing_slug}"
             }
         else:
-            err_msg = stderr.strip() or stdout.strip() or "Kaggle CLI error"
+            err_msg = stderr_clean or stdout_clean or "Kaggle CLI error"
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Lỗi đẩy Notebook Dubbing: {err_msg}"

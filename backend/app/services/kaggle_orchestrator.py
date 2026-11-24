@@ -76,13 +76,14 @@ class KaggleOrchestrator:
     @staticmethod
     def has_live_worker(db) -> bool:
         """
-        Queries the database to check if there is an active worker session 
-        that is not stopped or failed and has sent a heartbeat recently.
+        Queries the database to check if there is a confirmed live GPU worker container
+        (one that has actually started Python on Kaggle and contacted the Gateway within 180s).
+        Note: Gateway-side pre-push registrations use status='booting' so unstarted/QUEUED pushes
+        never masquerade as live running GPU workers.
         """
         from app.models import WorkerSession
         from datetime import datetime, timedelta
         
-        # Consider a worker "live" if it is in an active status and has heartbeat within the last 180 seconds
         cutoff = datetime.utcnow() - timedelta(seconds=180)
         
         session = db.query(WorkerSession).filter(
@@ -92,9 +93,25 @@ class KaggleOrchestrator:
         
         return session is not None
 
+    @staticmethod
+    def has_live_or_booting_worker(db) -> bool:
+        """Checks if any worker is either confirmed live (180s) or recently pushed/booting (120s)."""
+        from app.models import WorkerSession
+        from datetime import datetime, timedelta
+
+        if KaggleOrchestrator.has_live_worker(db):
+            return True
+        boot_cutoff = datetime.utcnow() - timedelta(seconds=120)
+        boot_sess = db.query(WorkerSession).filter(
+            WorkerSession.status == "booting",
+            WorkerSession.last_heartbeat_at >= boot_cutoff,
+        ).first()
+        return boot_sess is not None
+
     _runner_thread = None
     _runner_stop_event = None
     _wake_event = threading.Event()
+    _push_lock = threading.Lock()
     _consecutive_poll_failures = {}
     _unknown_status_count = {}
     _complete_grace_count = {}
@@ -105,6 +122,35 @@ class KaggleOrchestrator:
     _push_cooldown_until = 0.0
     _prewarm_lock = threading.Lock()
     _last_prewarm_at = 0.0
+
+    @classmethod
+    def _query_slot_kaggle_status(cls, username: str, key: str, slug: str) -> str:
+        """
+        Queries Kaggle CLI for the current status of `<username>/<slug>` before pushing.
+        Returns lowercase status output, or '' in testing / when kernel does not exist yet.
+        """
+        import sys
+        if os.environ.get("APP_ENV") == "testing" or not username or not key or not slug:
+            return ""
+        env = os.environ.copy()
+        env["KAGGLE_USERNAME"] = username
+        env["KAGGLE_KEY"] = key
+        env["KAGGLE_API_TOKEN"] = key
+        env["PYTHONUTF8"] = "1"
+        try:
+            res = subprocess.run(
+                [sys.executable, "-c", "from kaggle.cli import main; main()", "kernels", "status", f"{username}/{slug}"],
+                capture_output=True,
+                env=env,
+                text=True,
+                shell=False,
+                timeout=15,
+            )
+            if res.returncode == 0 and res.stdout:
+                return res.stdout.strip().lower()
+        except Exception as st_err:
+            print(f"[KaggleOrchestrator] Notice querying status for {username}/{slug}: {st_err}")
+        return ""
 
     @classmethod
     def _cleanup_job_tracking(cls, job_id: str):
@@ -187,60 +233,72 @@ class KaggleOrchestrator:
             from app.services.worker_session_service import WorkerSessionService
             from app.services.kaggle_notebook_builder import KaggleNotebookBuilder
 
-            db = SessionLocal()
-            try:
-                if cls.has_live_worker(db):
-                    return
-                booting = db.query(TTSJob).filter(TTSJob.status.in_(["starting_worker", "queued_kaggle"])).first()
-                if booting:
-                    return
-                username, key, _, default_worker_dir = cls.get_credentials(db, user_id)
-                if not username or not key:
-                    return
-                slot = cls._select_best_worker_slot(db, set())
-                worker_dir_path = f"{default_worker_dir}-2" if slot == "worker_2" else f"{default_worker_dir}-1"
-                worker_dir_abs = os.path.abspath(worker_dir_path)
+            with cls._push_lock:
+                db = SessionLocal()
+                try:
+                    if cls.has_live_or_booting_worker(db):
+                        return
+                    booting = db.query(TTSJob).filter(TTSJob.status.in_(["starting_worker", "queued_kaggle"])).first()
+                    if booting:
+                        return
+                    username, key, _, default_worker_dir = cls.get_credentials(db, user_id)
+                    if not username or not key:
+                        return
+                    slot = cls._select_best_worker_slot(db, set())
+                    slot_slug = "omnivoice-worker-2" if slot == "worker_2" else "omnivoice-worker-1"
+                    worker_dir_path = f"{default_worker_dir}-2" if slot == "worker_2" else f"{default_worker_dir}-1"
+                    worker_dir_abs = os.path.abspath(worker_dir_path)
 
-                KaggleNotebookBuilder.prepare_all(job={"worker_id": slot, "user_id": user_id}, db=db, is_daemon=True, user_id=user_id)
-                WorkerSessionService.register_worker(db, slot, "starting", "Pre-warming Kaggle GPU worker...")
+                    prior_st = cls._query_slot_kaggle_status(username, key, slot_slug)
+                    if "queued" in prior_st:
+                        print(f"[KaggleOrchestrator] Pre-warm found stale QUEUED kernel on {slot_slug}; purging before clean push...")
+                        cls._purge_wedged_worker_kernels(user_id=user_id, slugs=(slot_slug,))
 
-                env = os.environ.copy()
-                env["KAGGLE_USERNAME"] = username
-                env["KAGGLE_KEY"] = key
-                env["KAGGLE_API_TOKEN"] = key
-                env["PYTHONUTF8"] = "1"
-                import sys
-                cmd = [
-                    sys.executable, "-c", "from kaggle.cli import main; main()",
-                    "kernels", "push",
-                    "-p", worker_dir_abs,
-                    "--timeout", str(settings.KAGGLE_TIMEOUT_SECONDS),
-                    "--accelerator", "NvidiaTeslaT4",
-                ]
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, shell=False)
-                out, err = proc.communicate()
-                out_str = (out or err or "").strip()
-                out_low = out_str.lower()
-                print(f"[KaggleOrchestrator] Pre-warm push on {slot} exited {proc.returncode}: {out_str}")
-                if (
-                    proc.returncode != 0
-                    or "kernel push error" in out_low
-                    or "maximum batch gpu session count" in out_low
-                    or out_low.startswith("error:")
-                ):
-                    WorkerSessionService.shutdown_worker(db, slot, f"Pre-warm skipped: {out_str[:160]}")
-            except Exception as pw_err:
-                print(f"[KaggleOrchestrator] Pre-warm notice: {pw_err}")
-            finally:
-                db.close()
+                    KaggleNotebookBuilder.prepare_all(job={"worker_id": slot, "user_id": user_id}, db=db, is_daemon=True, user_id=user_id)
+                    WorkerSessionService.register_worker(db, slot, "booting", "Pre-warming Kaggle GPU worker...")
+
+                    env = os.environ.copy()
+                    env["KAGGLE_USERNAME"] = username
+                    env["KAGGLE_KEY"] = key
+                    env["KAGGLE_API_TOKEN"] = key
+                    env["PYTHONUTF8"] = "1"
+                    import sys
+                    cmd = [
+                        sys.executable, "-c", "from kaggle.cli import main; main()",
+                        "kernels", "push",
+                        "-p", worker_dir_abs,
+                        "--timeout", str(settings.KAGGLE_TIMEOUT_SECONDS),
+                        "--accelerator", "NvidiaTeslaT4",
+                    ]
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True, shell=False)
+                    out, err = proc.communicate()
+                    out_str = (out or err or "").strip()
+                    out_low = out_str.lower()
+                    print(f"[KaggleOrchestrator] Pre-warm push on {slot} exited {proc.returncode}: {out_str}")
+                    if (
+                        proc.returncode != 0
+                        or "kernel push error" in out_low
+                        or "maximum batch gpu session count" in out_low
+                        or out_low.startswith("error:")
+                    ):
+                        WorkerSessionService.shutdown_worker(db, slot, f"Pre-warm skipped: {out_str[:160]}")
+                except Exception as pw_err:
+                    print(f"[KaggleOrchestrator] Pre-warm notice: {pw_err}")
+                finally:
+                    db.close()
 
         threading.Thread(target=_bg_prewarm, daemon=True).start()
 
     @classmethod
-    def _purge_wedged_worker_kernels(cls, user_id: str = None, job_id: str = None, slugs: tuple = ("omnivoice-worker-1", "omnivoice-worker-2")):
+    def _purge_wedged_worker_kernels(
+        cls,
+        user_id: str = None,
+        job_id: str = None,
+        slugs: tuple = ("omnivoice-worker-1", "omnivoice-worker-2", "omnivoice-gpu-worker"),
+    ):
         """
-        Deletes auto-generated disposable worker kernels (omnivoice-worker-1 / omnivoice-worker-2)
-        ONLY when wedged background QUEUED GPU versions block new GPU allocations with 0 live Gateway workers.
+        Deletes auto-generated disposable worker kernels (omnivoice-worker-1 / omnivoice-worker-2 / omnivoice-gpu-worker)
+        when wedged background QUEUED GPU versions block new GPU allocations with 0 live Gateway workers.
         """
         import sys
         if os.environ.get("APP_ENV") == "testing":
@@ -310,27 +368,27 @@ class KaggleOrchestrator:
         is_batch_cap_reached = "maximum batch gpu session count" in status_lower
 
         # If Kaggle reports 2 batch GPU sessions are already active/queued:
-        # If 0 live workers are heartbeating with Gateway, purge wedged auto-generated worker slugs once so
-        # stacked QUEUED versions (e.g. v165+v166 on omnivoice-worker-1) immediately release Kaggle's GPU slots!
+        # When 0 confirmed live workers are heartbeating with Gateway, immediately purge wedged queued slugs
+        # on wait_cycles == 0 (first hit!) so stacked QUEUED versions immediately release Kaggle's GPU slots!
         if is_batch_cap_reached and (cls.has_live_worker(db) or attempts >= 2):
             wait_cycles = cls._quota_wait_cycles.get(job.id, 0)
             if wait_cycles < 40:
                 cls._quota_wait_cycles[job.id] = wait_cycles + 1
                 cls._boot_attempts[job.id] = 0
-                if not cls.has_live_worker(db) and wait_cycles in (1, 6):
+                if not cls.has_live_worker(db) and wait_cycles in (0, 3, 6):
                     cls._purge_wedged_worker_kernels(user_id=job.user_id, job_id=job.id)
-                    cls._push_cooldown_until = _time.monotonic() + 6.0
+                    cls._push_cooldown_until = _time.monotonic() + 5.0
                 else:
                     cls._push_cooldown_until = _time.monotonic() + 15.0
                 print(
                     f"[KaggleOrchestrator] Kaggle GPU session limit (2) active for job {job.id} "
-                    f"(wait cycle {wait_cycles + 1}/40). Parking job in 'queued' for queued/running GPU workers to claim."
+                    f"(wait cycle {wait_cycles + 1}/40). Parking job in 'queued' for clean GPU allocation."
                 )
                 JobService.update_job_status(
                     db=db,
                     job_id=job.id,
                     status="queued",
-                    message="Đang chờ máy chủ GPU Kaggle nhận tác vụ (hàng đợi GPU giờ cao điểm)...",
+                    message="Đang tự động giải phóng hàng đợi GPU Kaggle và cấp phát lại phiên chạy sạch...",
                     progress=15,
                 )
                 job.worker_id = None
@@ -406,7 +464,7 @@ class KaggleOrchestrator:
                 # 1. Recover stuck jobs from dead workers (no heartbeat for 180s)
                 cutoff = datetime.utcnow() - timedelta(seconds=180)
                 dead_sessions = db.query(WorkerSession).filter(
-                    WorkerSession.status.in_(["starting", "loading_model", "ready", "busy", "idle"]),
+                    WorkerSession.status.in_(["booting", "starting", "loading_model", "ready", "busy", "idle"]),
                     WorkerSession.last_heartbeat_at < cutoff
                 ).all()
                 
@@ -427,12 +485,18 @@ class KaggleOrchestrator:
                             stuck_job.worker_id = None
                     db.commit()
 
-                # 2. Count active/live worker sessions
+                # 2. Count confirmed live worker sessions + recently pushed booting sessions
                 active_sessions = db.query(WorkerSession).filter(
                     WorkerSession.status.in_(["starting", "loading_model", "ready", "busy", "idle"]),
                     WorkerSession.last_heartbeat_at >= cutoff
                 ).all()
                 active_worker_ids = {s.worker_id for s in active_sessions}
+
+                boot_cutoff = datetime.utcnow() - timedelta(seconds=120)
+                booting_sessions = db.query(WorkerSession).filter(
+                    WorkerSession.status == "booting",
+                    WorkerSession.last_heartbeat_at >= boot_cutoff
+                ).all()
 
                 # 3. Find and check booting jobs
                 booting_jobs = db.query(TTSJob).filter(
@@ -447,7 +511,10 @@ class KaggleOrchestrator:
                         cls._last_poll_at[b_job.id] = now_mono
                         cls._poll_booting_worker(db, b_job)
 
-                # Clean up boot-attempt tracking for jobs that have left the booting states
+                # Re-query booting/queued jobs after _poll_booting_worker may have failed over or updated statuses
+                booting_jobs = db.query(TTSJob).filter(
+                    TTSJob.status.in_(["starting_worker", "queued_kaggle"])
+                ).all()
                 booting_job_ids = {j.id for j in booting_jobs}
                 queued_jobs = db.query(TTSJob).filter(
                     TTSJob.status == "queued"
@@ -472,7 +539,7 @@ class KaggleOrchestrator:
                     cls._quota_wait_cycles.pop(q_id, None)
 
                 # Determine active or booting worker IDs
-                booting_worker_ids = {j.worker_id for j in booting_jobs if j.worker_id}
+                booting_worker_ids = {j.worker_id for j in booting_jobs if j.worker_id} | {s.worker_id for s in booting_sessions}
                 total_active_or_booting = active_worker_ids.union(booting_worker_ids)
                 free_or_warming_workers = {
                     s.worker_id
@@ -480,19 +547,26 @@ class KaggleOrchestrator:
                     if s.status in ("starting", "loading_model", "ready", "idle")
                 }
 
-                # Trigger a new worker slot only when needed:
+                # Trigger a new worker slot ONLY when safe and needed:
                 # - Never push during a quota cooldown window
-                # - Do NOT redundantly push a 2nd GPU container for 1 queued job when a ready/idle/pre-warming worker is already available
+                # - Never push a 2nd GPU container while another worker is currently booting/queued on Kaggle
+                #   (prevents stacking 2/2 QUEUED GPU sessions; a single ready worker processes TTS jobs in ~3s)
+                # - Scale to a 2nd worker ONLY when 1 confirmed worker is actively 'busy' (e.g. long dubbing/ASR) and 0 are free/booting
                 should_boot_another = (
-                    len(total_active_or_booting) < 2
-                    and now_mono >= cls._push_cooldown_until
+                    now_mono >= cls._push_cooldown_until
                     and len(queued_jobs) > 0
-                    and (len(total_active_or_booting) == 0 or len(queued_jobs) > len(free_or_warming_workers))
+                    and (
+                        len(total_active_or_booting) == 0
+                        or (
+                            len(total_active_or_booting) == 1
+                            and len(booting_worker_ids) == 0
+                            and len(booting_jobs) == 0
+                            and len(free_or_warming_workers) == 0
+                        )
+                    )
                 )
                 if should_boot_another:
-                    # Pick a queued job beyond those already covered by free/warming workers
-                    target_idx = min(len(free_or_warming_workers), len(queued_jobs) - 1)
-                    next_job = queued_jobs[target_idx]
+                    next_job = queued_jobs[0]
                     assigned_worker_id = cls._select_best_worker_slot(db, total_active_or_booting)
 
                     print(f"[KaggleOrchestrator] Queued job {next_job.id} needs worker. Active/booting: {total_active_or_booting} (free/warming={free_or_warming_workers}). Triggering slot {assigned_worker_id}...")
@@ -531,6 +605,9 @@ class KaggleOrchestrator:
     def _trigger_daemon_worker(cls, db, job):
         """Prepares daemon worker code and pushes it to Kaggle."""
         import time as _time
+        from datetime import datetime, timedelta
+        from app.models import WorkerSession
+
         cls._boot_attempts[job.id] = cls._boot_attempts.get(job.id, 0) + 1
         cls._boot_started_at[job.id] = _time.monotonic()
         current_attempt = cls._boot_attempts[job.id]
@@ -543,11 +620,7 @@ class KaggleOrchestrator:
         db.commit()
         db.refresh(job)
 
-        # Register or update worker session in DB to immediately mark it as starting
-        from app.services.worker_session_service import WorkerSessionService
-        WorkerSessionService.register_worker(db, job.worker_id, "starting", f"Kaggle kernel is being pushed (attempt {current_attempt})...")
-
-        # Resolve credentials
+        # Resolve credentials first so we can inspect Kaggle slot status before mutating WorkerSession
         username, key, default_kernel_ref, default_worker_dir = cls.get_credentials(db, job.user_id)
         if not username or not key:
             job.status = "failed"
@@ -558,13 +631,41 @@ class KaggleOrchestrator:
 
         # Resolve dynamic slot slug and directory
         if job.worker_id == "worker_2":
+            slot_slug = "omnivoice-worker-2"
             kernel_ref = f"{username}/omnivoice-worker-2"
             worker_dir_path = f"{default_worker_dir}-2"
         else:
+            slot_slug = "omnivoice-worker-1"
             kernel_ref = f"{username}/omnivoice-worker-1"
             worker_dir_path = f"{default_worker_dir}-1"
 
         worker_dir_abs = os.path.abspath(worker_dir_path)
+
+        # Check live Kaggle status on this slot BEFORE pushing to prevent stacking QUEUED versions on top of an existing run!
+        existing_sess = db.query(WorkerSession).filter(WorkerSession.worker_id == job.worker_id).first()
+        hb_cutoff = datetime.utcnow() - timedelta(seconds=180)
+        has_recent_hb = (
+            existing_sess is not None
+            and existing_sess.status in ("starting", "loading_model", "ready", "busy", "idle")
+            and existing_sess.last_heartbeat_at is not None
+            and existing_sess.last_heartbeat_at >= hb_cutoff
+        )
+        prior_status = cls._query_slot_kaggle_status(username, key, slot_slug)
+        if "running" in prior_status and has_recent_hb:
+            print(f"[KaggleOrchestrator] Slot {slot_slug} is already RUNNING & heartbeating on Kaggle; skipping duplicate push.")
+            job.status = "starting_worker"
+            job.message = f"Máy chủ GPU ({job.worker_id}) đang hoạt động, đang nhận tác vụ..."
+            job.progress = 25
+            db.commit()
+            return
+        if "queued" in prior_status or ("running" in prior_status and not has_recent_hb):
+            print(f"[KaggleOrchestrator] Slot {slot_slug} has stale/orphan Kaggle session ('{prior_status}'). Purging before clean push so versions never stack in queue...")
+            cls._purge_wedged_worker_kernels(user_id=job.user_id, job_id=job.id, slugs=(slot_slug,))
+            _time.sleep(1.5)
+
+        # Register worker session as 'booting' (NOT 'starting') until the Kaggle container actually starts Python
+        from app.services.worker_session_service import WorkerSessionService
+        WorkerSessionService.register_worker(db, job.worker_id, "booting", f"Kaggle kernel is being pushed (attempt {current_attempt})...")
 
         # Call builder to prepare files
         try:
@@ -716,8 +817,10 @@ class KaggleOrchestrator:
                 else:
                     queued_elapsed = _time.monotonic() - boot_t0
 
-                if queued_elapsed > 240:
-                    print(f"[KaggleOrchestrator] Worker {job.worker_id} stuck in QUEUED for {queued_elapsed:.0f}s. Failing over to alternate slot...")
+                if queued_elapsed > 90:
+                    stuck_slug = "omnivoice-worker-2" if job.worker_id == "worker_2" else "omnivoice-worker-1"
+                    print(f"[KaggleOrchestrator] Worker {job.worker_id} stuck in QUEUED for {queued_elapsed:.0f}s. Purging wedged {stuck_slug} on Kaggle and failing over to clean slot...")
+                    cls._purge_wedged_worker_kernels(user_id=job.user_id, job_id=job.id, slugs=(stuck_slug,))
                     cls._failover_or_retry_worker(db, job, f"Queued timeout ({int(queued_elapsed)}s)", "Worker Queued Timeout")
                 else:
                     job.status = "queued_kaggle"
