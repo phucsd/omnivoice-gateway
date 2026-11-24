@@ -55,6 +55,7 @@ tmp_*
 /test_*.py
 !backend/tests/test_*.py
 test_number_results/
+benchmark_results/
 
 # Local Windows YouTube Bridge runtime secrets, binaries & logs
 local_yt_bridge/bin/

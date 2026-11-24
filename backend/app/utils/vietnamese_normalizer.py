@@ -197,11 +197,37 @@ def normalize_vietnamese_text(text: str) -> str:
     s = re.sub(r'\$\s*(\d+(?:[.,]\d+)?)', r'\1 đô la', s)
     s = re.sub(r'€\s*(\d+(?:[.,]\d+)?)', r'\1 ơ-rô', s)
 
-    # 4. Dates: DD/MM/YYYY or DD-MM-YYYY
-    def repl_date(m):
-        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        return f"ngày {read_int(d)} tháng {read_int(mo)} năm {read_int(y)}"
-    s = re.sub(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', repl_date, s)
+    # 4. Dates: DD/MM/YYYY or DD-MM-YYYY (with optional leading 'ngày' to avoid 'ngày ngày ...'),
+    # plus 'ngày DD/MM' and 'tháng MM/YYYY'
+    def _read_month_vi(mo: int) -> str:
+        return "tư" if mo == 4 else read_int(mo)
+
+    def repl_full_date(m):
+        prefix = m.group(1) or "ngày"
+        d, mo, y = int(m.group(2)), int(m.group(3)), int(m.group(4))
+        if 1 <= d <= 31 and 1 <= mo <= 12:
+            return f"{prefix} {read_int(d)} tháng {_read_month_vi(mo)} năm {read_int(y)}"
+        return m.group(0)
+
+    s = re.sub(r'(?:(?<!\w)(ngày)\s+)?\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', repl_full_date, s, flags=re.IGNORECASE)
+
+    def repl_month_year(m):
+        prefix = m.group(1)
+        mo, y = int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12:
+            return f"{prefix} {_read_month_vi(mo)} năm {read_int(y)}"
+        return m.group(0)
+
+    s = re.sub(r'(?<!\w)(tháng)\s+(\d{1,2})[/-](\d{4})\b', repl_month_year, s, flags=re.IGNORECASE)
+
+    def repl_day_month(m):
+        prefix = m.group(1)
+        d, mo = int(m.group(2)), int(m.group(3))
+        if 1 <= d <= 31 and 1 <= mo <= 12:
+            return f"{prefix} {read_int(d)} tháng {_read_month_vi(mo)}"
+        return m.group(0)
+
+    s = re.sub(r'(?<!\w)(ngày)\s+(\d{1,2})[/-](\d{1,2})\b(?![/-]\d)', repl_day_month, s, flags=re.IGNORECASE)
 
     # 5. Times: 8h30, 8h, 8:30
     def repl_time(m):

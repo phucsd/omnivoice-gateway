@@ -36,6 +36,9 @@ class WorkerSessionService:
         if not session:
             # Auto-register if not found
             return WorkerSessionService.register_worker(db, worker_id, status, message)
+        if session.status == "stopped" and "Reset via /v1/settings/reset-workers" in (session.message or ""):
+            # Do not let a dying container resurrect a manually reset session before Kaggle SIGKILL arrives
+            return session
         
         session.status = status
         session.last_heartbeat_at = datetime.utcnow()

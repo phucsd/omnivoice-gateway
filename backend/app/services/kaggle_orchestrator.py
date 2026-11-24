@@ -73,18 +73,21 @@ class KaggleOrchestrator:
         username, key, kernel_ref, worker_dir = KaggleOrchestrator.get_credentials(db, user_id)
         return bool(username and key and kernel_ref and worker_dir)
 
+    HEARTBEAT_TIMEOUT_SECONDS = 75
+    BOOTING_TIMEOUT_SECONDS = 95
+
     @staticmethod
     def has_live_worker(db) -> bool:
         """
         Queries the database to check if there is a confirmed live GPU worker container
-        (one that has actually started Python on Kaggle and contacted the Gateway within 180s).
+        (one that has actually started Python on Kaggle and contacted the Gateway within 75s).
         Note: Gateway-side pre-push registrations use status='booting' so unstarted/QUEUED pushes
         never masquerade as live running GPU workers.
         """
         from app.models import WorkerSession
         from datetime import datetime, timedelta
         
-        cutoff = datetime.utcnow() - timedelta(seconds=180)
+        cutoff = datetime.utcnow() - timedelta(seconds=KaggleOrchestrator.HEARTBEAT_TIMEOUT_SECONDS)
         
         session = db.query(WorkerSession).filter(
             WorkerSession.status.in_(["starting", "loading_model", "ready", "busy", "idle"]),
@@ -95,13 +98,13 @@ class KaggleOrchestrator:
 
     @staticmethod
     def has_live_or_booting_worker(db) -> bool:
-        """Checks if any worker is either confirmed live (180s) or recently pushed/booting (120s)."""
+        """Checks if any worker is either confirmed live (75s) or recently pushed/booting (95s)."""
         from app.models import WorkerSession
         from datetime import datetime, timedelta
 
         if KaggleOrchestrator.has_live_worker(db):
             return True
-        boot_cutoff = datetime.utcnow() - timedelta(seconds=120)
+        boot_cutoff = datetime.utcnow() - timedelta(seconds=KaggleOrchestrator.BOOTING_TIMEOUT_SECONDS)
         boot_sess = db.query(WorkerSession).filter(
             WorkerSession.status == "booting",
             WorkerSession.last_heartbeat_at >= boot_cutoff,
@@ -347,7 +350,7 @@ class KaggleOrchestrator:
         from app.services.job_service import JobService
 
         old_worker_id = job.worker_id or "worker_1"
-        cutoff = datetime.utcnow() - timedelta(seconds=180)
+        cutoff = datetime.utcnow() - timedelta(seconds=cls.HEARTBEAT_TIMEOUT_SECONDS)
         old_sess = db.query(WorkerSession).filter(WorkerSession.worker_id == old_worker_id).first()
         is_old_actively_serving = (
             old_sess is not None
@@ -451,39 +454,90 @@ class KaggleOrchestrator:
             print("[KaggleOrchestrator] Queue runner background thread stopped.")
 
     @classmethod
+    def _recover_dead_worker_sessions(cls, db) -> tuple[datetime, datetime]:
+        """
+        Marks unresponsive workers (no heartbeat for 75s, or stuck pre-push 'booting' for 95s) as stopped
+        and resets any claimed/in-flight jobs back to 'queued' so a healthy worker can process them immediately.
+        """
+        from datetime import datetime, timedelta
+        from sqlalchemy import or_
+        from app.models import TTSJob, WorkerSession
+
+        now_utc = datetime.utcnow()
+        cutoff = now_utc - timedelta(seconds=cls.HEARTBEAT_TIMEOUT_SECONDS)
+        boot_cutoff = now_utc - timedelta(seconds=cls.BOOTING_TIMEOUT_SECONDS)
+
+        dead_sessions = db.query(WorkerSession).filter(
+            or_(
+                (
+                    WorkerSession.status.in_(["starting", "loading_model", "ready", "busy", "idle"])
+                    & (WorkerSession.last_heartbeat_at < cutoff)
+                ),
+                (
+                    (WorkerSession.status == "booting")
+                    & (WorkerSession.last_heartbeat_at < boot_cutoff)
+                ),
+            )
+        ).all()
+
+        in_flight_statuses = (
+            "loading_model",
+            "preparing_input",
+            "generating_audio",
+            "generating_tts",
+            "separating_audio",
+            "transcribing",
+            "exporting_wav",
+        )
+
+        for session in dead_sessions:
+            print(
+                f"[KaggleOrchestrator] Worker {session.worker_id} has died "
+                f"(status={session.status}, no heartbeat within {cls.HEARTBEAT_TIMEOUT_SECONDS}s). Stopping session."
+            )
+            old_job_id = session.current_job_id
+            session.status = "stopped"
+            session.stopped_at = now_utc
+            session.current_job_id = None
+            session.message = f"Stuck worker detected and stopped by Gateway ({cls.HEARTBEAT_TIMEOUT_SECONDS}s timeout)."
+
+            stuck_jobs = {}
+            if old_job_id:
+                j = db.query(TTSJob).filter(TTSJob.id == old_job_id).first()
+                if j and j.status not in ("completed", "failed"):
+                    stuck_jobs[j.id] = j
+
+            orphan_jobs = db.query(TTSJob).filter(
+                TTSJob.worker_id == session.worker_id,
+                TTSJob.status.in_(in_flight_statuses),
+            ).all()
+            for oj in orphan_jobs:
+                stuck_jobs[oj.id] = oj
+
+            for stuck_job in stuck_jobs.values():
+                print(f"[KaggleOrchestrator] Resetting stuck job {stuck_job.id} from '{stuck_job.status}' to 'queued'")
+                stuck_job.status = "queued"
+                stuck_job.message = "Hàng đợi tự động reset do máy chủ xử lý mất kết nối."
+                stuck_job.progress = 0
+                stuck_job.worker_id = None
+                stuck_job.started_at = None
+
+            db.commit()
+
+        return cutoff, boot_cutoff
+
+    @classmethod
     def _queue_loop(cls):
         import time
         from app.database import SessionLocal
         from app.models import TTSJob, WorkerSession
-        from datetime import datetime, timedelta
 
         print("[KaggleOrchestrator] Entering queue runner loop.")
         while cls._runner_stop_event and not cls._runner_stop_event.is_set():
             db = SessionLocal()
             try:
-                # 1. Recover stuck jobs from dead workers (no heartbeat for 180s)
-                cutoff = datetime.utcnow() - timedelta(seconds=180)
-                dead_sessions = db.query(WorkerSession).filter(
-                    WorkerSession.status.in_(["booting", "starting", "loading_model", "ready", "busy", "idle"]),
-                    WorkerSession.last_heartbeat_at < cutoff
-                ).all()
-                
-                for session in dead_sessions:
-                    print(f"[KaggleOrchestrator] Worker {session.worker_id} has died (no heartbeat for 180s). Stopping session.")
-                    session.status = "stopped"
-                    session.stopped_at = datetime.utcnow()
-                    session.message = "Stuck worker detected and stopped by Gateway."
-                    
-                    # Reset its current job to queued if it was in progress
-                    if session.current_job_id:
-                        stuck_job = db.query(TTSJob).filter(TTSJob.id == session.current_job_id).first()
-                        if stuck_job and stuck_job.status not in ["completed", "failed"]:
-                            print(f"[KaggleOrchestrator] Resetting stuck job {stuck_job.id} to 'queued'")
-                            stuck_job.status = "queued"
-                            stuck_job.message = "Hàng đợi tự động reset do máy chủ xử lý mất kết nối."
-                            stuck_job.progress = 0
-                            stuck_job.worker_id = None
-                    db.commit()
+                # 1. Recover stuck jobs from dead workers (no heartbeat for 75s)
+                cutoff, boot_cutoff = cls._recover_dead_worker_sessions(db)
 
                 # 2. Count confirmed live worker sessions + recently pushed booting sessions
                 active_sessions = db.query(WorkerSession).filter(
@@ -492,7 +546,6 @@ class KaggleOrchestrator:
                 ).all()
                 active_worker_ids = {s.worker_id for s in active_sessions}
 
-                boot_cutoff = datetime.utcnow() - timedelta(seconds=120)
                 booting_sessions = db.query(WorkerSession).filter(
                     WorkerSession.status == "booting",
                     WorkerSession.last_heartbeat_at >= boot_cutoff
@@ -643,7 +696,7 @@ class KaggleOrchestrator:
 
         # Check live Kaggle status on this slot BEFORE pushing to prevent stacking QUEUED versions on top of an existing run!
         existing_sess = db.query(WorkerSession).filter(WorkerSession.worker_id == job.worker_id).first()
-        hb_cutoff = datetime.utcnow() - timedelta(seconds=180)
+        hb_cutoff = datetime.utcnow() - timedelta(seconds=cls.HEARTBEAT_TIMEOUT_SECONDS)
         has_recent_hb = (
             existing_sess is not None
             and existing_sess.status in ("starting", "loading_model", "ready", "busy", "idle")

@@ -146,6 +146,12 @@ def test_generated_worker_contains_clone_voice_prompt_guard_and_qa_gate():
         assert 'kwargs["ref_text"] = None' in src
         # Cache guard prevents caching empty-ref_text prompt
         assert "if prompt_cache_key is not None and built_prompt is not None and eff_ref:" in src
+        # Cold-start faster-whisper prefetch & short clone_voice QA skip + Vietnamese digit QA normalization
+        assert "def _spawn_parallel_whisper_download(" in src
+        assert "FAST_WHISPER_SMALL_DIR" in src
+        assert 'extra_core.append("faster-whisper")' in src
+        assert "trans_text_for_qa = normalize_vietnamese_text(trans_text)" in src
+        assert "(word_cnt > 20 or not effective_ref_text)" in src
 
         # Also validate batch template normalizes blank ref_text to None
         batch_path = KaggleNotebookBuilder.generate_worker_code(

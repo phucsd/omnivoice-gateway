@@ -49,6 +49,19 @@ def test_vietnamese_percentages_and_currency():
 def test_vietnamese_dates_and_times():
     assert normalize_vietnamese_text("8h30") == "tám giờ ba mươi phút"
     assert normalize_vietnamese_text("20/11/2026") == "ngày hai mươi tháng mười một năm hai nghìn không trăm hai mươi sáu"
+    assert normalize_vietnamese_text("ngày 24/11/2026") == "ngày hai mươi tư tháng mười một năm hai nghìn không trăm hai mươi sáu"
+    assert normalize_vietnamese_text("Ngày 24-11-2026, hệ thống ra mắt.") == (
+        "Ngày hai mươi tư tháng mười một năm hai nghìn không trăm hai mươi sáu, hệ thống ra mắt."
+    )
+    assert normalize_vietnamese_text(
+        "Theo thống kê mới nhất ngày 24/11/2026, hơn 4.800 doanh nghiệp đã chuyển đổi."
+    ) == (
+        "Theo thống kê mới nhất ngày hai mươi tư tháng mười một năm hai nghìn không trăm hai mươi sáu, "
+        "hơn bốn nghìn tám trăm doanh nghiệp đã chuyển đổi."
+    )
+    assert normalize_vietnamese_text("Sự kiện diễn ra ngày 30/4 và tháng 11/2026.") == (
+        "Sự kiện diễn ra ngày ba mươi tháng tư và tháng mười một năm hai nghìn không trăm hai mươi sáu."
+    )
 
 def test_vietnamese_ranges_and_multiplications():
     assert normalize_vietnamese_text("1-2") == "một đến hai"

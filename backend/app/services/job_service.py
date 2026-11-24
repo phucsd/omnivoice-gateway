@@ -322,7 +322,13 @@ class JobService:
     @staticmethod
     def get_next_job(db: Session, worker_id: str, user_id: str = None) -> Optional[TTSJob]:
         """Locks the oldest queued or booting job for any ready worker and updates status to preparing_input."""
+        from app.models import WorkerSession
+
         with _job_allocation_lock:
+            ws = db.query(WorkerSession).filter(WorkerSession.worker_id == worker_id).first()
+            if ws and ws.status == "stopped" and "Reset via /v1/settings/reset-workers" in (ws.message or ""):
+                return None
+
             # Allow any ready worker to immediately claim queued or booting jobs (even if another slot initiated boot)
             query = db.query(TTSJob).filter(
                 TTSJob.status.in_(["queued", "starting_worker", "queued_kaggle"])
@@ -335,11 +341,17 @@ class JobService:
             if not job:
                 return None
 
-            # Lock the job
+            # Lock the job & bind current_job_id on WorkerSession immediately (closes race window before next heartbeat)
+            now_utc = datetime.utcnow()
             job.status = "preparing_input"
             job.worker_id = worker_id
             job.message = f"GPU Worker ({worker_id}) đang chuẩn bị dữ liệu đầu vào..."
-            job.started_at = datetime.utcnow()
+            job.started_at = now_utc
+            if ws:
+                ws.status = "busy"
+                ws.current_job_id = job.id
+                ws.last_heartbeat_at = now_utc
+                ws.stopped_at = None
             db.commit()
             db.refresh(job)
             return job

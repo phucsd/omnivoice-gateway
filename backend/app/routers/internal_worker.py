@@ -87,13 +87,15 @@ def register_worker(payload: WorkerRegisterRequest, db: Session = Depends(get_db
 @router.post("/workers/heartbeat")
 def worker_heartbeat(payload: WorkerHeartbeatRequest, db: Session = Depends(get_db)):
     """Logs a heartbeat update from an active worker, maintaining its live status."""
-    WorkerSessionService.heartbeat(
+    sess = WorkerSessionService.heartbeat(
         db=db,
         worker_id=payload.worker_id,
         status=payload.status,
         current_job_id=payload.current_job_id,
         message=payload.message
     )
+    if sess and sess.status == "stopped" and "Reset via /v1/settings/reset-workers" in (sess.message or ""):
+        return {"status": "stop"}
     return {"status": "ok"}
 
 @router.get("/jobs/next", response_model=WorkerNextJobResponse)

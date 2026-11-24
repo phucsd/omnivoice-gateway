@@ -526,4 +526,60 @@ def test_poll_queued_timeout_purges_stuck_slot_before_failover(mock_creds, db):
         assert mock_trigger.called
 
 
+def test_dead_worker_recovered_at_75s_heartbeat_timeout_and_resets_orphan_jobs(db):
+    from datetime import datetime, timedelta
+    from app.services.job_service import JobService
+
+    assert KaggleOrchestrator.HEARTBEAT_TIMEOUT_SECONDS == 75
+
+    stale_ts = datetime.utcnow() - timedelta(seconds=80)
+    ws = WorkerSession(
+        id="ws_dead_80s",
+        worker_id="worker_1",
+        status="busy",
+        started_at=stale_ts,
+        last_heartbeat_at=stale_ts,
+        current_job_id=None,  # Even if killed before current_job_id heartbeat arrived
+        message="Running clone_voice",
+    )
+    stuck_job = TTSJob(
+        id="job_killed_midflight",
+        user_id="test_user",
+        job_type="clone_voice",
+        text="Kiểm tra tự phục hồi sau 75 giây",
+        status="preparing_input",
+        worker_id="worker_1",
+        started_at=stale_ts,
+        progress=35,
+    )
+    db.add_all([ws, stuck_job])
+    db.commit()
+
+    assert KaggleOrchestrator.has_live_worker(db) is False
+
+    KaggleOrchestrator._recover_dead_worker_sessions(db)
+    db.refresh(ws)
+    db.refresh(stuck_job)
+
+    assert ws.status == "stopped"
+    assert stuck_job.status == "queued"
+    assert stuck_job.worker_id is None
+    assert stuck_job.started_at is None
+
+    # Also verify a force-reset worker session cannot steal jobs or resurrect via heartbeat
+    ws_reset = WorkerSession(
+        id="ws_reset_guard",
+        worker_id="worker_2",
+        status="stopped",
+        started_at=stale_ts,
+        last_heartbeat_at=stale_ts,
+        stopped_at=datetime.utcnow(),
+        message="Reset via /v1/settings/reset-workers",
+    )
+    db.add(ws_reset)
+    db.commit()
+
+    assert JobService.get_next_job(db, "worker_2") is None
+
+
 

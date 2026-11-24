@@ -227,7 +227,7 @@ def start_heartbeat_daemon():
             if WORKER_STATE.get("stop"):
                 break
             try:
-                make_request(
+                hb_res = make_request(
                     "POST",
                     "/v1/internal/workers/heartbeat",
                     json={{
@@ -238,6 +238,10 @@ def start_heartbeat_daemon():
                     }},
                     timeout=(10, 20),
                 )
+                if hb_res.status_code == 200 and hb_res.json().get("status") == "stop":
+                    log("Gateway signaled worker reset; stopping daemon cleanly.")
+                    WORKER_STATE["stop"] = True
+                    break
             except Exception as hb_err:
                 log(f"Notice: background heartbeat warning: {{hb_err}}")
     t = threading.Thread(target=_hb_loop, daemon=True)
@@ -256,6 +260,7 @@ def _select_fast_scratch_dir() -> str:
 
 FAST_SCRATCH_DIR = _select_fast_scratch_dir()
 FAST_MODEL_DIR = os.path.join(FAST_SCRATCH_DIR, "omnivoice_fast_weights")
+FAST_WHISPER_SMALL_DIR = os.path.join(FAST_SCRATCH_DIR, "faster_whisper_small")
 FAST_PKGS_DIR = os.path.join(FAST_SCRATCH_DIR, "omnivoice_fast_pkgs")
 os.makedirs(FAST_PKGS_DIR, exist_ok=True)
 
@@ -337,6 +342,8 @@ def _prepare_core_packages():
         importlib.metadata.version("soundfile")
     except Exception:
         extra_core.append("soundfile")
+    if importlib.util.find_spec("faster_whisper") is None:
+        extra_core.append("faster-whisper")
     if extra_core:
         _pip_or_uv_install(extra_core)
 
@@ -366,6 +373,24 @@ snapshot_download(
 )
 \"\"\"
     return subprocess.Popen([sys.executable, "-c", dl_script])
+
+def _spawn_parallel_whisper_download():
+    \"\"\"Prefetches faster-whisper-small (~484MB) into /dev/shm right after OmniVoice download finishes.\"\"\"
+    ws_script = f\"\"\"
+import os
+os.environ["HF_HUB_DISABLE_XET"] = "0"
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+from huggingface_hub import snapshot_download
+snapshot_download(
+    "Systran/faster-whisper-small",
+    local_dir={{repr(FAST_WHISPER_SMALL_DIR)}},
+    allow_patterns=["config.json", "model.bin", "tokenizer.json", "vocabulary.*"],
+    max_workers=8,
+)
+\"\"\"
+    return subprocess.Popen([sys.executable, "-c", ws_script])
 
 # Register early startup with Gateway & launch parallel warmup + download BEFORE heavy torch import!
 _EARLY_REGISTERED = False
@@ -451,6 +476,8 @@ def _preload_cuda_runtime_libs():
 
 WHISPER_MODEL = None
 ASR_WHISPER_MODEL = None
+_WHISPER_LOAD_LOCK = threading.Lock()
+_WHISPER_DL_PROC = None
 
 ONES_MAP = {{
     "0": "không", "1": "một", "2": "hai", "3": "ba", "4": "bốn",
@@ -504,16 +531,30 @@ def _verify_whisper_instance(wm):
 
 def get_whisper_model():
     global WHISPER_MODEL
-    if WHISPER_MODEL is None:
+    if WHISPER_MODEL is not None:
+        return WHISPER_MODEL
+    with _WHISPER_LOAD_LOCK:
+        if WHISPER_MODEL is not None:
+            return WHISPER_MODEL
         ensure_secondary_tools(need_whisper=True, need_demucs=False)
         _preload_cuda_runtime_libs()
-        log("Loading Whisper model for word alignment / prompt transcription...")
+        if _WHISPER_DL_PROC is not None:
+            try:
+                _WHISPER_DL_PROC.wait(timeout=10)
+            except Exception:
+                pass
+        model_ref = (
+            FAST_WHISPER_SMALL_DIR
+            if os.path.exists(os.path.join(FAST_WHISPER_SMALL_DIR, "model.bin"))
+            else "small"
+        )
+        log(f"Loading Whisper model ({{model_ref}}) for word alignment / QA...")
         from faster_whisper import WhisperModel
         
         if torch.cuda.is_available():
             try:
                 log("Attempting to load WhisperModel ('small') on GPU (cuda)...")
-                cand = WhisperModel("small", device="cuda", compute_type="float16")
+                cand = WhisperModel(model_ref, device="cuda", compute_type="float16")
                 WHISPER_MODEL = _verify_whisper_instance(cand)
                 log("Whisper model ('small') loaded & verified on GPU successfully.")
                 return WHISPER_MODEL
@@ -522,7 +563,7 @@ def get_whisper_model():
                 
         try:
             log("Attempting to load WhisperModel ('small') on CPU...")
-            WHISPER_MODEL = WhisperModel("small", device="cpu", compute_type="int8")
+            WHISPER_MODEL = WhisperModel(model_ref, device="cpu", compute_type="int8")
             log("Whisper model ('small') loaded on CPU successfully.")
         except Exception as cpu_err:
             log(f"Error: Failed to load WhisperModel on CPU: {{cpu_err}}")
@@ -532,7 +573,11 @@ def get_whisper_model():
 
 def get_asr_whisper_model():
     global ASR_WHISPER_MODEL
-    if ASR_WHISPER_MODEL is None:
+    if ASR_WHISPER_MODEL is not None:
+        return ASR_WHISPER_MODEL
+    with _WHISPER_LOAD_LOCK:
+        if ASR_WHISPER_MODEL is not None:
+            return ASR_WHISPER_MODEL
         ensure_secondary_tools(need_whisper=True, need_demucs=False)
         _preload_cuda_runtime_libs()
         from faster_whisper import WhisperModel
@@ -546,7 +591,7 @@ def get_asr_whisper_model():
                     return ASR_WHISPER_MODEL
                 except Exception as err:
                     log(f"Warning: Could not run faster-whisper '{{m_name}}' on GPU: {{err}}")
-        ASR_WHISPER_MODEL = get_whisper_model()
+    ASR_WHISPER_MODEL = get_whisper_model()
     return ASR_WHISPER_MODEL
 
 def align_words(original_words, transcribed_words, audio_duration):
@@ -865,7 +910,7 @@ def _prepare_clean_clone_prompt(model, local_ref_path, raw_ref_text=None, target
 
         if not chosen_ref_text:
             try:
-                asr_m = get_asr_whisper_model()
+                asr_m = ASR_WHISPER_MODEL if ASR_WHISPER_MODEL is not None else get_whisper_model()
                 asr_lang = target_lang if target_lang in ("vi", "en", "ja", "ko", "zh", "fr", "de", "es") else None
                 r_segs, _ = asr_m.transcribe(
                     resample_to_16k(cand_raw, full_sr),
@@ -936,7 +981,9 @@ def _evaluate_tts_output_qa(audio_arr, expected_text, ref_text_used=None, lang_c
                     if ws:
                         transcribed_words.append(dict(word=ws, start=w.start, end=w.end))
         trans_text = " ".join(raw_text_parts).strip()
-        trans_words = _norm_qa_words(trans_text)
+        is_vi_qa = (tr_lang == "vi") or (_detect_target_language(expected_text, lang_code) == "vi")
+        trans_text_for_qa = normalize_vietnamese_text(trans_text) if (is_vi_qa and trans_text) else trans_text
+        trans_words = _norm_qa_words(trans_text_for_qa)
         if not trans_words:
             return dict(ok=False, score=0.0, coverage=0.0, head_missing=True, ref_bleed=False, extra_stutters=0, transcribed_words=transcribed_words)
 
@@ -1029,6 +1076,11 @@ def main():
         try:
             t_load0 = time.time()
             dl_rc = _WEIGHTS_DL_PROC.wait()
+            global _WHISPER_DL_PROC
+            try:
+                _WHISPER_DL_PROC = _spawn_parallel_whisper_download()
+            except Exception:
+                _WHISPER_DL_PROC = None
             if dl_rc == 0 and os.path.exists(os.path.join(FAST_MODEL_DIR, "model.safetensors")):
                 log(f"Loading pre-fetched OmniVoice weights from {{FAST_MODEL_DIR}}...")
                 model = OmniVoice.from_pretrained(
@@ -1121,17 +1173,19 @@ def main():
         json={{"worker_id": WORKER_ID, "status": "ready", "message": "OmniVoice model ready for requests."}}
     )
 
-    # Background install & preload secondary tools ONLY when worker is NOT busy with an active synthesis job!
+    # Background preload faster-whisper immediately from /dev/shm (thread-safe via _WHISPER_LOAD_LOCK),
+    # and install heavy demucs only when worker is idle!
     def preload_secondary_when_idle():
         try:
-            time.sleep(0.5)
-            ensure_secondary_tools(need_whisper=True, need_demucs=True)
+            time.sleep(0.05)
+            if not WORKER_STATE.get("stop"):
+                log("Background preloading faster-whisper ('small') from /dev/shm...")
+                get_whisper_model()
+                log("Background faster-whisper model preloaded successfully.")
             while WORKER_STATE.get("status") == "busy" and not WORKER_STATE.get("stop"):
                 time.sleep(0.5)
             if not WORKER_STATE.get("stop"):
-                log("Background preloading faster-whisper model during idle window...")
-                get_whisper_model()
-                log("Background faster-whisper model preloaded successfully.")
+                ensure_secondary_tools(need_whisper=False, need_demucs=True)
         except Exception as wp_err:
             log(f"Notice: secondary tools background preload deferred: {{wp_err}}")
 
@@ -1142,15 +1196,19 @@ def main():
     cuda_warmed = False
     log("Entering job polling loop...")
     
-    while True:
+    while not WORKER_STATE.get("stop"):
         try:
             set_worker_state("idle", None, f"Worker polling. Idle time: {{idle_seconds}}s")
             if not first_poll and idle_seconds % 15 == 0:
-                make_request(
+                hb_idle = make_request(
                     "POST",
                     "/v1/internal/workers/heartbeat",
                     json={{"worker_id": WORKER_ID, "status": "idle", "message": f"Worker polling. Idle time: {{idle_seconds}}s"}}
                 )
+                if hb_idle.status_code == 200 and hb_idle.json().get("status") == "stop":
+                    log("Gateway signaled worker reset during idle poll; exiting.")
+                    WORKER_STATE["stop"] = True
+                    break
             first_poll = False
 
             # Poll for job immediately
@@ -1559,7 +1617,8 @@ def main():
                                 without_timestamps=True,
                             )
                             q_txt = " ".join(s.text.strip() for s in q_segs if s.text).strip()
-                            q_words = [w.strip(".,!?;:()-").lower() for w in q_txt.split() if w.strip(".,!?;:()-")]
+                            q_txt_norm = normalize_vietnamese_text(q_txt) if (s_lang == "vi" and q_txt) else q_txt
+                            q_words = [w.strip(".,!?;:()-").lower() for w in q_txt_norm.split() if w.strip(".,!?;:()-")]
                             oh_leak = bool(q_words and q_words[0] in ("oh", "ồ", "ờ"))
                             cov = len(q_words) / float(max(1, len(exp_w_list)))
                             return cov, oh_leak, q_txt
@@ -1964,8 +2023,15 @@ def main():
                         raise
 
                 log(f"Calling model.generate with arguments: {{list(generate_args.keys())}} (lang={{generate_args.get('language')}}, has_ref_text={{bool(effective_ref_text)}})")
-                run_qa_gate = (job_type == "clone_voice" or bool(job.get("with_alignment"))) and len(job_text.split()) >= 4
                 need_ts_in_qa = bool(job.get("with_alignment"))
+                word_cnt = len(job_text.split())
+                run_qa_gate = word_cnt >= 4 and (
+                    need_ts_in_qa
+                    or (
+                        job_type == "clone_voice"
+                        and (word_cnt > 20 or not effective_ref_text)
+                    )
+                )
                 best_wav = None
                 best_qa = None
                 max_takes = 3 if run_qa_gate else 1
